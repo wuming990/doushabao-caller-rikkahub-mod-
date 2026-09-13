@@ -53,6 +53,19 @@ private fun trimTrailingZero(value: Double): String {
     return if (rounded % 1.0 == 0.0) rounded.toInt().toString() else rounded.toString()
 }
 
+/**
+ * 缓存命中率（v299）：缓存命中的输入 token 占输入总量的百分比。
+ *
+ * 输入为 0 时返回 "—" —— 不能除零，也不能编一个 0% 出来（那会让人以为缓存完全没生效）。
+ * 保留一位小数，整数不带小数点（42.0 → "42%"、42.3 → "42.3%"）。
+ * 名字必须与同包其他顶层函数区分开（同包顶层同名会直接编译失败，见 v298 的 formatTokenTotal）。
+ */
+internal fun formatCacheHitRate(cachedTokens: Long, promptTokens: Long): String {
+    if (promptTokens <= 0L) return "—"
+    val pct = kotlin.math.round(cachedTokens * 1000.0 / promptTokens) / 10.0
+    return if (pct % 1.0 == 0.0) "${pct.toInt()}%" else "$pct%"
+}
+
 /** 顶栏那行小字：本对话 ↑输入 ↓输出 Σ合计。没有任何用量数据时整行不渲染。 */
 @Composable
 fun ConversationTokenStatsLine(
@@ -84,6 +97,8 @@ fun ConversationTokenStatsLine(
 fun ConversationTokenStatsDialog(
     stats: ConversationTokenStats,
     onDismiss: () -> Unit,
+    // v301：花费估算（调用方没传 / 没填过价时为 null）
+    cost: ConversationCost? = null,
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -110,11 +125,42 @@ fun ConversationTokenStatsDialog(
                         label = stringResource(R.string.stats_page_cached_tokens),
                         value = formatTokenTotal(stats.cachedTokens),
                     )
+                    // v299：命中率 = 缓存输入 / 总输入。输入为 0 时不显示（不编 0% 骗人）
+                    if (stats.promptTokens > 0) {
+                        StatsRow(
+                            label = stringResource(R.string.chat_conversation_token_cache_hit_rate),
+                            value = formatCacheHitRate(stats.cachedTokens, stats.promptTokens),
+                        )
+                    }
                 }
                 StatsRow(
                     label = stringResource(R.string.chat_conversation_token_total),
                     value = formatTokenTotal(stats.promptTokens + stats.completionTokens),
                 )
+                // v301：按用户自填单价估算的花费。
+                // 一条消息都没定上价时**不显示这一行** —— 显示「≈ 0」会被当成「免费」。
+                if (cost != null && cost.hasAnyPrice) {
+                    StatsRow(
+                        label = stringResource(R.string.chat_conversation_token_cost),
+                        value = "≈ ${formatCost(cost.cost)}",
+                    )
+                    Text(
+                        text = stringResource(R.string.chat_conversation_token_cost_note),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.Gray,
+                    )
+                }
+                // 有消息因为「模型没填价 / 模型已删」没被算进去时，必须如实说出来
+                if (cost != null && cost.unpricedMessages > 0) {
+                    Text(
+                        text = stringResource(
+                            R.string.chat_conversation_token_cost_unpriced,
+                            cost.unpricedMessages,
+                        ),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
                 Text(
                     text = stringResource(R.string.chat_conversation_token_note),
                     style = MaterialTheme.typography.bodySmall,

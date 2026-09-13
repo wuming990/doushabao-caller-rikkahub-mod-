@@ -79,6 +79,7 @@ import me.rerere.rikkahub.data.ai.stripResumeDuplication
 import me.rerere.rikkahub.data.ai.tools.createConversationTools
 import me.rerere.rikkahub.data.ai.tools.local.LocalTools
 import me.rerere.rikkahub.data.ai.tools.local.LocalToolOption
+import me.rerere.rikkahub.data.ai.tools.local.providerHostOf
 import me.rerere.rikkahub.data.ai.tools.createSearchTools
 import me.rerere.rikkahub.data.ai.tools.createSkillTools
 import me.rerere.rikkahub.data.ai.tools.createRoundTableReadOnlyWorkspaceTools
@@ -881,6 +882,8 @@ class ChatService(
         if (!allowReadOnlyTools) return emptyList()
         return buildList {
             if (assistant.enableWebSearch) addAll(createSearchTools(settings))
+            // v300：这里**故意不传** host/modelId。本地工具在圆桌已被过滤到只剩时间提醒，
+            // ask_user 根本不在名单里；不传即沿用默认值 = 行为与改前一字不差。
             addAll(localTools.getTools(assistant.localTools))
             if (assistant.enableRecentChatsReference) {
                 addAll(createConversationTools(conversationRepo, assistant.id))
@@ -3031,7 +3034,14 @@ class ChatService(
                     if (useExternalWebSearch) {
                         addAll(createSearchTools(settings))
                     }
-                    addAll(localTools.getTools(assistant.localTools))
+                    // v300：商汤 + kimi 不提供 ask_user（选项会被网关吃掉）
+                    addAll(
+                        localTools.getTools(
+                            assistant.localTools,
+                            providerHostOf(model, settings),
+                            model.modelId,
+                        )
+                    )
                     if (assistant.enableRecentChatsReference) {
                         addAll(createConversationTools(conversationRepo, assistant.id))
                     }

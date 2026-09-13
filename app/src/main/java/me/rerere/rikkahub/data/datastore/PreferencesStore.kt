@@ -718,6 +718,18 @@ class SettingsStore(
     }
 
     suspend fun updateAssistant(assistantId: Uuid) {
+        // v299：这条路径原来只直写 DataStore 的单个键，**不动内存态 settingsFlow**。
+        // 于是「打开对话 → ChatService 切当前助手」与「ChatVM 恢复本对话上次用的模型 →
+        // 全量落盘（persistSettings 会连 SELECT_ASSISTANT 一起写）」成为两条互相打架的写入：
+        // 恢复那次带的是切助手之前的旧 assistantId，只要它后提交，刚切好的当前助手就被回写，
+        // 界面（读「当前助手的 chatModelId」）于是停在旧模型上。真机现象就是
+        // 「第一次从文件夹外切到文件夹内，模型还是外面对话的；切走再回来才对」——
+        // 因为第二次进同一对话时记忆模型已经写进目标助手，恢复分支不再落盘，冲突消失。
+        // 这里顺手把内存态也同步掉，两条通道从此一致。
+        val current = settingsFlow.value
+        if (!current.init && current.assistantId != assistantId) {
+            settingsFlow.value = current.copy(assistantId = assistantId)
+        }
         dataStore.edit { preferences ->
             preferences[SELECT_ASSISTANT] = assistantId.toString()
         }

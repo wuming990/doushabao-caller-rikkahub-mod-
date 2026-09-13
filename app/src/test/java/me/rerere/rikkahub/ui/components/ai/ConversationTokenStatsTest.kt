@@ -42,11 +42,15 @@ class ConversationTokenStatsTest {
     fun `消息实体带 cumulativeUsage 字段 走 JSON 不落库版本`() {
         val msg = source("ai", "src", "main", "java", "me", "rerere", "ai", "ui", "Message.kt")
         assertTrue("UIMessage 缺 cumulativeUsage 字段", msg.contains("val cumulativeUsage: TokenUsage? = null"))
-        // 数据库版本必须保持 24：这次只是往消息 JSON 里加字段，不该动 schema
+        // v300：数据库版本由用户明确授权，从 24 采纳为官方 2.5.1 的 25
+        // （只多一列 workspaces.shell_compatibility_mode，官方自带 AutoMigration 24→25，不丢数据）。
+        // 这条守护的**本意没变**：版本只能由「用户拍板」改，而且改的时候必须同时带着迁移 ——
+        // 所以顺手把断言加强成「版本必须是 25 且迁移必须在」，比原来只钉数字更难蒙混。
         val db = source(
             "app", "src", "main", "java", "me", "rerere", "rikkahub", "data", "db", "AppDatabase.kt"
         )
-        assertTrue("AppDatabase 版本被改动", db.contains("version = 24"))
+        assertTrue("AppDatabase 版本不是 25（v300 用户授权改为 25）", db.contains("version = 25"))
+        assertTrue("升级迁移 24→25 丢了（会让老用户升级时崩）", db.contains("AutoMigration(from = 24, to = 25)"))
     }
 
     @Test

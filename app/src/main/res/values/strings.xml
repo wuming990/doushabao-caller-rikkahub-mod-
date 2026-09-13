@@ -242,6 +242,7 @@
   <string name="chat_conversation_token_summary">This chat ↑%1$s ↓%2$s Σ%3$s</string>
   <string name="chat_conversation_token_detail_title">Token usage in this chat</string>
   <string name="chat_conversation_token_reasoning">of which reasoning</string>
+  <string name="chat_conversation_token_cache_hit_rate">Cache hit rate</string>
   <string name="chat_conversation_token_total">Total</string>
   <string name="chat_conversation_token_note">Every tool call and every auto-resume re-sends the whole context, and all of it is counted here. Background calls (title, suggestions, compaction, translation) and sub-agent usage are NOT included.</string>
   <string name="chat_conversation_token_close">Close</string>
@@ -1526,7 +1527,7 @@
   <string name="chat_page_delete_folder_confirm">Delete folder "%1$s"? Conversations inside will not be deleted, only removed from the folder.</string>
   <string name="chat_page_delete_folder_generating">Some conversations in this folder are still generating. Please stop them before deleting.</string>
   <string name="assistant_page_context_message_limit">Context Message Limit</string>
-  <string name="assistant_page_context_message_limit_desc">Caps how many recent messages are sent to the model. When the limit is exceeded, the context is trimmed down to about half in one step instead of dropping one message per turn, so the request prefix stays stable and prompt caching keeps working for many turns.</string>
+  <string name="assistant_page_context_message_limit_desc">Limits the number of recent messages sent to the model</string>
   <string name="assistant_page_context_message_limit_count">Context message limit: %d</string>
   <string name="assistant_page_context_message_limit_unlimited">Unlimited context messages</string>
   <string name="assistant_page_context_message_limit_warning">Limiting context invalidates the prompt cache each time the context is trimmed. A larger limit trims less often; unlimited never trims and keeps the cache fully intact.</string>
@@ -1763,7 +1764,7 @@
   <string name="setting_page_preferences_network_user_agent_desc">Leave blank to use %1$s</string>
   <string name="setting_page_preferences_network">Network</string>
   <string name="setting_page_preferences_network_user_agent">User-Agent</string>
-  <string name="assistant_page_context_message_limit_hint">Enter 0 for unlimited, or a value of at least %d</string>
+  <string name="assistant_page_context_message_limit_hint">Enter 0 for unlimited; otherwise, larger values are better. Setting it to 0 or at least 20 is recommended.</string>
   <string name="assistant_page_context_message_limit_too_small">The context message limit cannot be less than %1$d. It has been reset to %1$d.</string>
   <string name="setting_page_preferences_network_proxy">Proxy</string>
   <string name="setting_page_preferences_network_proxy_desc">Supports HTTP and SOCKS5 proxy URLs. Leave blank to use system settings.</string>
@@ -1931,4 +1932,27 @@
   <string name="chat_page_queue_edit_title">Edit queued message</string>
   <string name="chat_page_queue_paused_count">Queue paused · %1$d</string>
   <string name="chat_page_queue_pending_count">Queued · %1$d</string>
+  <string name="assistant_page_time_reminder_interval">Time reminder interval</string>
+  <string name="assistant_page_time_reminder_interval_label">Interval (minutes)</string>
+  <string name="assistant_page_time_reminder_interval_hint">Enter a positive whole number. A reminder is inserted when the message gap exceeds this interval.</string>
+  <string name="assistant_page_time_reminder_interval_desc">Insert a reminder when the message gap exceeds this interval. Always remind before the first user message.</string>
+  <string name="assistant_page_time_reminder_interval_value">%1$d min</string>
+  <string name="imggen_page_delete_images_title">Delete images</string>
+  <string name="imggen_page_delete_images_message">Delete the selected images (%1$d)? This cannot be undone.</string>
+  <string name="imggen_page_delete_images_success">Images deleted: %1$d</string>
+  <string name="imggen_page_delete_images_failed">Deleted: %1$d. Failed: %2$d. Please try again.</string>
+  <string name="imggen_page_deleting">Deleting…</string>
+  <string name="imggen_page_selected_count">Selected: %1$d</string>
+  <string name="imggen_page_select_image">Select image</string>
+  <string name="workspace_detail_compatibility_mode">Compatibility mode</string>
+  <string name="workspace_detail_compatibility_mode_desc">Try enabling this if the terminal fails to start. It may reduce performance. Applies to new terminal tabs and subsequent commands.</string>
+  <string name="workspace_detail_settings_save_failed">Failed to save settings</string>
+  <string name="chat_message_tool_ask_skip">Skip</string>
+  <string name="chat_conversation_token_cost">≈ Cost</string>
+  <string name="chat_conversation_token_cost_note">Estimated from the prices you typed (per 1M tokens). Cached tokens without a cached price are counted at the input price. Background calls (title, suggestions, compression, translation) and sub-agents are not included.</string>
+  <string name="chat_conversation_token_cost_unpriced">%1$d messages not counted: their model has no price set</string>
+  <string name="setting_provider_page_model_input_price">Input price (per 1M tokens)</string>
+  <string name="setting_provider_page_model_output_price">Output price (per 1M tokens)</string>
+  <string name="setting_provider_page_model_cached_price">Cached input price (per 1M tokens)</string>
+  <string name="setting_provider_page_model_price_hint">Optional. Only used to estimate spending in the conversation token details. Leave blank to skip. If the cached price is blank, cached tokens are counted at the input price. No currency symbol is shown — type the price in your own currency.</string>
 </resources>

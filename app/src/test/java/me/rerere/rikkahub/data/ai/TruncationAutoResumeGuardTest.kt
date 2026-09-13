@@ -387,18 +387,44 @@ class TruncationAutoResumeGuardTest {
     }
 
     @Test
-    fun `询问卡片无选项降级与诊断的零件都在(v295)`() {
+    fun `询问卡片必须永远能作答_跳过_诊断的零件都在(v295-v300)`() {
         val src = source("app/src/main/java/me/rerere/rikkahub/ui/components/message/ChatMessageTools.kt")
-        // 4 处 options 空判定：single 降级 + multi 降级 + 提交判定 + 答案组装
-        assertEquals(
-            "single/multi 降级、提交判定、答案组装共 4 处 options 空判定必须都在（缺一处=卡死回归）",
-            4,
-            Regex("if \\(q\\.options\\.isEmpty\\(\\)\\)").findAll(src).count()
+        // v300：官方 2.5.1 把卡片重做成「每道题都恒有一个自由文本框」，旧版那 4 处
+        // 「选项为空就降级」的分支被官方版式整体取代，不再逐一存在。
+        // 守护的**本意没变**（无选项也绝不许卡死），所以改成直接钉住新版的硬约束：
+        //   ① 待答题恒有自由文本框（选项丢光也能作答 —— 这是「不卡死」的唯一保证）
+        //   ② 选项只在真有选项时才画 chips
+        //   ③ 提交键可用判定：多选「选了或打了字」，其余「必须打过字」
+        assertTrue(
+            "待答题缺自由文本框 —— 选项一旦丢失用户就没有回答途径（卡死回归）",
+            src.contains("value = answers[q.id] ?: \"\"")
         )
+        assertTrue("选项只在非空时才画 chips", src.contains("if (q.options.isNotEmpty()) {"))
+        assertTrue(
+            "提交键的可用判定缺「多选：选了选项或打了字」",
+            src.contains("\"multi\" -> !multiAnswers[q.id].isNullOrEmpty() || !answers[q.id].isNullOrBlank()")
+        )
+        assertTrue(
+            "提交键的可用判定缺「非多选：必须打过字」",
+            src.contains("else -> !answers[q.id].isNullOrBlank()")
+        )
+        // v300：跳过按钮 —— 用户被卡片卡住时的唯一出路（官方卡片只有「提交」）
+        assertTrue("询问卡片缺少「跳过」按钮", src.contains("chat_message_tool_ask_skip"))
+        assertTrue("跳过必须把「未作答」如实回传给模型，否则模型会空等", src.contains("用户跳过了本次询问"))
         // v297：解析搬进 AskUserParsing.kt 后，「整体读不出」的日志文案随之改名；
+        // v299：诊断改走 App 内日志页（Logging.log），文案随之又改了一次。
         // 断言跟着换成新文案，强度不变（两处第一现场都必须还在）。
         assertTrue("缺诊断日志（参数形状不符、一题都读不出）", src.contains("ask_user 未解析出任何问题"))
-        assertTrue("缺诊断日志（选项缺失第一现场）", src.contains("ask_user 选项缺失"))
+        assertTrue("缺诊断日志（本该有选项却没解析出来）", src.contains("ask_user 本该有选项却没解析出来"))
+        // v299：诊断必须同时进 App 内日志页（设置→日志），否则用户手上拿不到证据
+        assertTrue("诊断没有进 App 内日志页（缺 Logging.log）", src.contains("Logging.log(TAG, msg)"))
+        // v300：跳过按钮的文案 6 个语言必须齐全（缺一个就是英文串跑到中文界面）
+        listOf("values", "values-zh", "values-zh-rTW", "values-ja", "values-ko-rKR", "values-ru").forEach { loc ->
+            assertTrue(
+                "$loc 缺 chat_message_tool_ask_skip 文案",
+                source("app/src/main/res/$loc/strings.xml").contains("chat_message_tool_ask_skip")
+            )
+        }
     }
 
     @Test

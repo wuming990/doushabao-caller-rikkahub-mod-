@@ -31,7 +31,6 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.semantics
@@ -138,11 +137,13 @@ import org.koin.compose.koinInject
 import kotlin.uuid.Uuid
 
 private const val TAG = "RouteActivity"
+private const val ACTION_TRANSLATE = "me.rerere.rikkahub.action.TRANSLATE"  // 官方 2.5.1
 
 class RouteActivity : ComponentActivity() {
     private val okHttpClient by inject<OkHttpClient>()
     private val settingsStore by inject<SettingsStore>()
     private var navStack: MutableList<NavKey>? = null
+    private val pendingIntents = ArrayDeque<Intent>()  // 官方 2.5.1：导航栈就绪前先排队
 
     // Volume key listener registry — last registered handler wins
     internal val volumeKeyListeners = mutableListOf<(isVolumeUp: Boolean) -> Boolean>()
@@ -171,6 +172,9 @@ class RouteActivity : ComponentActivity() {
         }
         // v261：后台小窗 / 最近任务卡片用系统缓存的旧图标；强制刷新为新资源名。
         applyTaskIcon()
+        if (savedInstanceState == null) {
+            handleIntent(intent)
+        }
         setContent {
             RikkahubTheme {
                 setSingletonImageLoaderFactory { context ->
@@ -230,8 +234,7 @@ class RouteActivity : ComponentActivity() {
      * 之前中转 Intent 因此永远是空的 —— 分享图片进 App 一直没内容就是这个原因。
      * 这里按 Uri 取出来再转成字符串交给下游（Screen.ShareHandler 收的是 String?）。
      */
-    private fun readSharedStreamUri(): String? {
-        val source = intent ?: return null
+    private fun readSharedStreamUri(source: Intent): String? {
         val uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             source.getParcelableExtra(Intent.EXTRA_STREAM, android.net.Uri::class.java)
         } else {
@@ -241,46 +244,45 @@ class RouteActivity : ComponentActivity() {
         return uri?.toString() ?: source.getStringExtra(Intent.EXTRA_STREAM)
     }
 
-    @Composable
-    private fun ShareHandler(backStack: MutableList<NavKey>) {
-        val shareIntent = remember {
-            Intent().apply {
-                action = intent?.action
-                putExtra(Intent.EXTRA_TEXT, intent?.getStringExtra(Intent.EXTRA_TEXT))
-                // v255：分享进来的 EXTRA_STREAM 是 Parcelable Uri，getStringExtra 只会拿到 null，
-                // 于是中转 Intent 里的图片/文档永远是空的（分享图片一直失效就是这个原因）。
-                putExtra(Intent.EXTRA_STREAM, readSharedStreamUri())
-                putExtra(Intent.EXTRA_PROCESS_TEXT, intent?.getCharSequenceExtra(Intent.EXTRA_PROCESS_TEXT))
-            }
+    /**
+     * 官方 2.5.1 重写：Intent 统一入口（分享 / 翻译快捷方式 / 对话跳转）。
+     * v255 分享修图与 v274 OAuth 回跳两处二改已并进来，不要丢。
+     */
+    private fun handleIntent(intent: Intent) {
+        val backStack = navStack ?: run {
+            // Compose 尚未创建导航栈，待就绪后处理。
+            pendingIntents.addLast(intent)
+            return
         }
-
-        LaunchedEffect(backStack) {
-            when (shareIntent.action) {
-                Intent.ACTION_SEND -> {
-                    val text = shareIntent.getStringExtra(Intent.EXTRA_TEXT) ?: ""
-                    val streamUri = shareIntent.getStringExtra(Intent.EXTRA_STREAM)
-                    backStack.add(Screen.ShareHandler(text, streamUri))
-                }
-
-                Intent.ACTION_PROCESS_TEXT -> {
-                    val text = shareIntent.getCharSequenceExtra(Intent.EXTRA_PROCESS_TEXT)?.toString() ?: ""
-                    backStack.add(Screen.ShareHandler(text, null))
-                }
-            }
-            // v274：OAuth 登录回跳（冷启动路径）——打开对应供应商设置页（照搬 ExTV）
-            if (intent.getBooleanExtra(EXTRA_OPEN_CODEX_SETTINGS, false)) {
-                val destination = Screen.SettingProviderDetail(DEFAULT_CODEX_PROVIDER_ID.toString())
-                if (backStack.lastOrNull() != destination) backStack.add(destination)
-                intent.removeExtra(EXTRA_OPEN_CODEX_SETTINGS)
-            }
-            if (intent.getBooleanExtra(EXTRA_OPEN_GEMINI_SETTINGS, false)) {
-                val destination = Screen.SettingProviderDetail(DEFAULT_GEMINI_OAUTH_PROVIDER_ID.toString())
-                if (backStack.lastOrNull() != destination) backStack.add(destination)
-                intent.removeExtra(EXTRA_OPEN_GEMINI_SETTINGS)
-            }
+        // v274：OAuth 登录回跳优先处理，不再走下面的 action 分派
+        if (intent.getBooleanExtra(EXTRA_OPEN_CODEX_SETTINGS, false)) {
+            val destination = Screen.SettingProviderDetail(DEFAULT_CODEX_PROVIDER_ID.toString())
+            if (backStack.lastOrNull() != destination) backStack.add(destination)
+            intent.removeExtra(EXTRA_OPEN_CODEX_SETTINGS)
+            return
+        }
+        if (intent.getBooleanExtra(EXTRA_OPEN_GEMINI_SETTINGS, false)) {
+            val destination = Screen.SettingProviderDetail(DEFAULT_GEMINI_OAUTH_PROVIDER_ID.toString())
+            if (backStack.lastOrNull() != destination) backStack.add(destination)
+            intent.removeExtra(EXTRA_OPEN_GEMINI_SETTINGS)
+            return
+        }
+        val destination = when (intent.action) {
+            ACTION_TRANSLATE -> Screen.Translator
+            Intent.ACTION_SEND -> Screen.ShareHandler(
+                text = intent.getStringExtra(Intent.EXTRA_TEXT).orEmpty(),
+                // v255：EXTRA_STREAM 是 Parcelable Uri，getStringExtra 只会拿到 null
+                streamUri = readSharedStreamUri(intent),
+            )
+            Intent.ACTION_PROCESS_TEXT -> Screen.ShareHandler(
+                text = intent.getCharSequenceExtra(Intent.EXTRA_PROCESS_TEXT)?.toString().orEmpty(),
+            )
+            else -> intent.getStringExtra("conversationId")?.let { Screen.Chat(it) }
+        }
+        if (destination != null && backStack.lastOrNull() != destination) {
+            backStack.add(destination)
         }
     }
-
     companion object {
         // v274：OAuth 登录回跳后自动打开对应供应商设置页（照搬 ExTV rikkahub-agent）
         const val EXTRA_OPEN_CODEX_SETTINGS = "open_codex_settings"
@@ -289,25 +291,8 @@ class RouteActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        // v274：OAuth 登录回跳（热路径）
-        if (intent.getBooleanExtra(EXTRA_OPEN_CODEX_SETTINGS, false)) {
-            val destination = Screen.SettingProviderDetail(DEFAULT_CODEX_PROVIDER_ID.toString())
-            navStack?.let { stack ->
-                if (stack.lastOrNull() != destination) stack.add(destination)
-            }
-            intent.removeExtra(EXTRA_OPEN_CODEX_SETTINGS)
-        }
-        if (intent.getBooleanExtra(EXTRA_OPEN_GEMINI_SETTINGS, false)) {
-            val destination = Screen.SettingProviderDetail(DEFAULT_GEMINI_OAUTH_PROVIDER_ID.toString())
-            navStack?.let { stack ->
-                if (stack.lastOrNull() != destination) stack.add(destination)
-            }
-            intent.removeExtra(EXTRA_OPEN_GEMINI_SETTINGS)
-        }
-        // Navigate to the chat screen if a conversation ID is provided
-        intent.getStringExtra("conversationId")?.let { text ->
-            navStack?.add(Screen.Chat(text))
-        }
+        setIntent(intent)
+        handleIntent(intent)
     }
 
     @OptIn(ExperimentalComposeUiApi::class)
@@ -342,9 +327,12 @@ class RouteActivity : ComponentActivity() {
         )
 
         val backStack = rememberNavBackStack(startScreen)
-        SideEffect { this@RouteActivity.navStack = backStack }
-
-        ShareHandler(backStack)
+        SideEffect {
+            navStack = backStack
+            while (pendingIntents.isNotEmpty()) {
+                handleIntent(pendingIntents.removeFirst())
+            }
+        }
 
         SharedTransitionLayout {
             CompositionLocalProvider(

@@ -8,6 +8,7 @@ import me.rerere.ai.provider.BuiltInTools
 import me.rerere.ai.provider.Model
 import me.rerere.rikkahub.data.ai.mcp.McpManager
 import me.rerere.rikkahub.data.ai.tools.local.LocalTools
+import me.rerere.rikkahub.data.ai.tools.local.providerHostOf
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.files.SkillManager
 import me.rerere.rikkahub.data.model.Assistant
@@ -59,7 +60,9 @@ class ChatToolFactory(
         if (shouldUseExternalWebSearch(assistant, model)) {
             addAll(createSearchTools(settings))
         }
-        addAll(localTools.getTools(assistant.localTools))
+        // v300：把本次生成用的供应商/模型告诉本地工具装配 ——
+        // 商汤 + kimi 组合不提供 ask_user（选项会被网关吃掉，用户只会被卡住）
+        addAll(localTools.getTools(assistant.localTools, providerHostOf(model, settings), model.modelId))
         if (assistant.enableRecentChatsReference) {
             addAll(createConversationTools(conversationRepository, assistant.id))
         }

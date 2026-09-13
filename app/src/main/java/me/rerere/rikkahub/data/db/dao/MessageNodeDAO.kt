@@ -51,6 +51,10 @@ interface MessageNodeDAO {
     @RawQuery
     suspend fun getConversationTokenStatsRaw(query: SupportSQLiteQuery): ConversationTokenStats
 
+    // v301：按「生成这条回答的模型」分组 —— 算钱要用（每个模型单价不同）
+    @RawQuery
+    suspend fun getConversationTokenStatsByModelRaw(query: SupportSQLiteQuery): List<ModelTokenStats>
+
     @RawQuery
     suspend fun getMessageCountPerDayRaw(query: SupportSQLiteQuery): List<MessageDayCount>
 }
@@ -81,7 +85,27 @@ data class ConversationTokenStats(
     val usageMessages: Int = 0,
 )
 
+/**
+ * v301：本对话里「按模型分组」的用量 —— 用来按各自单价算钱。
+ *
+ * modelId 取自消息上的 `modelId` 字段（每条回答都记着自己当时用的模型），
+ * 所以一个对话中途换过模型也能分别计价。json_extract 取不到时为 null。
+ * messageCount 只数**真正有用量的消息**（口径与 usageMessages 一致）——
+ * 用户消息、纯占位消息不该被算成「未计价」。
+ */
+data class ModelTokenStats(
+    val modelId: String? = null,
+    val promptTokens: Long = 0,
+    val completionTokens: Long = 0,
+    val cachedTokens: Long = 0,
+    val messageCount: Int = 0,
+)
+
 data class MessageDayCount(val day: String, val count: Int)
+
+// 官方 2.5.1：在 json_each() 的参数内校验 JSON，避免损坏行导致整个统计查询失败。
+// 使用 CASE 而非依赖 WHERE 条件的求值顺序，无效 JSON 按空数组处理。
+private const val VALID_MESSAGES_JSON = "CASE WHEN json_valid(mn.messages) THEN mn.messages ELSE '[]' END"
 
 // SQLite json_each() 展开 messages JSON 数组，json_extract() 提取 Token 字段并聚合
 private val TOKEN_STATS_SQL = SimpleSQLiteQuery(
@@ -89,7 +113,7 @@ private val TOKEN_STATS_SQL = SimpleSQLiteQuery(
         "COALESCE(SUM(CAST(${usageFieldSql("promptTokens")} AS INTEGER)), 0) AS promptTokens, " +
         "COALESCE(SUM(CAST(${usageFieldSql("completionTokens")} AS INTEGER)), 0) AS completionTokens, " +
         "COALESCE(SUM(CAST(${usageFieldSql("cachedTokens")} AS INTEGER)), 0) AS cachedTokens " +
-        "FROM message_node mn, json_each(mn.messages) j"
+        "FROM message_node mn, json_each($VALID_MESSAGES_JSON) j"
 )
 
 /**
@@ -112,10 +136,27 @@ private val CONVERSATION_TOKEN_STATS_SQL: String =
         "${sumOfUsageField("reasoningTokens")} AS reasoningTokens, " +
         // 三项任一 > 0 就算「这条消息有用量」：只报分项不报 total 的服务商也要被认出来
         "COALESCE(SUM(CASE WHEN ${usageFieldSql("promptTokens")} > 0 OR ${usageFieldSql("completionTokens")} > 0 OR ${usageFieldSql("totalTokens")} > 0 THEN 1 ELSE 0 END), 0) AS usageMessages " +
-        "FROM message_node mn, json_each(mn.messages) j " +
+        "FROM message_node mn, json_each($VALID_MESSAGES_JSON) j " +
         "WHERE mn.conversation_id = ?"
 
 suspend fun MessageNodeDAO.getTokenStats(): MessageTokenStats = getTokenStatsRaw(TOKEN_STATS_SQL)
+
+/** v301：按模型分组。同一套 COALESCE(累计, 水位) 口径，只是多一个 GROUP BY。 */
+private val CONVERSATION_TOKEN_STATS_BY_MODEL_SQL: String =
+    "SELECT json_extract(j.value, '\$.modelId') AS modelId, " +
+        "${sumOfUsageField("promptTokens")} AS promptTokens, " +
+        "${sumOfUsageField("completionTokens")} AS completionTokens, " +
+        "${sumOfUsageField("cachedTokens")} AS cachedTokens, " +
+        "COALESCE(SUM(CASE WHEN ${usageFieldSql("promptTokens")} > 0 OR ${usageFieldSql("completionTokens")} > 0 " +
+        "OR ${usageFieldSql("totalTokens")} > 0 THEN 1 ELSE 0 END), 0) AS messageCount " +
+        "FROM message_node mn, json_each($VALID_MESSAGES_JSON) j " +
+        "WHERE mn.conversation_id = ? " +
+        "GROUP BY json_extract(j.value, '\$.modelId')"
+
+suspend fun MessageNodeDAO.getConversationTokenStatsByModel(conversationId: String): List<ModelTokenStats> =
+    getConversationTokenStatsByModelRaw(
+        SimpleSQLiteQuery(CONVERSATION_TOKEN_STATS_BY_MODEL_SQL, arrayOf(conversationId))
+    )
 
 suspend fun MessageNodeDAO.getConversationTokenStats(conversationId: String): ConversationTokenStats =
     getConversationTokenStatsRaw(
@@ -128,7 +169,7 @@ suspend fun MessageNodeDAO.getMessageCountPerDay(startDate: String): List<Messag
         SimpleSQLiteQuery(
             "SELECT substr(json_extract(j.value, '$.createdAt'), 1, 10) AS day, " +
                 "COUNT(*) AS count " +
-                "FROM message_node mn, json_each(mn.messages) j " +
+                "FROM message_node mn, json_each($VALID_MESSAGES_JSON) j " +
                 "WHERE json_extract(j.value, '$.role') = 'user' " +
                 "AND json_extract(j.value, '$.createdAt') >= ? " +
                 "GROUP BY day",

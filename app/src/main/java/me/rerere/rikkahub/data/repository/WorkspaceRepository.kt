@@ -104,6 +104,11 @@ class WorkspaceRepository(
         return dao.getAll().any { it.id != excludeId && it.name.trim() == target }
     }
 
+    // 官方 2.5.1：终端兼容模式（终端起不来时启用）
+    suspend fun setShellCompatibilityMode(id: String, enabled: Boolean) {
+        dao.setShellCompatibilityMode(id, enabled, System.currentTimeMillis())
+    }
+
     suspend fun setToolApproval(id: String, toolName: String, needsApproval: Boolean): Boolean {
         val workspace = dao.getById(id) ?: return false
         val overrides = workspace.toolApprovalOverrides() + (toolName to needsApproval)
@@ -344,7 +349,10 @@ class WorkspaceRepository(
             WorkspaceBoostManager.begin()
             try {
                 manager.ensureWorkspace(workspace.root)
-                manager.executeCommand(workspace.root, command, cwd, timeoutMillis, stdin)
+                manager.executeCommand(
+                    workspace.root, command, cwd, timeoutMillis, stdin,
+                    shellCompatibilityMode = workspace.shellCompatibilityMode,
+                )
             } finally {
                 WorkspaceBoostManager.end()
             }

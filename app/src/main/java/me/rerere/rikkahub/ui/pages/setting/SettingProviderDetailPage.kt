@@ -356,7 +356,8 @@ private fun SettingProviderConfigPage(
 
             Button(
                 onClick = {
-                    onEdit(internalProvider)
+                    val providerToSave: ProviderSetting = internalProvider
+                    onEdit(providerToSave.copyProvider(name = providerToSave.name.trim()))
                 }
             ) {
                 Text(stringResource(R.string.setting_provider_page_save))
@@ -619,7 +620,7 @@ private fun ModelSettingsForm(
                         OutlinedTextField(
                             value = model.displayName,
                             onValueChange = {
-                                onModelChange(model.copy(displayName = it.trim()))
+                                onModelChange(model.copy(displayName = it))
                             },
                             label = { Text(stringResource(if (isEdit) R.string.setting_provider_page_model_name else R.string.setting_provider_page_model_display_name)) },
                             modifier = Modifier.fillMaxWidth(),
@@ -628,6 +629,33 @@ private fun ModelSettingsForm(
                                     Text(stringResource(R.string.setting_provider_page_model_display_name_placeholder))
                                 }
                             }
+                        )
+
+                        // v301：自定义单价（每 100 万 token）。
+                        // 中转站价目表各家不同、还会变，内置一份只会算错 —— 所以由用户自己填，
+                        // 只用来在「本对话 token 明细」里估算花费。留空 = 不参与估算。
+                        PriceInputField(
+                            identity = model.id,
+                            value = model.inputPricePerMillion,
+                            onValueChange = { onModelChange(model.copy(inputPricePerMillion = it)) },
+                            label = stringResource(R.string.setting_provider_page_model_input_price),
+                        )
+                        PriceInputField(
+                            identity = model.id,
+                            value = model.outputPricePerMillion,
+                            onValueChange = { onModelChange(model.copy(outputPricePerMillion = it)) },
+                            label = stringResource(R.string.setting_provider_page_model_output_price),
+                        )
+                        PriceInputField(
+                            identity = model.id,
+                            value = model.cachedPricePerMillion,
+                            onValueChange = { onModelChange(model.copy(cachedPricePerMillion = it)) },
+                            label = stringResource(R.string.setting_provider_page_model_cached_price),
+                        )
+                        Text(
+                            text = stringResource(R.string.setting_provider_page_model_price_hint),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
 
                         ModelTypeSelector(
@@ -717,7 +745,9 @@ private fun AddModelButton(
     parentProvider: ProviderSetting,
     onUpdateProvider: (ProviderSetting) -> Unit
 ) {
-    val dialogState = useEditState<Model> { onAddModel(it) }
+    val dialogState = useEditState<Model> {
+        onAddModel(it.copy(displayName = it.displayName.trim()))
+    }
     val scope = rememberCoroutineScope()
 
     Row(
@@ -1188,6 +1218,44 @@ fun ModalAbilitySelector(
     }
 }
 
+/**
+ * v301：单价输入框。
+ *
+ * 为什么自己保存一份文本：直接绑定 Double 时，用户打「1.」会立刻被解析成 1 又把文本刷回
+ * 「1」，小数点被吃掉、没法继续输入。这里本地存文本、只往上层交解析结果。
+ *
+ * identity 用模型 id：编辑框复用时靠它重置文本，否则换一个模型还会显示上一个的价格。
+ * 输入只放行数字和小数点（单价不可能是负数）。
+ */
+@Composable
+private fun PriceInputField(
+    identity: Any?,
+    value: Double?,
+    onValueChange: (Double?) -> Unit,
+    label: String,
+    modifier: Modifier = Modifier,
+) {
+    var text by remember(identity) {
+        mutableStateOf(value?.let { formatPriceInput(it) } ?: "")
+    }
+    OutlinedTextField(
+        value = text,
+        onValueChange = { raw ->
+            val filtered = raw.filter { char -> char.isDigit() || char == '.' }
+            text = filtered
+            onValueChange(filtered.toDoubleOrNull())
+        },
+        label = { Text(label) },
+        modifier = modifier.fillMaxWidth(),
+        singleLine = true,
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+    )
+}
+
+/** 15.0 → "15"、0.35 → "0.35"（回显时不要多出一个没意义的 .0） */
+private fun formatPriceInput(value: Double): String =
+    if (value == value.toLong().toDouble()) value.toLong().toString() else value.toString()
+
 @Composable
 private fun ModelCard(
     model: Model,
@@ -1197,7 +1265,7 @@ private fun ModelCard(
     parentProvider: ProviderSetting
 ) {
     val dialogState = useEditState<Model> {
-        onEdit(it)
+        onEdit(it.copy(displayName = it.displayName.trim()))
     }
     val swipeToDismissBoxState = rememberSwipeToDismissBoxState()
     val scope = rememberCoroutineScope()
@@ -1590,7 +1658,7 @@ private fun ProviderOverrideSettings(
                         }
                         TextButton(
                             onClick = {
-                                onUpdateProviderOverride(internalProvider)
+                                onUpdateProviderOverride(internalProvider.copyProvider(name = internalProvider.name.trim()))
                                 showProviderConfig = false
                                 editingProvider = null
                             },

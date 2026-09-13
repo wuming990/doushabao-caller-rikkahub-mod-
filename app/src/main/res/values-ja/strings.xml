@@ -237,6 +237,7 @@
   <string name="chat_conversation_token_summary">この会話 ↑%1$s ↓%2$s Σ%3$s</string>
   <string name="chat_conversation_token_detail_title">この会話のトークン使用量</string>
   <string name="chat_conversation_token_reasoning">うち推論</string>
+  <string name="chat_conversation_token_cache_hit_rate">キャッシュヒット率</string>
   <string name="chat_conversation_token_total">合計</string>
   <string name="chat_conversation_token_note">ツール呼び出しと自動続き生成でコンテキストを再送信した分もすべて計上しています。タイトル生成・提案・圧縮・翻訳などのバックグラウンド消費とサブエージェントの消費は含みません。</string>
   <string name="chat_conversation_token_close">閉じる</string>
@@ -1277,7 +1278,7 @@ mDNSアドレス: .localホスト名を使用し、IPを知らなくても同じ
   <string name="setting_display_page_tts_read_outside_brackets_title">TTS 括弧内を読み上げない</string>
   <string name="setting_display_page_tts_read_outside_brackets_desc">有効にすると、TTS は括弧内の内容を読み上げません</string>
   <string name="assistant_page_context_message_limit">コンテキストメッセージ上限</string>
-  <string name="assistant_page_context_message_limit_desc">モデルに送信する直近のメッセージ数の上限を設定します。上限を超えた場合、ターンごとに1件ずつ削除するのではなく、一度にコンテキストを約半分まで切り詰めます。これによりリクエストのプレフィックスが安定し、プロンプトキャッシュが多くのターンにわたって有効に働きます。</string>
+  <string name="assistant_page_context_message_limit_desc">モデルに送信する最近のメッセージ数を制限します。</string>
   <string name="assistant_page_context_message_limit_count">コンテキストメッセージ制限: %d</string>
   <string name="assistant_page_context_message_limit_unlimited">コンテキストメッセージ無制限</string>
   <string name="assistant_page_context_message_limit_warning">コンテキストの制限は、コンテキストが切り詰められるたびにプロンプトキャッシュを無効化します。制限が大きいほど切り詰めの頻度が減り、無制限なら切り詰めが発生せず、キャッシュは完全に保持されます。</string>
@@ -1387,5 +1388,29 @@ mDNSアドレス: .localホスト名を使用し、IPを知らなくても同じ
   <string name="setting_page_asr_silence_duration">発話終了の無音時間</string>
   <string name="setting_page_asr_silence_duration_desc">無音がこの時間続いたら発話を終了します。推奨: 800〜1000 ms。</string>
   <string name="setting_page_asr_milliseconds">ミリ秒</string>
+  <string name="assistant_page_time_reminder_interval">時間リマインダー間隔</string>
+  <string name="assistant_page_time_reminder_interval_label">間隔（分）</string>
+  <string name="assistant_page_time_reminder_interval_hint">正の整数を入力してください。メッセージ間隔がこの値を超えると、リマインダーが挿入されます。</string>
+  <string name="assistant_page_time_reminder_interval_desc">メッセージ間隔がこの間隔を超えた場合にリマインダーを挿入します。最初のユーザーメッセージの前には常にリマインドします。</string>
+  <string name="assistant_page_time_reminder_interval_value">%1$d 分</string>
+  <string name="assistant_page_context_message_limit_hint">0を入力すると無制限になります。それ以外の場合、値は大きいほど良いです。0または20以上に設定することをお勧めします。</string>
+  <string name="imggen_page_delete_images_title">画像を削除</string>
+  <string name="imggen_page_delete_images_message">選択した画像 (%1$d) を削除しますか？この操作は元に戻せません。</string>
+  <string name="imggen_page_delete_images_success">画像を%1$d件削除しました</string>
+  <string name="imggen_page_delete_images_failed">削除：%1$d件、失敗：%2$d件。もう一度お試しください。</string>
+  <string name="imggen_page_deleting">削除中…</string>
+  <string name="imggen_page_selected_count">選択中: %1$d</string>
+  <string name="imggen_page_select_image">画像を選択</string>
+  <string name="workspace_detail_compatibility_mode">互換モード</string>
+  <string name="workspace_detail_compatibility_mode_desc">ターミナルが起動しない場合、これを有効にしてみてください。パフォーマンスが低下する可能性があります。新しいターミナルタブとその後のコマンドに適用されます。</string>
+  <string name="workspace_detail_settings_save_failed">設定の保存に失敗しました</string>
+  <string name="chat_message_tool_ask_skip">スキップ</string>
+  <string name="chat_conversation_token_cost">≈ コスト</string>
+  <string name="chat_conversation_token_cost_note">入力した単価（100万トークンあたり）からの概算です。キャッシュ単価が未入力の場合は入力単価で計算します。タイトル生成・提案・圧縮・翻訳などのバックグラウンド呼び出しとサブエージェントの消費は含みません。</string>
+  <string name="chat_conversation_token_cost_unpriced">%1$d 件のメッセージは未計上：モデルに単価が設定されていません</string>
+  <string name="setting_provider_page_model_input_price">入力単価（100万トークンあたり）</string>
+  <string name="setting_provider_page_model_output_price">出力単価（100万トークンあたり）</string>
+  <string name="setting_provider_page_model_cached_price">キャッシュ入力単価（100万トークンあたり）</string>
+  <string name="setting_provider_page_model_price_hint">任意。会話のトークン詳細で費用を概算するためだけに使います。未入力なら概算しません。キャッシュ単価が空欄なら入力単価で計算します。通貨記号は表示しないので、ご自身の通貨で入力してください。</string>
 </resources>
 

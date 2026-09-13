@@ -242,6 +242,7 @@
   <string name="chat_conversation_token_summary">本对话 ↑%1$s ↓%2$s Σ%3$s</string>
   <string name="chat_conversation_token_detail_title">本对话 token 明细</string>
   <string name="chat_conversation_token_reasoning">其中思考</string>
+  <string name="chat_conversation_token_cache_hit_rate">缓存命中率</string>
   <string name="chat_conversation_token_total">合计</string>
   <string name="chat_conversation_token_note">每调用一次工具、每自动续跑一次都会把全量上下文重发一遍，这些都已计入。不含起标题、生成建议、压缩历史、翻译等后台消耗，也不含子代理的消耗。</string>
   <string name="chat_conversation_token_close">关闭</string>
@@ -1523,7 +1524,7 @@ mDNS 地址：使用 .local 主机名，同一网络中的其他设备可通过�
   <string name="chat_page_delete_folder_confirm">删除文件夹 "%1$s"？其中的对话不会被删除，只会从文件夹中移除。</string>
   <string name="chat_page_delete_folder_generating">此文件夹中有对话仍在生成中，请停止后再删除。</string>
   <string name="assistant_page_context_message_limit">上下文消息限制</string>
-  <string name="assistant_page_context_message_limit_desc">限制发送给模型的最近消息数量。超出限制时，上下文会一次性缩减至约一半，而非每轮丢弃一条消息，从而保持请求前缀稳定，并使提示词缓存在多轮对话中持续生效。</string>
+  <string name="assistant_page_context_message_limit_desc">限制发送给模型的最近消息数量</string>
   <string name="assistant_page_context_message_limit_count">上下文消息限制: %d</string>
   <string name="assistant_page_context_message_limit_unlimited">无限上下文消息</string>
   <string name="assistant_page_context_message_limit_warning">限制上下文会在每次上下文被修剪时使提示词缓存失效。更大的限制修剪频率更低；无限制则从不修剪，并保持缓存完全完好。</string>
@@ -1809,7 +1810,7 @@ mDNS 地址：使用 .local 主机名，同一网络中的其他设备可通过�
   <string name="setting_page_preferences_network_user_agent_desc">留空以使用 %1$s</string>
   <string name="setting_page_preferences_network">网络</string>
   <string name="setting_page_preferences_network_user_agent">User-Agent</string>
-  <string name="assistant_page_context_message_limit_hint">输入 0 表示不限制，其他值不能小于 %d</string>
+  <string name="assistant_page_context_message_limit_hint">输入 0 表示不限制，否则越大越好，推荐设置为 0 或者 20 以上</string>
   <string name="assistant_page_context_message_limit_too_small">上下文消息限制不能小于 %1$d，已自动重置为 %1$d。</string>
   <string name="setting_page_preferences_network_proxy">代理</string>
   <string name="setting_page_preferences_network_proxy_desc">支持 HTTP 和 SOCKS5 代理 URL。留空以使用系统设置。</string>
@@ -1904,4 +1905,27 @@ mDNS 地址：使用 .local 主机名，同一网络中的其他设备可通过�
   <string name="chat_page_voice_end">结束</string>
   <string name="chat_page_voice_configure_asr">请先在语音设置中配置 ASR</string>
   <string name="chat_page_voice_unsupported_asr">当前 ASR 不支持服务端断句，请使用 OpenAI Realtime、DashScope 或火山</string>
+  <string name="assistant_page_time_reminder_interval">时间提醒间隔</string>
+  <string name="assistant_page_time_reminder_interval_label">间隔（分钟）</string>
+  <string name="assistant_page_time_reminder_interval_hint">请输入正整数。当消息间隔超过该时间间隔时，将插入一条提醒。</string>
+  <string name="assistant_page_time_reminder_interval_desc">当消息间隔超过此设定值时插入提醒。始终在第一条用户消息之前提醒。</string>
+  <string name="assistant_page_time_reminder_interval_value">%1$d 分钟</string>
+  <string name="imggen_page_delete_images_title">删除图片</string>
+  <string name="imggen_page_delete_images_message">删除选定的图片（%1$d）？此操作无法撤销。</string>
+  <string name="imggen_page_delete_images_success">已删除 %1$d 张图片</string>
+  <string name="imggen_page_delete_images_failed">已删除：%1$d。失败：%2$d。请重试。</string>
+  <string name="imggen_page_deleting">删除中…</string>
+  <string name="imggen_page_selected_count">已选择：%1$d</string>
+  <string name="imggen_page_select_image">选择图片</string>
+  <string name="workspace_detail_compatibility_mode">兼容模式</string>
+  <string name="workspace_detail_compatibility_mode_desc">如果终端无法启动，请尝试启用此功能。这可能会降低性能。适用于新的终端标签页及后续命令。</string>
+  <string name="workspace_detail_settings_save_failed">保存设置失败</string>
+  <string name="chat_message_tool_ask_skip">跳过</string>
+  <string name="chat_conversation_token_cost">≈ 消耗</string>
+  <string name="chat_conversation_token_cost_note">按你填写的单价估算（每 100 万 token 的价格）。缓存没填价时按输入价计算。不含起标题、生成建议、压缩历史、翻译等后台调用，也不含子代理的消耗。</string>
+  <string name="chat_conversation_token_cost_unpriced">%1$d 条消息未计入：它的模型没有填写价格</string>
+  <string name="setting_provider_page_model_input_price">输入价（每百万 token）</string>
+  <string name="setting_provider_page_model_output_price">输出价（每百万 token）</string>
+  <string name="setting_provider_page_model_cached_price">缓存命中价（每百万 token）</string>
+  <string name="setting_provider_page_model_price_hint">选填。只用于「本对话 token 明细」里的花费估算，不填就不估。缓存价留空时按输入价计算。界面不显示货币符号，按你自己的货币单位填即可。</string>
 </resources>

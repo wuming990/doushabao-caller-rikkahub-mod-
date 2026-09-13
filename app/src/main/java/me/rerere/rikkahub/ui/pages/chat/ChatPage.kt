@@ -103,6 +103,7 @@ import me.rerere.rikkahub.ui.components.ai.ChatFileBrowserSheet
 import me.rerere.rikkahub.ui.components.ai.ChatImageTarget
 import me.rerere.rikkahub.ui.components.ai.ChatImageTargetDialog
 import me.rerere.rikkahub.data.db.dao.ConversationTokenStats
+import me.rerere.rikkahub.ui.components.ai.ConversationCost
 import me.rerere.rikkahub.ui.components.ai.ConversationTokenStatsDialog
 import me.rerere.rikkahub.ui.components.ai.ConversationTokenStatsLine
 import me.rerere.rikkahub.ui.components.ai.FilesPicker
@@ -143,6 +144,9 @@ fun ChatPage(
             parametersOf(id.toString())
         }
     )
+    // v300：每次进入本对话页都检查一次「本对话上次用的模型」。
+    // VM 在导航返回时会被复用、init 只跑一次，所以不能只靠 VM 初始化。
+    LaunchedEffect(Unit) { vm.restoreRememberedModel() }
     val filesManager: FilesManager = koinInject()
     val navController = LocalNavController.current
     val scope = rememberCoroutineScope()
@@ -403,6 +407,8 @@ private fun ChatPageContent(
                     conversation = conversation,
                     // v297：本对话 token 累计（顶栏小字，可在设置里关掉）
                     tokenStats = vm.conversationTokenStats.collectAsStateWithLifecycle().value,
+                    // v301：按自填单价估算的花费（没填过价时为 null，弹窗里整行不出现）
+                    tokenCost = vm.conversationTokenCost.collectAsStateWithLifecycle().value,
                     showTokenStats = setting.displaySetting.showConversationTokenStats,
                     bigScreen = bigScreen,
                     drawerState = drawerState,
@@ -1298,6 +1304,8 @@ private fun TopBar(
     conversation: Conversation,
     // v297：本对话 token 累计（点开展示口径说明；开关关闭时整行不渲染）
     tokenStats: ConversationTokenStats = ConversationTokenStats(),
+    // v301：花费估算（用户自己填的单价算出来的）
+    tokenCost: ConversationCost? = null,
     showTokenStats: Boolean = false,
     drawerState: DrawerState,
     bigScreen: Boolean,
@@ -1398,6 +1406,7 @@ private fun TopBar(
     if (showTokenStatsDialog) {
         ConversationTokenStatsDialog(
             stats = tokenStats,
+            cost = tokenCost,
             onDismiss = { showTokenStatsDialog = false },
         )
     }

@@ -44,6 +44,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import me.rerere.ai.ui.ToolApprovalState
 import me.rerere.ai.ui.UIMessagePart
+import me.rerere.common.android.Logging
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.BubbleChatQuestion
 import me.rerere.hugeicons.stroke.Cancel01
@@ -282,12 +283,21 @@ private fun ChainOfThoughtScope.AskUserToolStep(
     // v297：参数里确实有内容、却一道题都没读出来 —— 卡片必须仍然可回答，不许留空白
     val unreadable = remember(arguments) { askUserArgumentsUnreadable(arguments) }
     LaunchedEffect(arguments) {
+        // v299：诊断日志同时写进 App 内日志页（Logging.log）。
+        // 只写 Log.w 时只有插电脑看 logcat 才看得到 —— 用户手上拿不到证据，
+        // 商汤渠道「选项一个都显示不出来」就一直只能猜。设置→日志 现在能直接看到并复制。
         if (unreadable) {
-            Log.w(TAG, "ask_user 未解析出任何问题（参数形状不符），已改用自由文本回答；原始参数片段: $arguments".take(400))
+            val msg = "ask_user 未解析出任何问题（参数形状不符），已改用自由文本回答；原始参数片段: $arguments".take(400)
+            Log.w(TAG, msg)
+            Logging.log(TAG, msg)
         }
         // v295：single/multi 缺 options 是「真机卡死」的上游现场（商汤渠道实遇），留证据
-        if (questions.any { it.selectionType != "text" && it.options.isEmpty() }) {
-            Log.w(TAG, "ask_user 选项缺失（single/multi 但 options 为空，已降级文本输入）；原始参数片段: $arguments".take(400))
+        // v299：条件与卡片摊原文保持一致 —— 纯文本题（schema 明确允许不带 options）是正常形态，
+        // 不该每次打开对话都记一条「选项缺失」把 100 条环形缓冲刷满（二轮审查位指出）。
+        if (questions.any { q -> q.options.isEmpty() && (q.selectionType != "text" || q.hadOptionsField) }) {
+            val msg = "ask_user 本该有选项却没解析出来（已降级文本输入）；原始参数片段: $arguments".take(400)
+            Log.w(TAG, msg)
+            Logging.log(TAG, msg)
         }
     }
 
@@ -380,116 +390,58 @@ private fun ChainOfThoughtScope.AskUserToolStep(
                         )
 
                         if (isPending && onToolAnswer != null) {
-                            when (q.selectionType) {
-                                "single" -> {
-                                    // Single select: chips only, no text input
-                                    // v295：上游可能不生成 options（可选字段）——无选项时降级为
-                                    // 自由文本输入，否则用户没有任何回答途径、提交键永远灰着（真机卡死）
-                                    if (q.options.isEmpty()) {
-                                        OutlinedTextField(
-                                            value = answers[q.id] ?: "",
-                                            onValueChange = { answers[q.id] = it },
-                                            modifier = Modifier.fillMaxWidth(),
-                                            textStyle = MaterialTheme.typography.bodySmall,
-                                            singleLine = false,
-                                            minLines = 1,
-                                            maxLines = 3,
+                            // 官方 2.5.1：不再「单选/多选只给选项、不给输入框」——
+                            // 每道题都能自己手打答案，多选还能把选项和自定义文字一起交。
+                            // 单选/多选即使一个选项都没有，也自然降级成纯文本，不会再卡死。
+                            //
+                            // v295 备忘（旧写法已由官方这版取代，教训保留）：
+                            // 上游可能不生成 options；旧版「单选/多选只给选项」时，选项一丢用户
+                            // 就没有任何回答途径、提交键永远灰着（商汤渠道真机卡死）。
+                            // 现在文本框恒在，等价于旧版那几处「选项为空就降级」的分支。
+                            if (q.options.isNotEmpty()) {
+                                FlowRow(
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                                ) {
+                                    q.options.forEach { option ->
+                                        val selectedOptions = multiAnswers[q.id] ?: emptySet()
+                                        FilterChip(
+                                            selected = if (q.selectionType == "multi") {
+                                                option in selectedOptions
+                                            } else {
+                                                answers[q.id] == option
+                                            },
+                                            onClick = {
+                                                if (q.selectionType == "multi") {
+                                                    multiAnswers[q.id] = if (option in selectedOptions) {
+                                                        selectedOptions - option
+                                                    } else {
+                                                        selectedOptions + option
+                                                    }
+                                                } else {
+                                                    answers[q.id] = option
+                                                }
+                                            },
+                                            label = {
+                                                Text(
+                                                    text = option,
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                )
+                                            },
                                         )
                                     }
-                                    if (q.options.isNotEmpty()) {
-                                        FlowRow(
-                                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                            verticalArrangement = Arrangement.spacedBy(4.dp),
-                                        ) {
-                                            q.options.forEach { option ->
-                                                FilterChip(
-                                                    selected = answers[q.id] == option,
-                                                    onClick = { answers[q.id] = option },
-                                                    label = {
-                                                        Text(
-                                                            text = option,
-                                                            style = MaterialTheme.typography.labelSmall,
-                                                        )
-                                                    },
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
-                                "multi" -> {
-                                    // Multi select: chips only, multiple can be selected
-                                    // v295：同 single —— 无选项时降级为自由文本输入（答案走 answers）
-                                    if (q.options.isEmpty()) {
-                                        OutlinedTextField(
-                                            value = answers[q.id] ?: "",
-                                            onValueChange = { answers[q.id] = it },
-                                            modifier = Modifier.fillMaxWidth(),
-                                            textStyle = MaterialTheme.typography.bodySmall,
-                                            singleLine = false,
-                                            minLines = 1,
-                                            maxLines = 3,
-                                        )
-                                    }
-                                    if (q.options.isNotEmpty()) {
-                                        FlowRow(
-                                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                            verticalArrangement = Arrangement.spacedBy(4.dp),
-                                        ) {
-                                            q.options.forEach { option ->
-                                                val selectedSet = multiAnswers[q.id] ?: emptySet()
-                                                FilterChip(
-                                                    selected = selectedSet.contains(option),
-                                                    onClick = {
-                                                        val current = selectedSet.toMutableSet()
-                                                        if (current.contains(option)) current.remove(option)
-                                                        else current.add(option)
-                                                        multiAnswers[q.id] = current
-                                                    },
-                                                    label = {
-                                                        Text(
-                                                            text = option,
-                                                            style = MaterialTheme.typography.labelSmall,
-                                                        )
-                                                    },
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
-                                else -> {
-                                    // Text (default): optional option chips + free text input
-                                    if (q.options.isNotEmpty()) {
-                                        FlowRow(
-                                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                            verticalArrangement = Arrangement.spacedBy(4.dp),
-                                        ) {
-                                            q.options.forEach { option ->
-                                                FilterChip(
-                                                    selected = answers[q.id] == option,
-                                                    onClick = { answers[q.id] = option },
-                                                    label = {
-                                                        Text(
-                                                            text = option,
-                                                            style = MaterialTheme.typography.labelSmall,
-                                                        )
-                                                    },
-                                                )
-                                            }
-                                        }
-                                    }
-
-                                    // Free text input
-                                    OutlinedTextField(
-                                        value = answers[q.id] ?: "",
-                                        onValueChange = { answers[q.id] = it },
-                                        modifier = Modifier.fillMaxWidth(),
-                                        textStyle = MaterialTheme.typography.bodySmall,
-                                        singleLine = false,
-                                        minLines = 1,
-                                        maxLines = 3,
-                                    )
                                 }
                             }
+
+                            OutlinedTextField(
+                                value = answers[q.id] ?: "",
+                                onValueChange = { answers[q.id] = it },
+                                modifier = Modifier.fillMaxWidth(),
+                                textStyle = MaterialTheme.typography.bodySmall,
+                                singleLine = false,
+                                minLines = 1,
+                                maxLines = 3,
+                            )
                         } else if (isAnswered) {
                             // Show the user's answer
                             val answeredState = tool.approvalState as ToolApprovalState.Answered
@@ -503,7 +455,9 @@ private fun ChainOfThoughtScope.AskUserToolStep(
                             val answerText = (answersNode?.get(q.id) as? JsonPrimitive)?.contentOrNull
                                 ?: answeredState.answer
                             Text(
-                                text = answerText,
+                                // v300：跳过的题目答案是空串，直接显示会是一行莫名其妙的空白 ——
+                                // 复用「跳过」这个词当占位（不新增文案）。
+                                text = answerText.ifBlank { stringResource(R.string.chat_message_tool_ask_skip) },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.primary,
                             )
@@ -511,72 +465,122 @@ private fun ChainOfThoughtScope.AskUserToolStep(
                     }
                 }
 
-                // Submit button
+                // v299：某题「本该有选项却没解析出来」时，把模型给的原始参数摊在卡片上。
+                // 商汤渠道真机实遇「题干显示正常、选项一个都看不到」——先让用户当场能照着原文作答，
+                // 同时把真实形状留成证据（同一份文本也写进了 App 内日志页，设置→日志可复制）。
+                // ⚠️ 条件必须收窄（审查位抓到）：schema 允许纯文本题不带 options，
+                // 只看「选项为空」会把所有渠道的正常自由文本提问卡都摊成一段 JSON。
+                if (
+                    isPending &&
+                    questions.any { q ->
+                        q.options.isEmpty() && (q.selectionType != "text" || q.hadOptionsField)
+                    }
+                ) {
+                    Text(
+                        text = arguments.toString().take(400),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.outline,
+                        maxLines = 4,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+
+                // Submit / 跳过（官方 2.5.1 版式 + v300 二改：跳过按钮）
                 if (isPending && onToolAnswer != null) {
-                    FilledTonalButton(
-                        onClick = {
-                            // v297：没解析出任何题目时，把「卡片没能读出问题」这件事如实回传给模型。
-                            // 否则模型只收到一个空 answers，会以为用户沉默，然后原地打转
-                            // （这次就是主模型自己发错参数、拿回空答案却查不到原因）。
-                            val answerPayload = if (questions.isEmpty()) {
-                                buildJsonObject {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        // v300（二改）：跳过。
+                        // 官方卡片只给「提交」，模型问的问题一旦不是你想要的（或选项丢了、
+                        // 只剩自由文本框），人就卡在这里出不去——真机实遇。
+                        // 跳过会把「用户未作答」如实回传给模型，让它自己决定继续，而不是空等。
+                        TextButton(
+                            onClick = {
+                                val skipPayload = buildJsonObject {
                                     put("answers", buildJsonObject {
-                                        put("free_text", JsonPrimitive(freeTextAnswer.trim()))
+                                        if (questions.isEmpty()) {
+                                            put("free_text", JsonPrimitive(""))
+                                        } else {
+                                            questions.forEach { q -> put(q.id, JsonPrimitive("")) }
+                                        }
                                     })
                                     put(
                                         "note",
                                         JsonPrimitive(
-                                            "ask_user 卡片没能从参数里解析出任何问题（参数形状不符合约定）。" +
-                                                "answers.free_text 里是用户的自由回答。" +
-                                                "需要提问请改用普通文本，或把 options 改成纯字符串列表后重发。"
+                                            "用户跳过了本次询问，没有作答。请基于现有信息自行决定并继续，" +
+                                                "不要重复问同样的问题；如果确实必须知道，请改用普通文字再问一次。"
                                         )
                                     )
                                 }
-                            } else {
-                                buildJsonObject {
-                                    put("answers", buildJsonObject {
-                                        questions.forEach { q ->
-                                            when (q.selectionType) {
-                                                // v295：无选项时取文本框内容
-                                                "multi" -> put(q.id, JsonPrimitive(
-                                                    if (q.options.isEmpty()) answers[q.id] ?: ""
-                                                    else multiAnswers[q.id]?.joinToString(", ") ?: ""
-                                                ))
-                                                else -> put(q.id, JsonPrimitive(answers[q.id] ?: ""))
-                                            }
-                                        }
-                                    })
-                                }
-                            }
-                            onToolAnswer(tool.toolCallId, answerPayload.toString())
-                        },
-                        // v297：空题目时不能再靠「空列表 all 恒真」放行，必须让用户真的打了字才能提交
-                        enabled = if (questions.isEmpty()) {
-                            freeTextAnswer.isNotBlank()
-                        } else {
-                            questions.all { q ->
-                                when (q.selectionType) {
-                                    // v295：无选项时答案在文本框（answers）里
-                                    "multi" -> if (q.options.isEmpty()) {
-                                        !answers[q.id].isNullOrBlank()
-                                    } else {
-                                        !multiAnswers[q.id].isNullOrEmpty()
+                                onToolAnswer(tool.toolCallId, skipPayload.toString())
+                            },
+                        ) {
+                            Text(stringResource(R.string.chat_message_tool_ask_skip))
+                        }
+
+                        FilledTonalButton(
+                            onClick = {
+                                // v297：没解析出任何题目时，把「卡片没能读出问题」这件事如实回传给模型。
+                                // 否则模型只收到一个空 answers，会以为用户沉默，然后原地打转
+                                // （这次就是主模型自己发错参数、拿回空答案却查不到原因）。
+                                val answerPayload = if (questions.isEmpty()) {
+                                    buildJsonObject {
+                                        put("answers", buildJsonObject {
+                                            put("free_text", JsonPrimitive(freeTextAnswer.trim()))
+                                        })
+                                        put(
+                                            "note",
+                                            JsonPrimitive(
+                                                "ask_user 卡片没能从参数里解析出任何问题（参数形状不符合约定）。" +
+                                                    "answers.free_text 里是用户的自由回答。" +
+                                                    "需要提问请改用普通文本，或把 options 改成纯字符串列表后重发。"
+                                            )
+                                        )
                                     }
-                                    else -> !answers[q.id].isNullOrBlank()
+                                } else {
+                                    buildJsonObject {
+                                        put("answers", buildJsonObject {
+                                            questions.forEach { q ->
+                                                when (q.selectionType) {
+                                                    // 官方 2.5.1：多选 = 已选选项 + 自定义文字（两者可同时存在）
+                                                    "multi" -> put(q.id, JsonPrimitive(
+                                                        (multiAnswers[q.id].orEmpty().toList() +
+                                                            listOfNotNull(answers[q.id]?.takeIf { it.isNotBlank() }))
+                                                            .joinToString(", ")
+                                                    ))
+                                                    else -> put(q.id, JsonPrimitive(answers[q.id] ?: ""))
+                                                }
+                                            }
+                                        })
+                                    }
                                 }
-                            }
-                        },
-                        modifier = Modifier.align(Alignment.End),
-                    ) {
-                        Icon(
-                            imageVector = HugeIcons.Tick01,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Text(
-                            text = stringResource(R.string.chat_message_tool_submit),
-                            modifier = Modifier.padding(start = 4.dp),
-                        )
+                                onToolAnswer(tool.toolCallId, answerPayload.toString())
+                            },
+                            // v297：空题目时不能再靠「空列表 all 恒真」放行，必须让用户真的打了字才能提交
+                            // 官方 2.5.1 语义：多选「选了选项」或「打了字」都算答过
+                            enabled = if (questions.isEmpty()) {
+                                freeTextAnswer.isNotBlank()
+                            } else {
+                                questions.all { q ->
+                                    when (q.selectionType) {
+                                        "multi" -> !multiAnswers[q.id].isNullOrEmpty() || !answers[q.id].isNullOrBlank()
+                                        else -> !answers[q.id].isNullOrBlank()
+                                    }
+                                }
+                            },
+                        ) {
+                            Icon(
+                                imageVector = HugeIcons.Tick01,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Text(
+                                text = stringResource(R.string.chat_message_tool_submit),
+                                modifier = Modifier.padding(start = 4.dp),
+                            )
+                        }
                     }
                 }
             }

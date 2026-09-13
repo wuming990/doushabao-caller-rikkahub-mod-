@@ -148,4 +148,61 @@ class AskUserParsingTest {
         assertEquals(emptyList<AskUserQuestion>(), parseAskUserQuestions(json("""{"questions":null}""")))
         assertEquals(emptyList<AskUserQuestion>(), parseAskUserQuestions(null))
     }
+
+    // ---- v299：商汤渠道 + kimi-k3 真机实遇「题干显示正常、选项一个都看不到」后补的形状 ----
+
+    @Test
+    fun `选项被塞成 JSON 字符串时也能读出来`() {
+        // 网关/模型把数组序列化成字符串：options 的值是 "[\"甲\",\"乙\"]" 这个字符串
+        val questions = parseAskUserQuestions(
+            json("""{"questions":[{"id":"a","question":"题","options":"[\"甲\",\"乙\"]"}]}""")
+        )
+        assertEquals(listOf("甲", "乙"), questions[0].options)
+    }
+
+    @Test
+    fun `选项写成用分隔符隔开的一整串时也能读出来`() {
+        fun opts(raw: String) = parseAskUserQuestions(
+            json("""{"questions":[{"id":"a","question":"题","options":"$raw"}]}""")
+        ).first().options
+        assertEquals(listOf("甲", "乙", "丙"), opts("甲|乙|丙"))
+        assertEquals(listOf("甲", "乙"), opts("甲、乙"))
+        // 换行必须写成「反斜杠+n」进 JSON 文本（Kotlin 源里写 \\n），否则真换行会直接
+        // 插进 JSON 字符串里变成非法 JSON；编号前缀由生产代码剥掉（v299 审查位抓到）
+        assertEquals(listOf("甲", "乙"), opts("1. 甲\\n2. 乙"))
+        assertEquals(listOf("甲", "乙"), opts("1) 甲\\n2) 乙"))
+        // 序号后面没有空白时不许剥 —— 否则「3.5 倍」会被削成「5 倍」
+        assertEquals(listOf("3.5 倍以内", "5 倍以上"), opts("3.5 倍以内|5 倍以上"))
+        // 已知取舍（审查位要求钉住，避免以后无声变化）：单个选项里自带逗号时会被切碎。
+        // 之所以仍然收逗号：模型把选项写成整串时，逗号分隔是最常见的形态，
+        // 放弃逗号会让「可以,不可以」变成一整条选项，代价更大。
+        assertEquals(listOf("是的", "我需要"), opts("是的，我需要"))
+        // 整串本来就只有一个选项时，不能切碎
+        assertEquals(listOf("只有一个选项"), opts("只有一个选项"))
+    }
+
+    @Test
+    fun `选项字段被换名成 choices 时也能读出来`() {
+        val questions = parseAskUserQuestions(
+            json("""{"questions":[{"id":"a","question":"题","choices":["甲","乙"]}]}""")
+        )
+        assertEquals(listOf("甲", "乙"), questions[0].options)
+    }
+
+    @Test
+    fun `参数本身就是数组时也能读出来`() {
+        val questions = parseAskUserQuestions(
+            json("""[{"id":"a","question":"题","options":["甲"]}]""")
+        )
+        assertEquals(1, questions.size)
+        assertEquals(listOf("甲"), questions[0].options)
+    }
+
+    @Test
+    fun `题干换名成 title 时也能读出来`() {
+        val questions = parseAskUserQuestions(
+            json("""{"questions":[{"id":"a","title":"用 title 当题干","options":["甲"]}]}""")
+        )
+        assertEquals("用 title 当题干", questions[0].question)
+    }
 }

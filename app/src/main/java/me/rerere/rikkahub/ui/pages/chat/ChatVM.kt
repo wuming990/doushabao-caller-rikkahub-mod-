@@ -22,22 +22,31 @@ import me.rerere.rikkahub.utils.UpdateInfo
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import me.rerere.ai.provider.Model
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.ai.ui.isEmptyInputMessage
+import me.rerere.common.android.Logging
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.ai.prompts.DEFAULT_COMPRESS_PROMPT
 import me.rerere.rikkahub.data.db.dao.ConversationTokenStats
+import me.rerere.rikkahub.data.db.dao.ModelTokenStats
 import me.rerere.rikkahub.data.db.dao.MessageNodeDAO
 import me.rerere.rikkahub.data.db.dao.getConversationTokenStats
+import me.rerere.rikkahub.data.db.dao.getConversationTokenStatsByModel
+import me.rerere.rikkahub.ui.components.ai.ConversationCost
+import me.rerere.rikkahub.ui.components.ai.ModelPrice
+import me.rerere.rikkahub.ui.components.ai.ModelUsageSlice
+import me.rerere.rikkahub.ui.components.ai.computeConversationCost
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.datastore.getCurrentAssistant
@@ -85,7 +94,16 @@ class ChatVM(
     private val _conversationId: Uuid = Uuid.parse(id)
     val conversation: StateFlow<Conversation> = chatService.getConversationFlow(_conversationId)
 
-    init {
+    /**
+     * v268 / v299 / v300：打开（或重新进入）本对话时，恢复它最后一次使用的模型。
+     *
+     * v300（用户反馈「时灵时不灵」）的根因：这段逻辑原来写在 init 里，而 ViewModel 在
+     * 导航返回时是**被复用**的 —— 从 A 对话切到 B、再退回 A 时，A 的导航条目自带的
+     * ViewModelStore 还在，VM 不会重建，init 一辈子只跑一次，于是「切回来」这一步
+     * 根本不会重新恢复，界面停在上一个对话的模型上。
+     * 现在抽成幂等函数，由 ChatPage 每次进入该页面时调用（重复调用无副作用）。
+     */
+    fun restoreRememberedModel() {
         // v268：对话级模型记忆（照 Chatbox 设计）—— 打开/切回对话时恢复它最后一次使用的模型。
         // 写回助手默认值是刻意的：全局「当前模型」跟随正在查看的对话（= 最近使用），
         // 新对话因此沿用最近使用的模型；已存在的其它对话不受影响（它们各自有自己的记忆）。
@@ -93,7 +111,10 @@ class ChatVM(
         // VM 创建瞬间那还是占位对话（assistantId = 当时的当前助手），跨助手打开时会把
         // 记忆模型写错到别的助手头上。生成用的就是对话所属助手的模型，恢复只写它。
         viewModelScope.launch {
-            val settings = settingsStore.settingsFlow.first()
+            // v299 二轮审查：必须等「真实设置」到位再判断。settingsFlow 的初始值是 Settings.dummy()
+            // （init=true、assistants 与 conversationModelIds 都是空的），冷启动后立刻打开对话时
+            // first() 可能拿到 dummy → 记忆条目查不到 → 恢复被静默跳过。
+            val settings = settingsStore.settingsFlow.first { !it.init }
             if (!settings.rememberModelPerConversation) return@launch
             val remembered = settings.conversationModelIds[_conversationId] ?: return@launch
             if (settings.findModelById(remembered) == null) return@launch
@@ -104,6 +125,13 @@ class ChatVM(
                     (assistant.chatModelId ?: settings.chatModelId) != remembered
             }
             if (needsUpdate) {
+                // v299 二轮审查（带全文那份）：只同步内存还不够 —— 恢复的 `update{}` 是**全量落盘**，
+                // persistSettings 会把快照里的 assistantId 一起写回；若它晚于 ChatService
+                // initializeConversation 的切助手提交，刚切好的当前助手就被回写成旧值，
+                // 界面（读「当前助手的 chatModelId」）停在旧模型上，症状与修复前一字不差。
+                // 所以先把当前助手切到本对话所属助手（与 ChatService.kt 那句等价、幂等），
+                // 之后这份快照必然带着目标 assistantId，与对端协程的提交顺序彻底解耦。
+                settingsStore.updateAssistant(realAssistantId)
                 settingsStore.update { s ->
                     s.copy(
                         assistants = s.assistants.map { assistant ->
@@ -115,6 +143,13 @@ class ChatVM(
                         }
                     )
                 }
+                // v299 诊断：只有「本对话确实有记忆条目」时才打一行（普通对话不打，避免刷屏）。
+                // 真机若仍复现，去 设置→日志 搜 ChatVM 就能看到到底走到哪一步。
+                Logging.log(TAG, "已恢复本对话记忆模型 $remembered（助手 $realAssistantId）")
+            } else {
+                // v300：即使不需要恢复也留一行 —— 用户报「时灵时不灵」时要能区分
+                // 「检查跑了、本来就一致」和「检查压根没跑」这两种情况。
+                Logging.log(TAG, "本对话记忆模型已是 $remembered（助手 $realAssistantId），无需恢复")
             }
         }
     }
@@ -157,11 +192,50 @@ class ChatVM(
     private val _conversationTokenStats = MutableStateFlow(ConversationTokenStats())
     val conversationTokenStats = _conversationTokenStats.asStateFlow()
 
+    /**
+     * v301：按用户自填单价估算的花费（「本对话 token 明细」里那行「≈ 消耗」）。
+     * 没有任何模型填过价时保持 null —— 界面不显示这一行，绝不用「≈ 0」冒充免费。
+     */
+    private val _conversationTokenCost = MutableStateFlow<ConversationCost?>(null)
+    val conversationTokenCost = _conversationTokenCost.asStateFlow()
+
+    private companion object {
+        /**
+         * v300：用量签名变化后等这么久再刷 —— 一次生成里每轮的用量会连着落库，
+         * 合并成一次查询，既跟上进度又不至于把 IO 打满。
+         */
+        const val TOKEN_STATS_REFRESH_DEBOUNCE_MS = 800L
+    }
+
     fun refreshConversationTokenStats() {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 _conversationTokenStats.value =
                     messageNodeDAO.getConversationTokenStats(_conversationId.toString())
+                // v301：按「生成这条回答的模型」分组算花费（单价用户自己填，模型没填价就不计入）。
+                // 设置还没加载好（dummy）时先不动 —— 那一瞬间所有模型都查不到价，
+                // 会把「未计入」条数报得很难看，属于自己吓自己。
+                val settings = settingsStore.settingsFlow.value
+                if (!settings.init) {
+                    val slices = messageNodeDAO.getConversationTokenStatsByModel(_conversationId.toString())
+                    val modelsById = settings.providers.flatMap { provider -> provider.models }
+                        .associateBy { model -> model.id }
+                    _conversationTokenCost.value = computeConversationCost(
+                        slices = slices.map { it.toCostSlice() },
+                        priceOf = { rawModelId ->
+                            rawModelId
+                                ?.let { runCatching { Uuid.parse(it) }.getOrNull() }
+                                ?.let { modelsById[it] }
+                                ?.let { model ->
+                                    ModelPrice(
+                                        inputPerMillion = model.inputPricePerMillion,
+                                        outputPerMillion = model.outputPricePerMillion,
+                                        cachedPerMillion = model.cachedPricePerMillion,
+                                    )
+                                }
+                        },
+                    )
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -176,6 +250,23 @@ class ChatVM(
         // 生成结束（job 变 null）后刷一次：这一趟的工具轮与续跑轮都已计入 cumulativeUsage
         viewModelScope.launch {
             conversationJob.collect { job -> if (job == null) refreshConversationTokenStats() }
+        }
+        // v300（用户反馈）：原来只在「整趟生成结束」刷一次，一轮长回答要看几分钟前的旧数字。
+        // 现在改成「每轮一刷」：触发条件是**用量签名变化** —— 服务商报出用量的那一刻签
+        // 名才会变（流式分片期间它不变），所以不会每个 token 都去扫一次聚合 SQL。
+        // collectLatest + 延迟 = 合并连续变化，最多晚 TOKEN_STATS_REFRESH_DEBOUNCE_MS 刷新。
+        viewModelScope.launch {
+            conversation
+                .map { conv ->
+                    val msgs = conv.currentMessages
+                    val lastAssistant = msgs.lastOrNull { it.role == me.rerere.ai.core.MessageRole.ASSISTANT }
+                    "${msgs.size}|${lastAssistant?.usage}|${lastAssistant?.cumulativeUsage}"
+                }
+                .distinctUntilChanged()
+                .collectLatest {
+                    delay(TOKEN_STATS_REFRESH_DEBOUNCE_MS)
+                    refreshConversationTokenStats()
+                }
         }
     }
 
@@ -460,6 +551,11 @@ class ChatVM(
             ).onFailure {
                 chatService.addError(it, title = context.getString(R.string.error_title_compress_conversation))
             }
+            // v299：压缩会整批替换本对话的消息节点，统计随之重算（智能压缩几乎归零；
+            // 经典压缩只保留最近若干条，会留下那几条的用量）。但顶栏那行只在
+            // 「打开对话」与「这趟生成结束」两个时点刷新 —— 不主动刷一次，
+            // 用户看到的还是压缩前那个数，像是「压缩后没重新计算、还在叠加」。
+            refreshConversationTokenStats()
         }
     }
 
@@ -486,6 +582,11 @@ class ChatVM(
             ).onFailure {
                 chatService.addError(it, title = context.getString(R.string.error_title_compress_conversation))
             }
+            // v299：压缩会整批替换本对话的消息节点，统计随之重算（智能压缩几乎归零；
+            // 经典压缩只保留最近若干条，会留下那几条的用量）。但顶栏那行只在
+            // 「打开对话」与「这趟生成结束」两个时点刷新 —— 不主动刷一次，
+            // 用户看到的还是压缩前那个数，像是「压缩后没重新计算、还在叠加」。
+            refreshConversationTokenStats()
         }
     }
 
@@ -637,3 +738,12 @@ class ChatVM(
     }
 
 }
+
+/** v301：数据库那一行的「按模型分组用量」→ 算钱用的纯数据结构。 */
+private fun ModelTokenStats.toCostSlice(): ModelUsageSlice = ModelUsageSlice(
+    modelId = modelId,
+    promptTokens = promptTokens,
+    completionTokens = completionTokens,
+    cachedTokens = cachedTokens,
+    messageCount = messageCount,
+)

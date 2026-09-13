@@ -12,4 +12,15 @@
             android:data="rikkahubmod://shortcut" />
         <categories android:name="android.shortcut.conversation" />
     </shortcut>
+    <!-- 官方 2.5.1 新增：翻译快捷方式 -->
+    <shortcut
+        android:shortcutId="translator"
+        android:enabled="true"
+        android:icon="@drawable/ic_translate"
+        android:shortcutShortLabel="@string/translator_page_title"
+        android:shortcutLongLabel="@string/translator_page_title">
+        <intent
+            android:action="me.rerere.rikkahub.action.TRANSLATE"
+            android:targetClass="me.rerere.rikkahub.RouteActivity" />
+    </shortcut>
 </shortcuts>

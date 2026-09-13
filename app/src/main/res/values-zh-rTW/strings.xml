@@ -237,6 +237,7 @@
   <string name="chat_conversation_token_summary">本對話 ↑%1$s ↓%2$s Σ%3$s</string>
   <string name="chat_conversation_token_detail_title">本對話 token 明細</string>
   <string name="chat_conversation_token_reasoning">其中思考</string>
+  <string name="chat_conversation_token_cache_hit_rate">快取命中率</string>
   <string name="chat_conversation_token_total">合計</string>
   <string name="chat_conversation_token_note">每呼叫一次工具、每自動續跑一次都會把全量上下文重發一遍，這些都已計入。不含起標題、產生建議、壓縮歷史、翻譯等後台消耗，也不含子代理的消耗。</string>
   <string name="chat_conversation_token_close">關閉</string>
@@ -1275,7 +1276,7 @@
   <string name="setting_display_page_tts_read_outside_brackets_title">TTS 不朗讀括號內的內容</string>
   <string name="setting_display_page_tts_read_outside_brackets_desc">啟用後，TTS 將不朗讀括號內的內容</string>
   <string name="assistant_page_context_message_limit">上下文訊息限制</string>
-  <string name="assistant_page_context_message_limit_desc">限制發送給模型的最近訊息數量。當超出限制時，上下文會一次性修剪到大約一半，而不是每次輪次刪除一條訊息，這樣請求前綴保持穩定，提示詞緩存可以在多次輪次中繼續運作。</string>
+  <string name="assistant_page_context_message_limit_desc">限制傳送給模型的最近訊息數量</string>
   <string name="assistant_page_context_message_limit_count">上下文訊息限制：%d</string>
   <string name="assistant_page_context_message_limit_unlimited">無限上下文訊息</string>
   <string name="assistant_page_context_message_limit_warning">限制上下文會在每次上下文被裁減時使提示詞快取失效。較大的限制裁減頻率較低；無限則永不裁減並保持快取完整。</string>
@@ -1308,11 +1309,11 @@
   <string name="workspace_terminal_close_confirm_title">關閉終端機 %1$d？</string>
   <string name="workspace_terminal_close_confirm_message">關閉此分頁將終止仍在其中執行的任何程序。</string>
   <string name="workspace_terminal_close">關閉</string>
-    <string name="chat_generation_network_retrying">%1$s，正在重試（%2$d/%3$d）…</string>
-    <string name="chat_generation_network_unknown_host">無法解析伺服器位址</string>
-    <string name="chat_generation_network_timeout">連線逾時</string>
-    <string name="chat_generation_network_unreachable">無法連線到伺服器</string>
-    <string name="chat_generation_network_disconnected">網路連線已中斷</string>
+  <string name="chat_generation_network_retrying">%1$s，正在重試（%2$d/%3$d）…</string>
+  <string name="chat_generation_network_unknown_host">無法解析伺服器位址</string>
+  <string name="chat_generation_network_timeout">連線逾時</string>
+  <string name="chat_generation_network_unreachable">無法連線到伺服器</string>
+  <string name="chat_generation_network_disconnected">網路連線已中斷</string>
   <string name="setting_page_preferences_network_auto_retry">自動重試</string>
   <string name="setting_page_preferences_network_auto_retry_desc">發生網路錯誤時自動重試模型請求，最多重試 3 次。</string>
 
@@ -1385,5 +1386,29 @@
   <string name="chat_page_voice_end">結束</string>
   <string name="chat_page_voice_configure_asr">請先在語音設定中設定 ASR</string>
   <string name="chat_page_voice_unsupported_asr">此 ASR 提供者不支援伺服器端語音端點偵測。請使用 OpenAI Realtime、DashScope 或 Volcengine。</string>
+  <string name="assistant_page_time_reminder_interval">時間提醒間隔</string>
+  <string name="assistant_page_time_reminder_interval_label">間隔 (分鐘)</string>
+  <string name="assistant_page_time_reminder_interval_hint">輸入正整數。當訊息間隔超過此時間間隔時，會插入提醒。</string>
+  <string name="assistant_page_time_reminder_interval_desc">當訊息間隔超過此時間間隔時插入提醒。第一則使用者訊息前一律提醒。</string>
+  <string name="assistant_page_time_reminder_interval_value">%1$d 分</string>
+  <string name="assistant_page_context_message_limit_hint">輸入 0 表示無限制；否則，數值越大越好。建議設為 0 或至少 20。</string>
+  <string name="imggen_page_delete_images_title">刪除圖片</string>
+  <string name="imggen_page_delete_images_message">刪除選取的圖片（%1$d）？此操作無法復原。</string>
+  <string name="imggen_page_delete_images_success">已刪除 %1$d 張圖片</string>
+  <string name="imggen_page_delete_images_failed">已刪除：%1$d。失敗：%2$d。請再試一次。</string>
+  <string name="imggen_page_deleting">刪除中…</string>
+  <string name="imggen_page_selected_count">已選取：%1$d</string>
+  <string name="imggen_page_select_image">選擇圖片</string>
+  <string name="workspace_detail_compatibility_mode">相容模式</string>
+  <string name="workspace_detail_compatibility_mode_desc">如果終端機無法啟動，請嘗試啟用此選項。這可能會降低效能。適用於新的終端機分頁和後續指令。</string>
+  <string name="workspace_detail_settings_save_failed">儲存設定失敗</string>
+  <string name="chat_message_tool_ask_skip">跳過</string>
+  <string name="chat_conversation_token_cost">≈ 消耗</string>
+  <string name="chat_conversation_token_cost_note">依你填寫的單價估算（每 100 萬 token 的價格）。快取未填價時以輸入價計算。不含生成標題、聊天建議、壓縮歷史、翻譯等背景呼叫與子代理消耗。</string>
+  <string name="chat_conversation_token_cost_unpriced">%1$d 則訊息未計入：其模型沒有填寫價格</string>
+  <string name="setting_provider_page_model_input_price">輸入價（每百萬 token）</string>
+  <string name="setting_provider_page_model_output_price">輸出價（每百萬 token）</string>
+  <string name="setting_provider_page_model_cached_price">快取命中價（每百萬 token）</string>
+  <string name="setting_provider_page_model_price_hint">選填。僅用於「本對話 token 明細」的花費估算，未填則不估算。快取價留空時以輸入價計算。介面不顯示貨幣符號，請以你使用的貨幣單位填寫。</string>
 </resources>
 
