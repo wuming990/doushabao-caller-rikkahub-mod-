@@ -84,6 +84,7 @@ import me.rerere.rikkahub.ui.components.richtext.ZoomableAsyncImage
 import me.rerere.rikkahub.ui.components.richtext.buildMarkdownPreviewHtml
 import me.rerere.rikkahub.ui.components.webview.WebViewContentCache
 import me.rerere.rikkahub.ui.components.ui.ChainOfThought
+import me.rerere.rikkahub.ui.components.ui.shouldPreviewThinkingTail
 import me.rerere.rikkahub.ui.components.ui.Favicon
 import me.rerere.rikkahub.ui.context.LocalNavController
 import me.rerere.rikkahub.ui.modifier.shimmer
@@ -314,15 +315,38 @@ private fun MessagePartsBlock(
 
     // Render parts in original order (group thinking/tool as chain-of-thought)
     val groupedParts = remember(parts) { parts.groupMessageParts() }
-    groupedParts.fastForEach { block ->
+    // v307：流式内容总是追加在最后一块，所以「当前活跃的思考块」= 最后一块
+    val lastGroupedIndex = groupedParts.lastIndex
+    groupedParts.fastForEachIndexed { index, block ->
         when (block) {
             is MessagePartBlock.ThinkingBlock -> {
                 if (block.steps.isNotEmpty()) {
                     val isReasoningOnlyBlock = block.steps.fastAll { it is ThinkingStep.ReasoningStep }
+                    // v307：「思考卡片单步可收起」打开时，折叠态下还要不要显示尾部步骤 ——
+                    // 生成中（且这一块是最后一块）→ 显示，能实时看到思考与工具调用；
+                    // 有步骤正在等用户确认/回答 → 必须显示，否则按钮被藏起来、用户不知道要点哪里；
+                    // 其余情况（本条消息生成结束）→ 全部收起，只留顶部控制条。
+                    // minVisibleTailCount 再兜一层：就算等操作的步骤排在倒数第三、第四位
+                    // （一次发出多个工具调用、需要确认的那个排在前面），也要显示到它为止。
+                    val firstPendingStepIndex = block.steps.indexOfFirst { step ->
+                        step is ThinkingStep.ToolStep && step.tool.isPending
+                    }
+                    val previewTail = shouldPreviewThinkingTail(
+                        messageLoading = loading,
+                        isLastBlock = index == lastGroupedIndex,
+                        hasPendingInteraction = firstPendingStepIndex >= 0,
+                    )
                     ChainOfThought(
                         modifier = Modifier.animateContentSize(),
                         steps = block.steps,
                         collapsedAdaptiveWidth = isReasoningOnlyBlock,
+                        fullyCollapsible = settings.displaySetting.collapseThinkingCardFully,
+                        previewTail = previewTail,
+                        minVisibleTailCount = if (firstPendingStepIndex >= 0) {
+                            block.steps.size - firstPendingStepIndex
+                        } else {
+                            0
+                        },
                         cardColors = CardDefaults.cardColors(
                             containerColor = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = settings.displaySetting.bubbleOpacity),
                         ),

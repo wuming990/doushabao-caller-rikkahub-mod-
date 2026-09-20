@@ -2,7 +2,6 @@ package me.rerere.rikkahub.ui.pages.chat
 
 import androidx.activity.ComponentActivity
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,6 +15,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.AlertDialog
@@ -71,6 +71,7 @@ import me.rerere.hugeicons.stroke.TransactionHistory
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.Screen
 import me.rerere.rikkahub.data.datastore.Settings
+import me.rerere.rikkahub.data.files.moveItemTo
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.Avatar
 import me.rerere.rikkahub.data.model.resolveUserDefaultAvatar
@@ -82,6 +83,7 @@ import me.rerere.rikkahub.ui.components.ui.BackupReminderCard
 import me.rerere.rikkahub.ui.components.ui.Greeting
 import me.rerere.rikkahub.ui.components.ui.Tooltip
 import me.rerere.rikkahub.ui.components.ui.UIAvatar
+import me.rerere.rikkahub.ui.components.ui.dragToReorder
 import androidx.compose.ui.draw.clip
 import me.rerere.rikkahub.ui.context.LocalToaster
 import me.rerere.rikkahub.ui.context.Navigator
@@ -259,6 +261,7 @@ fun ChatDrawerContent(
                 onCreate = { showCreateFolderDialog = true },
                 onRename = { folderToRename = it },
                 onDelete = { folderToDelete = it },
+                onReorder = { drawerVm.reorderFolders(it) },
             )
 
             ConversationList(
@@ -793,7 +796,24 @@ private fun FolderBar(
     onCreate: () -> Unit,
     onRename: (Folder) -> Unit,
     onDelete: (Folder) -> Unit,
+    onReorder: (List<Folder>) -> Unit,
 ) {
+    // v304：拖动过程中的「临时顺序」。
+    //
+    // 为什么需要它：落盘后数据库 Flow 才会回流新顺序，中间隔了一次写库 + 一次发射，
+    // 拖动时直接依赖它会出现「松手前顺序弹回去」。这里在拖动期间先用本地顺序渲染，
+    // 等回流顺序与本地一致了再交还给数据源（不一致就继续用本地那份，避免闪一下）。
+    var draggingOrder by remember { mutableStateOf<List<Folder>?>(null) }
+    // v304：长按松手时，外层「点一下 = 选中文件夹」有可能会被顺带触发一次
+    //（手势收尾顺序由 Compose 决定，不能假定谁先谁后）。这里用
+    //「拖动结束 + 300ms」当宽限窗口挡住它：拖动结束后的 0.3 秒内点击一律不算。
+    var dragGuardUntil by remember { mutableStateOf(0L) }
+    val displayFolders = draggingOrder ?: folders
+    LaunchedEffect(folders) {
+        val local = draggingOrder ?: return@LaunchedEffect
+        if (folders.map { it.id } == local.map { it.id }) draggingOrder = null
+    }
+
     LazyRow(
         modifier = Modifier
             .fillMaxWidth()
@@ -806,18 +826,35 @@ private fun FolderBar(
                 label = stringResource(R.string.chat_page_folder_default),
                 selected = selectedFolderId == null,
                 onClick = { onSelect(null) },
-                onLongClick = {},
             )
         }
-        items(folders) { folder ->
+        itemsIndexed(displayFolders, key = { _, folder -> folder.id }) { index, folder ->
             var menuExpanded by remember { mutableStateOf(false) }
-            Box {
+            Box(
+                modifier = Modifier
+                    .animateItem()
+                    // v304：长按拖动排序。长按不动直接松手 → 照旧弹原来的重命名/删除菜单，
+                    // 所以这个手势没有夺走旧操作（旧实现是 combinedClickable 的 onLongClick，
+                    // 两者同时挂会互相抢事件，所以这里合并成一套）。
+                    .dragToReorder(
+                        index = index,
+                        horizontal = true,
+                        onMove = { from, to ->
+                            draggingOrder = moveItemTo(displayFolders, from, to)
+                        },
+                        onDrop = { draggingOrder?.let(onReorder) },
+                        onLongPressWithoutMove = { menuExpanded = true },
+                        onDragStateChange = { active ->
+                            dragGuardUntil = if (active) Long.MAX_VALUE
+                            else System.currentTimeMillis() + 300L
+                        },
+                    )
+            ) {
                 FolderChip(
                     label = folder.name,
                     icon = HugeIcons.Folder01,
                     selected = selectedFolderId == folder.id,
-                    onClick = { onSelect(folder.id) },
-                    onLongClick = { menuExpanded = true },
+                    onClick = { if (System.currentTimeMillis() > dragGuardUntil) onSelect(folder.id) },
                 )
                 DropdownMenu(
                     expanded = menuExpanded,
@@ -848,7 +885,6 @@ private fun FolderBar(
                 icon = HugeIcons.FolderAdd,
                 selected = false,
                 onClick = onCreate,
-                onLongClick = {},
             )
         }
     }
@@ -859,8 +895,8 @@ private fun FolderChip(
     label: String,
     selected: Boolean,
     onClick: () -> Unit,
-    onLongClick: () -> Unit,
     icon: ImageVector? = null,
+    modifier: Modifier = Modifier,
 ) {
     Surface(
         shape = CircleShape,
@@ -869,12 +905,11 @@ private fun FolderChip(
         } else {
             MaterialTheme.colorScheme.surfaceContainerLow
         },
-        modifier = Modifier
+        // v304：拖动排序挂在调用方给的 modifier 上（长按转交给 dragToReorder），
+        // 所以这里只保留「点一下 = 选中」这个单击手势。
+        modifier = modifier
             .clip(CircleShape)
-            .combinedClickable(
-                onClick = onClick,
-                onLongClick = onLongClick,
-            )
+            .clickable(onClick = onClick)
     ) {
         Row(
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),

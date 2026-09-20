@@ -84,26 +84,77 @@ fun ChatMessageNerdLine(
                             Text(text = "${usage.completionTokens.formatNumber()} tokens")
                         }
                     )
-                    // TPS
+                    // v303：两个速度都显示。分子统一用这条回答的**真实累计输出**
+                    // （cumulativeUsage，工具轮/续跑轮全部相加，不再只取最后一轮）；
+                    // 分母不含工具执行时间、不含用户审批等待。外面工具分两派，两格各对应一派：
+                    // 「生成」只算模型真正在吐字的时间（LM Studio / Cherry Studio 口径，不含首字等待）；
+                    // 「响应」从发出请求算到本轮收完（Claude Code 插件 / ccstatusline 口径，含首字等待）。
+                    // 取不到新账本时（旧聊天记录、非流式那一趟）退回官方原算法，旧消息不掉数。
                     if (message.finishedAt != null) {
+                        val cumulative = message.cumulativeUsage
+                        val outputTokens = cumulative?.completionTokens ?: usage.completionTokens
+                        val generationSpeed = if (cumulative != null) {
+                            computeTokenSpeed(outputTokens, message.cumulativeGenerationMs)
+                        } else {
+                            null
+                        }
+                        val responseSpeed = if (cumulative != null) {
+                            computeTokenSpeed(outputTokens, message.cumulativeResponseMs)
+                        } else {
+                            null
+                        }
                         val duration = Duration.between(
                             message.createdAt.toJavaLocalDateTime(),
                             message.finishedAt!!.toJavaLocalDateTime()
                         )
-                        val tps = usage.completionTokens.toFloat() / duration.toMillis() * 1000
                         val seconds = (duration.toMillis() / 1000f).toFixed(1)
-                        StatsItem(
-                            icon = {
-                                Icon(
-                                    imageVector = HugeIcons.Zap,
-                                    contentDescription = "Speed",
-                                    modifier = Modifier.size(12.dp)
+                        if (generationSpeed != null || responseSpeed != null) {
+                            generationSpeed?.let { speed ->
+                                StatsItem(
+                                    icon = {
+                                        Icon(
+                                            imageVector = HugeIcons.Zap,
+                                            contentDescription = "Generation speed",
+                                            tint = color,
+                                            modifier = Modifier.size(12.dp)
+                                        )
+                                    },
+                                    content = {
+                                        Text(text = "生成 ${speed.toFixed(1)} tok/s")
+                                    }
                                 )
-                            },
-                            content = {
-                                Text(text = "${tps.toFixed(1)} tok/s")
                             }
-                        )
+                            responseSpeed?.let { speed ->
+                                StatsItem(
+                                    icon = {
+                                        Icon(
+                                            imageVector = HugeIcons.Zap,
+                                            contentDescription = "Response speed",
+                                            tint = color,
+                                            modifier = Modifier.size(12.dp)
+                                        )
+                                    },
+                                    content = {
+                                        Text(text = "响应 ${speed.toFixed(1)} tok/s")
+                                    }
+                                )
+                            }
+                        } else {
+                            // 官方原算法兜底（旧消息）：整段墙钟 + 水位口径输出
+                            val tps = usage.completionTokens.toFloat() / duration.toMillis() * 1000
+                            StatsItem(
+                                icon = {
+                                    Icon(
+                                        imageVector = HugeIcons.Zap,
+                                        contentDescription = "Speed",
+                                        modifier = Modifier.size(12.dp)
+                                    )
+                                },
+                                content = {
+                                    Text(text = "${tps.toFixed(1)} tok/s")
+                                }
+                            )
+                        }
 
                         StatsItem(
                             icon = {

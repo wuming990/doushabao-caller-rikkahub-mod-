@@ -26,6 +26,8 @@ class FolderRepository(
         val folder = Folder(
             assistantId = assistantId,
             name = name,
+            // v304：新文件夹追加在末尾（用户手动排过序后，0 会插到最前面）
+            sortIndex = folderDAO.nextSortIndex(assistantId.toString()),
             createAt = Instant.now(),
         )
         folderDAO.insert(folder.toEntity())
@@ -34,6 +36,17 @@ class FolderRepository(
 
     suspend fun renameFolder(id: Uuid, name: String) {
         folderDAO.rename(id.toString(), name)
+    }
+
+    /**
+     * v304：按用户拖动后的顺序写回排序号（从 0 开始重编号）。
+     *
+     * 为什么整对象写回：@Update 是整行覆盖，只改 sortIndex、其余字段原样带回，
+     * 避免顺手把名字/归属改坏。顺序里若有重复 id 或异常项，交由数据库自身约束兜底。
+     */
+    suspend fun reorderFolders(ordered: List<Folder>) {
+        if (ordered.isEmpty()) return
+        folderDAO.updateAll(ordered.mapIndexed { index, folder -> folder.copy(sortIndex = index).toEntity() })
     }
 
     /**

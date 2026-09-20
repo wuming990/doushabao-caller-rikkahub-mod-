@@ -61,7 +61,15 @@ class ConversationTokenStatsTest {
         val calls = Regex("foldRoundUsage\\(").findAll(loop).count()
         // 1 处定义 + 2 处调用（流式每轮结束、非流式一次请求）
         assertEquals("foldRoundUsage 定义/调用数量不符", 3, calls)
-        assertTrue("没读 handler 的本轮用量", loop.contains("foldRoundUsage(streamChunkHandler.reportedUsage)"))
+        // v303：流式那一轮除了服务商报的用量，还要把 handler 量到的耗时一起入账，
+        // 所以这条断言跟着改成新的调用形态 —— 意图不变（确认真的读了 handler 的本轮数据，
+        // 而不是自己另算一套）。合并上游后它变红 = 这条接线被覆盖了。
+        assertTrue(
+            "没读 handler 的本轮用量与耗时",
+            loop.contains(
+                "foldRoundUsage(streamChunkHandler.reportedUsage, streamChunkHandler.roundTiming)"
+            )
+        )
         assertTrue("累计写入用的是基线+本轮的绝对值", loop.contains("entryCumulativeUsage.accumulate(total)"))
         // 路径级门禁（v297 审查位抓到）：异常中断那一轮也必须计入真实消耗，否则注释与
         // 六语言文案里「中断/重跑的轮也已计入」就是假话。定位到中断续跑那段再查，

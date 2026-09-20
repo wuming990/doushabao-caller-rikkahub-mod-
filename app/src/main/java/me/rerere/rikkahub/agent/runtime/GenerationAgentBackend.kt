@@ -823,6 +823,22 @@ class GenerationAgentBackend(
     private val conversationRepository: ConversationRepository,
 ) : AgentBackend {
 
+    /**
+     * v304：上层指定的「这一趟从哪个候选模型开始」（线程 id → 模型 id）。
+     *
+     * 用途：续跑次数用完时自动换候选模型（见 AgentThreadManager.rotateResumeModel）。
+     * 一次性指令 —— 读完即清，避免影响之后再往后的运行。进程内状态，不落库。
+     */
+    private val preferredStartModels = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    override fun setPreferredStartModel(threadId: String, modelId: String?) {
+        if (modelId.isNullOrBlank()) {
+            preferredStartModels.remove(threadId)
+        } else {
+            preferredStartModels[threadId] = modelId
+        }
+    }
+
     override suspend fun run(
         thread: AgentThread,
         resume: Boolean,
@@ -837,7 +853,18 @@ class GenerationAgentBackend(
         // 正在崩（限流/5xx/连接被重置），自动重试也只是拿**同一个模型**再撞两次，
         // 撞完就彻底停在失败。用户实测反馈的就是这个：「一个模型崩溃之后没有保底机制」。
         // 现在把四层优先级摊平成一条候选链，前面的跑不动就往后换人。
-        val modelChain = resolveModelChain(thread, settings)
+        // v304：上层（AgentThreadManager）在「续跑次数用完 → 自动换候选模型」之后会指定
+        // 这一趟从哪个模型开始。一次性指令，读完即清；那个 id 找不到（模型被删 / 线程变了）
+        // 就回落整条候选链 —— 绝不能因为一个失效的 id 把候选链清空。
+        val preferredStartModelId = preferredStartModels.remove(thread.id)
+        val modelChain = resolveModelChain(thread, settings).let { chain ->
+            if (preferredStartModelId == null) {
+                chain
+            } else {
+                chain.dropWhile { model -> model.id.toString() != preferredStartModelId }
+                    .ifEmpty { chain }
+            }
+        }
         if (modelChain.isEmpty()) {
             throw AgentModelUnavailableException(
                 "子代理模型不可用：${thread.modelId ?: "未指定（继承主助手）"}"

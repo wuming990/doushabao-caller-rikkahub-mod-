@@ -194,6 +194,14 @@ class SettingsStore(
         val TRUNCATION_AUTO_RESUME_MAX = intPreferencesKey("truncation_auto_resume_max")
 
         /**
+         * v304：技能（skills）列表的显示顺序，存的是技能**目录名**（按用户拖动后的排列）。
+         * 目录名是唯一稳定标识（frontmatter 里的 name 可能重复、也可能被改）。
+         * 只影响列表顺序与注入顺序，不影响技能内容与「哪些技能被启用」。
+         * 默认空 = 按目录名排（确定性顺序，不再是文件系统随机顺序）。
+         */
+        val SKILL_ORDER = stringPreferencesKey("skill_order")
+
+        /**
          * v241：子代理单趟步数上限（只读位；编程位自动取它的 1.5 倍）。
          *
          * 用户原话：「为什么要限制这个步数？不会导致关键时候差一点搜索完结果截断么」——
@@ -343,6 +351,7 @@ class SettingsStore(
                     .coerceIn(TOOL_OUTPUT_LIMIT_MIN_KB, TOOL_OUTPUT_LIMIT_MAX_KB)
                 preferences[AGENT_AUTO_RESUME_MAX] = settings.agentAutoResumeMax.coerceIn(0, 10)
                 preferences[TRUNCATION_AUTO_RESUME_MAX] = settings.truncationAutoResumeMax.coerceIn(0, 99)
+                preferences[SKILL_ORDER] = encodeSkillOrder(settings.skillOrder)
                 preferences[RESUME_STRATEGY_V288] = settings.resumeStrategy.name
                 preferences[REMEMBER_MODEL_PER_CONVERSATION] = settings.rememberModelPerConversation
                 preferences[CONVERSATION_MODEL_IDS] = JsonInstant.encodeToString(
@@ -444,6 +453,7 @@ class SettingsStore(
                     .coerceIn(TOOL_OUTPUT_LIMIT_MIN_KB, TOOL_OUTPUT_LIMIT_MAX_KB),
                 agentAutoResumeMax = (preferences[AGENT_AUTO_RESUME_MAX] ?: 2).coerceIn(0, 10),
                 truncationAutoResumeMax = (preferences[TRUNCATION_AUTO_RESUME_MAX] ?: 3).coerceIn(0, 99),
+                skillOrder = decodeSkillOrder(preferences[SKILL_ORDER]),
                 resumeStrategy = preferences[RESUME_STRATEGY_V288]
                     ?.let { value -> ResumeStrategy.entries.find { it.name == value } }
                     ?: ResumeStrategy.CONTINUE,
@@ -546,6 +556,10 @@ class SettingsStore(
                     providers.add(defaultProvider.copyProvider())
                 }
             }
+            // v305（用户拍板「没填过密钥的才删，填过的保留不动」）：内置清单已移除这几家
+            // 广告位（见 DefaultProviders 与 v304 FINAL 快照留档），但老用户设备上是把
+            // 它们存进过设置数据的，不会自己消失，所以在这里按用户口径清一次。
+            providers = providers.filterNot { it.shouldDropRemovedAdProvider() }.toMutableList()
             providers = providers.map { provider ->
                 val defaultProvider = DEFAULT_PROVIDERS.find { it.id == provider.id }
                 if (defaultProvider != null) {
@@ -562,12 +576,15 @@ class SettingsStore(
                     assistants.add(defaultAssistant.copy())
                 }
             }
-            val ttsProviders = it.ttsProviders.ifEmpty { DEFAULT_TTS_PROVIDERS }.toMutableList()
+            var ttsProviders = it.ttsProviders.ifEmpty { DEFAULT_TTS_PROVIDERS }.toMutableList()
             DEFAULT_TTS_PROVIDERS.forEach { defaultTTSProvider ->
                 if (ttsProviders.none { provider -> provider.id == defaultTTSProvider.id }) {
                     ttsProviders.add(defaultTTSProvider.copyProvider())
                 }
             }
+            // v305（用户拍板「一并清掉」）：清掉语音合成表里预置的 AiHubMix 广告位，
+            // 同口径 —— 填过密钥的保留不动。
+            ttsProviders = ttsProviders.filterNot { it.shouldDropRemovedAdTtsProvider() }.toMutableList()
             it.copy(
                 providers = providers,
                 assistants = assistants,
@@ -882,6 +899,31 @@ internal fun decodeAgentFallbackModelIds(raw: String?): List<Uuid> {
         .take(AGENT_FALLBACK_MODEL_LIMIT)
 }
 
+/**
+ * v304：技能顺序的编解码。
+ *
+ * 为什么存目录名：SkillPaths 解析技能用的就是目录名，也是唯一稳定标识；
+ * 显示名（frontmatter 的 name）可能重复或随时被用户改。
+ * 去重、去空白，上限 200 条 —— 防止异常数据把设置撑大。
+ */
+internal const val SKILL_ORDER_LIMIT = 200
+
+internal fun encodeSkillOrder(names: List<String>): String =
+    JsonInstant.encodeToString(
+        names.mapNotNull { name -> name.trim().takeIf { it.isNotEmpty() } }
+            .distinct()
+            .take(SKILL_ORDER_LIMIT)
+    )
+
+internal fun decodeSkillOrder(raw: String?): List<String> {
+    if (raw.isNullOrBlank()) return emptyList()
+    return runCatching { JsonInstant.decodeFromString<List<String>>(raw) }
+        .getOrDefault(emptyList())
+        .mapNotNull { name -> name.trim().takeIf { it.isNotEmpty() } }
+        .distinct()
+        .take(SKILL_ORDER_LIMIT)
+}
+
 @Serializable
 data class Settings(
     @Transient
@@ -1023,6 +1065,9 @@ data class Settings(
     // v237：子代理备用模型（最多 3 个，按顺序兜底）。
     // 插在候选链的「主对话模型」之前：先用你指定的便宜兜底模型，最后才落到主对话模型。
     val agentFallbackModelIds: List<Uuid> = emptyList(),
+
+    // v304：技能列表显示顺序（技能目录名）。空 = 按目录名排。
+    val skillOrder: List<String> = emptyList(),
 ) {
     /**
      * v248：子代理单次工具返回的字符上限。界面按 KB 存，这里统一换算，
@@ -1102,6 +1147,15 @@ enum class ChatFontFamily {
 }
 
 @Serializable
+enum class BackgroundEffectType {
+    @SerialName("blur")
+    BLUR,
+
+    @SerialName("glass")
+    GLASS,
+}
+
+@Serializable
 data class DisplaySetting(
     val userAvatar: Avatar = Avatar.Dummy,
     val userNickname: String = "",
@@ -1136,6 +1190,13 @@ data class DisplaySetting(
      * 无已开启 skill 时两种模式都零注入。
      */
     val forceSkillReview: Boolean = false,
+    /**
+     * v306：思考卡片单步可收起。开 = 思考步骤卡片只要非空就显示折叠控制条
+     * （单步也能收起来），且折叠时全部收起、连最后一条也不留，正文阅读不受影响；
+     * 关（默认）= 官方行为（超过两步才可折叠、折叠时保留尾部两步）。
+     * 只影响 ChainOfThought 渲染，不影响模型输出。
+     */
+    val collapseThinkingCardFully: Boolean = false,
     // 输入框上方常显「当前上下文占用」，默认开启
     val showContextUsage: Boolean = true,
     /**
@@ -1168,6 +1229,7 @@ data class DisplaySetting(
     val enableAutoScroll: Boolean = true,
     val enableLatexRendering: Boolean = true,
     val enableBlurEffect: Boolean = false,
+    val backgroundEffectType: BackgroundEffectType = BackgroundEffectType.BLUR,
     val chatFontFamily: ChatFontFamily = ChatFontFamily.DEFAULT,
     val chatCustomFontPath: String = "",
     val chatCustomFontName: String = "",
@@ -1340,20 +1402,68 @@ internal val DEFAULT_ASSISTANTS = listOf(
     ),
 )
 
+/**
+ * v305：从内置清单移除的推广位供应商 id（AiHubMix / APIMart / 硅基流动 / 小马算力 /
+ * 302.AI / 随想AI网关 / MaruCode）。id 是这些内置条目固定不变的标识，改名不影响判定，
+ * 所以这里认 id 不认名字。声明为 internal 是为了让单测能拿到真实 id 构造样本。
+ */
+internal val REMOVED_AD_PROVIDER_IDS = setOf(
+    Uuid.parse("1b1395ed-b702-4aeb-8bc1-b681c4456953"), // AiHubMix
+    Uuid.parse("2a05506f-3a59-450a-a493-33a82bc85a81"), // APIMart
+    Uuid.parse("56a94d29-c88b-41c5-8e09-38a7612d6cf8"), // 硅基流动
+    Uuid.parse("da020a90-f7b3-4c29-b90e-c511a0630630"), // 小马算力
+    Uuid.parse("da93779f-3956-48cc-82ef-67bb482eaaf7"), // 302.AI
+    Uuid.parse("aecf04fd-cb5c-4582-aed2-e8bf393923fd"), // 随想AI网关
+    Uuid.parse("afbc54ad-807e-4455-9594-7d7a546356ad"), // MaruCode
+)
+
+/**
+ * v305：判定一个已保存的供应商是否该被自动清掉 —— 必须是「我们移除的那几家广告位」
+ * **且**「没填密钥」且「没添加过模型」，三条同时成立才动手（用户口径：填过密钥的保留不动）。
+ * 加 models 判据是因为用户可能没填 key 但自己配过模型，那也算动过的配置。
+ * 认不出的类型（Codex / Grok / GeminiOAuth 没有 apiKey 概念）一律不清 —— 宁可不删。
+ * 纯函数、无 Android 依赖，可直接单测（见 RemovedAdProviderTest）。
+ */
+internal fun ProviderSetting.shouldDropRemovedAdProvider(): Boolean {
+    if (id !in REMOVED_AD_PROVIDER_IDS) return false
+    return when (this) {
+        is ProviderSetting.OpenAI -> apiKey.isBlank() && models.isEmpty()
+        is ProviderSetting.Google -> apiKey.isBlank() && models.isEmpty()
+        is ProviderSetting.Claude -> apiKey.isBlank() && models.isEmpty()
+        else -> false
+    }
+}
+
 val DEFAULT_SYSTEM_TTS_ID = Uuid.parse("026a01a2-c3a0-4fd5-8075-80e03bdef200")
 private val DEFAULT_TTS_PROVIDERS = listOf(
     TTSProviderSetting.SystemTTS(
         id = DEFAULT_SYSTEM_TTS_ID,
         name = "",
     ),
-    TTSProviderSetting.OpenAI(
-        id = Uuid.parse("e36b22ef-ca82-40ab-9e70-60cad861911c"),
-        name = "AiHubMix",
-        baseUrl = "https://aihubmix.com/v1",
-        model = "gpt-4o-mini-tts",
-        voice = "alloy",
-    )
+    // v305（用户拍板「一并清掉」）：原先这里预置了一条 AiHubMix（baseUrl 指向
+    // aihubmix.com），性质与供应商列表里那 7 个广告位相同 —— 预置就是把人往某家弓。
+    // 需要第三方 TTS 仍可在语音合成页手动添加（走随机 id，不受下面的清理影响）。
 )
+
+/**
+ * v305：语音合成表里被移除的广告位预置项 id（AiHubMix）。同样只清纯没填过密钥的。
+ */
+internal val REMOVED_AD_TTS_PROVIDER_IDS = setOf(
+    Uuid.parse("e36b22ef-ca82-40ab-9e70-60cad861911c"), // AiHubMix TTS
+)
+
+/**
+ * v305：与 [shouldDropRemovedAdProvider] 同口径的语音合成版 —— id 命中且没填过密钥才清。
+ * 清掉后不会让朗读失效：getSelectedTTSProvider 有 `?: ttsProviders.firstOrNull()` 兜底，
+ * 而 SystemTTS 永远留在清单里（它也在 DEFAULT_TTS_PROVIDERS 中，会被回填）。
+ */
+internal fun TTSProviderSetting.shouldDropRemovedAdTtsProvider(): Boolean {
+    if (id !in REMOVED_AD_TTS_PROVIDER_IDS) return false
+    return when (this) {
+        is TTSProviderSetting.OpenAI -> apiKey.isBlank()
+        else -> false
+    }
+}
 
 internal val DEFAULT_ASSISTANTS_IDS = DEFAULT_ASSISTANTS.map { it.id }
 

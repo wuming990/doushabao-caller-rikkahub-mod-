@@ -160,6 +160,16 @@ class ChatDrawerVM(
     }
 
     /**
+     * v304：文件夹拖动排序落盘。顺序即列表顺序，从 0 开始重编号。
+     * 只写排序号，不动文件夹名与归属。
+     */
+    fun reorderFolders(ordered: List<Folder>) {
+        viewModelScope.launch {
+            folderRepo.reorderFolders(ordered)
+        }
+    }
+
+    /**
      * 删除文件夹。若文件夹内有正在生成回复的会话，拒绝删除并返回 false（UI 层据此提示用户）。
      */
     fun deleteFolder(folderId: Uuid): Boolean {

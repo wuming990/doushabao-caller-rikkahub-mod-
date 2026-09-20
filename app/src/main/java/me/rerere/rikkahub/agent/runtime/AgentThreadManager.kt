@@ -65,6 +65,31 @@ internal const val AGENT_MODEL_SWITCH_WAIT_MILLIS = 30_000L
 internal const val AGENT_AUTO_RETRY_BACKOFF_MILLIS = 4_000L
 
 /**
+ * v304：续跑「换模型」的轮次推进（纯函数，可直接单测）。
+ *
+ * 语义：每个候选模型各拿一份「自动续跑次数」预算；第一个候选用完换第二个，轮到链尾就停下等人。
+ *
+ * @return 下一个候选下标；没有候选、或已经轮到最后一个候选时返回 null（= 该停下等人了）。
+ */
+internal fun nextResumeModelRound(chainSize: Int, currentRound: Int): Int? {
+    if (chainSize <= 0) return null
+    val next = currentRound + 1
+    return next.takeIf { it < chainSize }
+}
+
+/**
+ * v304：续跑换模型用的候选信息。
+ *
+ * 与内层 `resolveModelChain` 同一份解析结果（id + 给人看的名字），
+ * 这样事件里能写清楚「换成了哪个模型」，而不是只甩一个编号。
+ *
+ * 可见性是 **public**（不是 internal）：它出现在 AgentThreadManager 这个公开类的构造参数里，
+ * 用 internal 会触发「public function exposes its internal parameter type」（v304 编译期实测）。
+ * 项目里的 AgentThreadStatus / AgentRole / AgentErrorKind 也都是公开的，跟惯例一致。
+ */
+data class ResumeModelCandidate(val id: String, val displayName: String)
+
+/**
  * v236：点了停止之后，最多等这么久让线程自己落终态；超时就兜底强制写 STOPPED。
  *
  * 为什么需要兜底：模型请求可能卡在一次长读上（真机见过单次思考 100 秒以上），
@@ -139,6 +164,19 @@ class AgentThreadManager(
      * 机制都没来得及用」（见 [pipelineStageWaitMillis]）。默认 0，表示按内置默认值估算。
      */
     private val idleTimeoutMillis: suspend () -> Long = { 0L },
+    /**
+     * v304：续跑次数用完后「换模型接着跑」要用的候选链。
+     *
+     * 与内层 `resolveModelChain` 完全同一套解析（线程点名 → 角色指定 → 子代理默认 →
+     * 备用模型 1~3 → 主对话模型）。做成 lambda 的理由同 [autoResumeMax]：agent 包不必
+     * 把设置层拖进来，单测也能随手注入。
+     *
+     * **默认返回空链** —— 空链时行为与 v303 及以前完全一致（次数用完就停下等人），
+     * 所以既有子代理测试与九个假后端一个都不用改。
+     */
+    private val resumeModelChain: suspend (AgentThread) -> List<ResumeModelCandidate> = {
+        emptyList()
+    },
 ) {
     private val jobs = ConcurrentHashMap<String, Job>()
     private val stopRequested = ConcurrentHashMap.newKeySet<String>()
@@ -153,6 +191,25 @@ class AgentThreadManager(
      * 线程成功收尾时清零，让下一段运行重新获得完整的重试预算。
      */
     private val autoRetryCount = ConcurrentHashMap<String, Int>()
+
+    /**
+     * v304：当前用的是候选链里第几个模型的续跑预算（0 起，进程内计数，故意不落库）。
+     *
+     * 用户拍板原话：「用完就自动换下一个候选模型接着跑（候选轮完才停）」。
+     * 轮次只记「第几个候选」，不落库：App 重启说明用户已经介入，从头开始更符合直觉。
+     * 清零时机 = 用户手动点「继续输出」或换模型继续（见 [resume] 的 keepModelRotation）。
+     */
+    private val resumeModelRound = ConcurrentHashMap<String, Int>()
+
+    /**
+     * v304：换模型那一刻**宣布过的**候选模型 id（线程 id → 模型 id）。
+     *
+     * 为什么要单独记：候选链是按当前设置现算的，而「换模型 → 退避几秒 → 再跑」之间
+     * 用户可能刚好改了模型设置。若只认下标，事件里说的模型与这一趟实际跑的模型就可能分叉
+     *（v242「事件说换了、其实没换」同款症状，用户最反感这个）。记下宣布过的 id，
+     * 之后每一趟都用它，事件与实际永远同源。
+     */
+    private val resumeModelCandidateId = ConcurrentHashMap<String, String>()
 
     /**
      * v254：「完整替换修复」已用次数（进程内计数，与 [autoRetryCount] 同款，故意不落库）。
@@ -495,7 +552,14 @@ class AgentThreadManager(
      * @return 续跑后的线程；不满足续跑条件时返回 null
      * @throws AgentLimitReachedException 并发额度已满时
      */
-    suspend fun resume(threadId: String, extraInstruction: String? = null): AgentThread? {
+    suspend fun resume(
+        threadId: String,
+        extraInstruction: String? = null,
+        // v304：true = 自动续跑（保留「当前轮到第几个候选模型」的轮次）；
+        // false（默认）= 用户手动点「继续输出」/换模型继续 —— 轮次清零，重新从候选链第一棒开始。
+        keepModelRotation: Boolean = false,
+    ): AgentThread? {
+        if (!keepModelRotation) resetResumeModelRound(threadId)
         mutex.withLock {
             val thread = repository.thread(threadId) ?: return null
             if (!thread.canResume) return null
@@ -858,6 +922,103 @@ class AgentThreadManager(
     }
 
     /**
+     * v304：自动续跑次数用完后，按候选链换下一个模型接着跑。
+     *
+     * 用户拍板（原话：「用完就自动换下一个候选模型接着跑（候选轮完才停）」）。
+     *
+     * @return true = 已切到下一个候选（调用方应把这次续跑当成新一轮，尝试次数从 1 起）；
+     *         false = 候选已轮完或拿不到候选链，已发事件说明，调用方直接停下等人。
+     */
+    private suspend fun rotateResumeModel(
+        threadId: String,
+        eventType: String,
+        skippedEventType: String,
+        used: Int,
+        max: Int,
+        reason: String,
+    ): Boolean {
+        val thread = repository.thread(threadId)
+        val chain = if (thread == null) {
+            emptyList()
+        } else {
+            try {
+                resumeModelChain(thread)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                emptyList()
+            }
+        }
+        if (chain.isEmpty()) {
+            // 拿不到候选链（没接设置层 / 单测没注入）→ 维持 v303 及以前的行为：停下等人
+            emitEvent(
+                threadId,
+                skippedEventType,
+                "自动续跑次数已用完（$used/$max），等你手点「继续输出」或换个模型继续",
+            )
+            return false
+        }
+        val currentRound = resumeModelRound[threadId] ?: 0
+        val nextRound = nextResumeModelRound(chain.size, currentRound)
+        if (nextRound == null) {
+            emitEvent(
+                threadId,
+                skippedEventType,
+                "自动续跑次数已用完（$used/$max），$reason；候选模型已全部轮完" +
+                    "（共 ${chain.size} 个），停下等你手点「继续输出」或手动换模型",
+            )
+            return false
+        }
+        resumeModelRound[threadId] = nextRound
+        resumeModelCandidateId[threadId] = chain[nextRound].id
+        emitEvent(
+            threadId,
+            eventType,
+            "自动续跑次数已用完（$used/$max），自动换用候选模型" +
+                "「${chain[nextRound].displayName}」（第 ${nextRound + 1}/${chain.size} 个候选）接着跑；" +
+                "每个候选各有一份续跑预算，候选轮完才停",
+        )
+        return true
+    }
+
+    /**
+     * v304：让本趟续跑从「当前轮到的候选模型」开始。
+     *
+     * 为什么每次续跑都要重新设一遍：后端把「从哪个模型开始」当成一次性指令，读完即清
+     * （见 [AgentBackend.setPreferredStartModel]）。轮次 0 = 候选链第一棒 = 不需要指定。
+     */
+    private suspend fun applyResumeModelRound(threadId: String) {
+        val round = resumeModelRound[threadId] ?: return
+        if (round <= 0) return
+        // 优先用「换模型时宣布过的那个 id」：退避期间用户改了模型设置也不会让
+        // 事件与实跑分叉；模型后来被删掉时由后端回落整条候选链（不会空转）。
+        resumeModelCandidateId[threadId]?.let { announced ->
+            backend.setPreferredStartModel(threadId, announced)
+            return
+        }
+        val thread = repository.thread(threadId) ?: return
+        val chain = try {
+            resumeModelChain(thread)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            emptyList()
+        }
+        val candidate = chain.getOrNull(round) ?: return
+        backend.setPreferredStartModel(threadId, candidate.id)
+    }
+
+    /**
+     * v304：轮次清零。用户手动续跑/换模型时调用 —— 重新从候选链第一棒开始，
+     * 不把「上次自动轮到了第几个」带进用户的新一次尝试。
+     */
+    private suspend fun resetResumeModelRound(threadId: String) {
+        resumeModelRound.remove(threadId)
+        resumeModelCandidateId.remove(threadId)
+        backend.setPreferredStartModel(threadId, null)
+    }
+
+    /**
      * v235：上游抖动后的自动续跑。
      *
      * v292（用户拍板「全拆黑名单」）：不再按错误分类拦截——任何失败（含 FATAL 的
@@ -896,14 +1057,18 @@ class AgentThreadManager(
                 return@launch
             }
             if (used >= max) {
-                emitEvent(
-                    threadId,
-                    "AUTO_RETRY_SKIPPED",
-                    "自动续跑次数已用完（$used/$max），等你手点「继续输出」或换个模型继续",
+                // v304：次数用完不再就地停下 —— 自动换下一个候选模型接着跑（候选轮完才停）
+                val rotated = rotateResumeModel(
+                    threadId = threadId,
+                    eventType = "MODEL_ROTATE",
+                    skippedEventType = "AUTO_RETRY_SKIPPED",
+                    used = used,
+                    max = max,
+                    reason = "上游错误（${kind.name}）",
                 )
-                return@launch
+                if (!rotated) return@launch
             }
-            val attempt = used + 1
+            val attempt = if (used >= max) 1 else used + 1
             autoRetryCount[threadId] = attempt
             val waitMillis = AGENT_AUTO_RETRY_BACKOFF_MILLIS * attempt
             emitEvent(
@@ -927,7 +1092,9 @@ class AgentThreadManager(
                 emitEvent(threadId, "AUTO_RETRY_SKIPPED", "线程状态已改变（被停止/关闭/已在重跑），放弃自动续跑")
                 return@launch
             }
-            val revived = runCatching { resume(threadId) }
+            // v304：若本轮已经换过模型，让这一趟从那个候选开始（后端读完即清）
+            applyResumeModelRound(threadId)
+            val revived = runCatching { resume(threadId, keepModelRotation = true) }
                 .onFailure {
                     emitEvent(
                         threadId,
@@ -984,14 +1151,18 @@ class AgentThreadManager(
                 return@launch
             }
             if (used >= max) {
-                emitEvent(
-                    threadId,
-                    "AUTO_CONTINUE_SKIPPED",
-                    "话没说完，但自动续跑次数已用完（$used/$max），等你手点「继续输出」或换个模型继续",
+                // v304：话没说完、次数用完 —— 同样换下一个候选模型接着写（候选轮完才停）
+                val rotated = rotateResumeModel(
+                    threadId = threadId,
+                    eventType = "MODEL_ROTATE",
+                    skippedEventType = "AUTO_CONTINUE_SKIPPED",
+                    used = used,
+                    max = max,
+                    reason = "话没说完",
                 )
-                return@launch
+                if (!rotated) return@launch
             }
-            val attempt = used + 1
+            val attempt = if (used >= max) 1 else used + 1
             autoRetryCount[threadId] = attempt
             emitEvent(
                 threadId,
@@ -1017,7 +1188,9 @@ class AgentThreadManager(
                 )
                 return@launch
             }
-            val revived = runCatching { resume(threadId) }
+            // v304：若本轮已经换过模型，让这一趟从那个候选开始（后端读完即清）
+            applyResumeModelRound(threadId)
+            val revived = runCatching { resume(threadId, keepModelRotation = true) }
                 .onFailure {
                     emitEvent(
                         threadId,

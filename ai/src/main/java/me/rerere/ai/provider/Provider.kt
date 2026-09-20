@@ -74,7 +74,11 @@ data class TextGenerationParams(
     val reasoningLevel: ReasoningLevel = ReasoningLevel.OFF,
     val customHeaders: List<CustomHeader> = emptyList(),
     val customBody: List<CustomBody> = emptyList(),
-    val sessionId: String? = null,
+    // v306 合并上游 2.5.3：官方把默认值从 null 改成随机 id。实际影响面已核清 ——
+    // sessionId 只在两处生效（opencode.ai 的请求头、OpenRouter 请求体的 session_id），
+    // 不会给商汤这类「表外字段拒收」的网关多加字段；util/Request.kt 的
+    // configureSessionHeaders 是零调用的死函数，不受影响。
+    val sessionId: String? = Uuid.random().toString(),
 )
 
 @Serializable

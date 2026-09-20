@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.files.FileUtils
 import me.rerere.rikkahub.data.files.SkillFrontmatterParser
 import me.rerere.rikkahub.data.files.SkillManager
@@ -23,6 +24,7 @@ import kotlin.collections.iterator
 
 class SkillsVM(
     private val skillManager: SkillManager,
+    private val settingsStore: SettingsStore,
 ) : ViewModel() {
     private val _skills = MutableStateFlow<List<SkillMetadata>>(emptyList())
     val skills = _skills.asStateFlow()
@@ -50,6 +52,18 @@ class SkillsVM(
     fun deleteSkill(name: String) {
         viewModelScope.launch(Dispatchers.IO) {
             skillManager.deleteSkill(name)
+            _skills.value = skillManager.listSkills()
+        }
+    }
+
+    /**
+     * v304：拖动排序落盘 —— 存技能**目录名**（SkillPaths 用的就是这个标识）。
+     * 顺序变了要重新读一次列表，界面顺序与实际顺序才一致。
+     */
+    fun reorderSkills(ordered: List<SkillMetadata>) {
+        val names = ordered.map { it.skillDir.name }
+        viewModelScope.launch(Dispatchers.IO) {
+            settingsStore.update { settings -> settings.copy(skillOrder = names) }
             _skills.value = skillManager.listSkills()
         }
     }

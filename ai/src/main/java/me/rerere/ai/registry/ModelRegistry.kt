@@ -294,6 +294,12 @@ object ModelRegistry {
         toolReasoningAbility()
     }
 
+    private val DEEPSEEK_FLASH = defineModel {
+        tokens("deepseek", "flash")
+        visionInput()
+        toolReasoningAbility()
+    }
+
     private val DEEPSEEK_V4_FLASH = defineModel {
         tokens("deepseek", "v", "4", "flash")
         toolReasoningAbility()
@@ -451,6 +457,12 @@ object ModelRegistry {
 
     private val STEP_3_7_FLASH = defineModel {
         tokens("step", "3", "7", "flash")
+        visionInput()
+        toolReasoningAbility()
+    }
+
+    private val STEP_5 = defineModel {
+        tokens("step", "5")
         visionInput()
         toolReasoningAbility()
     }
@@ -630,6 +642,7 @@ object ModelRegistry {
         DEEPSEEK_CHAT,
         DEEPSEEK_R1_MODEL,
         DEEPSEEK_REASONER,
+        DEEPSEEK_FLASH,
         DEEPSEEK_V4_FLASH,
         DEEPSEEK_V4_FLASH_VISION_EXP,
         DEEPSEEK_V4_1_FLASH,
@@ -657,6 +670,7 @@ object ModelRegistry {
         KIMI_K3_ALIAS,
         STEP_3,
         STEP_3_7_FLASH,
+        STEP_5,
         INTERN_S1,
         GLM_4_5,
         GLM_4_6,

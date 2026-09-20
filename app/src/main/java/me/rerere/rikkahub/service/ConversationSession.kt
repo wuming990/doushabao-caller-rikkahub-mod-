@@ -1,6 +1,5 @@
 package me.rerere.rikkahub.service
 
-import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -13,11 +12,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import me.rerere.ai.ui.finishReasoning
 import me.rerere.rikkahub.data.model.Conversation
+import java.time.Instant
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.uuid.Uuid
 
-private const val TAG = "ConversationSession"
 private const val IDLE_TIMEOUT_MS = 5_000L
 
 class ConversationSession(
@@ -28,27 +28,65 @@ class ConversationSession(
     private val onGenerationFinished: (Uuid, Throwable?) -> Unit = { _, _ -> },
 ) {
     // 会话状态
-    val state = MutableStateFlow(initial)
+    private val _state = MutableStateFlow(initial)
+    val state: StateFlow<Conversation> = _state.asStateFlow()
+    private val initializationMutex = Mutex()
+    private val metadataMutex = Mutex()
+    @Volatile
+    private var initialized = false
     val messageQueue = MessageQueue()
+
+    // 页面切换和 SSE 重连只加载一次；活跃 session 的内存状态始终优先。
+    suspend fun initialize(load: suspend () -> Conversation) {
+        initializationMutex.withLock {
+            if (initialized) return
+            val conversation = load()
+            synchronized(this) {
+                // 加载挂起期间可能已经通过保存或编辑写入了更新的状态。
+                if (!initialized) updateConversation(conversation)
+            }
+        }
+    }
+
+    @Synchronized
+    fun updateConversation(conversation: Conversation) {
+        require(conversation.id == id)
+        _state.value = conversation
+        initialized = true
+    }
+
+    // 元数据先应用到最新内存状态；落库只更新对应列，不能用旧消息快照覆盖流式输出。
+    internal suspend fun updateMetadata(
+        update: (Conversation) -> Conversation,
+        persist: suspend (Conversation) -> Unit,
+    ) {
+        metadataMutex.withLock {
+            val updated = synchronized(this) {
+                update(state.value).also(::updateConversation)
+            }
+            persist(updated)
+        }
+    }
+
+    // 失败和取消也必须保存已收到的内容，且保存完成前不能释放生成任务。
+    suspend fun finishGeneration(save: suspend (Conversation) -> Unit): Conversation =
+        withContext(NonCancellable) {
+            val current = state.value
+            val conversation = current.copy(
+                messageNodes = current.messageNodes.map { node ->
+                    node.copy(messages = node.messages.map { it.finishReasoning() })
+                },
+                updateAt = Instant.now(),
+            )
+            updateConversation(conversation)
+            save(conversation)
+            conversation
+        }
 
     // 从队列取出到写入会话历史之间，附件仍需作为有效引用保留。
     @Volatile
     var submittingMessage: QueuedMessage? = null
         internal set
-
-    // 同一个 session 只允许从数据库初始化一次，避免切换回来时旧快照覆盖流式内容。
-    private val initializationMutex = Mutex()
-    @Volatile
-    private var initialized = false
-
-    suspend fun initializeOnce(block: suspend () -> Unit) {
-        if (initialized) return
-        initializationMutex.withLock {
-            if (initialized) return
-            block()
-            initialized = true
-        }
-    }
 
     // 原子引用计数
     private val refCount = AtomicInteger(0)
@@ -68,34 +106,12 @@ class ConversationSession(
     // 空闲检查任务
     private var idleCheckJob: Job? = null
 
-    fun acquire(): Int = refCount.incrementAndGet().also {
+    internal fun acquire(): Int = refCount.incrementAndGet().also {
         cancelIdleCheck()
-        Log.d(TAG, "acquire $id (refs=$it)")
     }
 
-    fun release(): Int = refCount.decrementAndGet().also {
-        Log.d(TAG, "release $id (refs=$it)")
+    internal fun release(): Int = refCount.decrementAndGet().also {
         if (it <= 0) scheduleIdleCheck()
-    }
-
-    // 作用域 API - 短请求（REST）
-    inline fun <T> withRef(block: () -> T): T {
-        acquire()
-        try {
-            return block()
-        } finally {
-            release()
-        }
-    }
-
-    // 作用域 API - 长连接（SSE、挂起函数）
-    suspend inline fun <T> withRefSuspend(block: () -> T): T {
-        acquire()
-        try {
-            return block()
-        } finally {
-            release()
-        }
     }
 
     @Synchronized

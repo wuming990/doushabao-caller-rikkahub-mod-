@@ -231,6 +231,7 @@
   <string name="cancel_edit">取消编辑</string>
   <string name="chain_of_thought_collapse">收起</string>
   <string name="chain_of_thought_show_more_steps">再显示 %d 步</string>
+  <string name="chain_of_thought_show_all_steps">显示全部 %d 步</string>
   <string name="chat_input_placeholder">输入消息与AI聊天</string>
   <string name="chat_input_unsupported_file_type">不支持的文件类型：%s</string>
   <string name="chat_input_file_read_failed">文件读取失败：%s</string>
@@ -320,7 +321,7 @@
   <string name="setting_workspace_command_timeout_desc">AI 未指定时，单条工作区命令的默认时长上限。默认不限时。</string>
   <string name="setting_workspace_command_timeout_unlimited">不限时</string>
   <string name="setting_truncation_auto_resume_title">回复异常中断时自动续写</string>
-  <string name="setting_truncation_auto_resume_desc">回复因输出上限被掐断、连接中断或服务商临时故障而没写完时，自动从断点接着写完。0 = 关闭。</string>
+  <string name="setting_truncation_auto_resume_desc">回复因输出上限被掐断、连接中断或服务商临时故障而没写完时，自动从断点接着写完。0 = 关闭。打开后网络重试的次数上限也跟随这个数值（见「网络 → 自动重试」）。</string>
   <string name="setting_truncation_auto_resume_off">关闭</string>
   <string name="setting_resume_strategy_title">续跑方式</string>
   <string name="setting_resume_strategy_desc">回复写到一半断掉时怎么接回来。「发送继续」= 保留已写内容，让模型接着往下写；「重新生成最后一次输出」= 丢掉写坏的那一段，把同一个请求原样重发一次，只重来最后那一段，前面已完成的内容和整个对话都不动。仅在开启自动续跑时生效。注意：撞到输出长度上限时一律走「发送继续」，因为重新生成必然再撞同一个上限。</string>
@@ -705,7 +706,7 @@
   <string name="reasoning_xhigh">超高</string>
   <string name="reasoning_max">最大</string>
   <string name="regenerate">重新生成</string>
-  <string name="regenerate_confirm_message">确定要重新生成此消息吗？</string>
+  <string name="regenerate_confirm_message">确定要重新生成此消息吗？此消息下方所有消息会被清理</string>
   <string name="render_with_webview">网页视图渲染</string>
   <string name="rikkahub_provider_description">官方免费 AI 服务，使用用户赞助资金为新用户提供部分免费模型作为备用，无需 API 密钥。有严格速率限制，如已购买自有服务商，请尽量使用自有服务商。</string>
   <string name="safe_mode_assistants">助手</string>
@@ -881,6 +882,8 @@
   <string name="setting_display_page_highlight_key_points_title">重点标色</string>
   <string name="setting_display_page_highlight_key_points_desc">关闭（默认）：模型完全不知道此功能存在，不注入任何内容。打开：仅在系统提示词末尾附加一段中性说明，告知模型可以（不是必须）用红/黄/绿标注重点——只说明能力存在，不干预回答方式。聊天界面对这些颜色标签的渲染是现成的。</string>
   <string name="setting_display_page_force_skill_review_title">强制翻阅技能</string>
+  <string name="setting_display_page_collapse_thinking_card_title">思考卡片单步可收起</string>
+  <string name="setting_display_page_collapse_thinking_card_desc">打开：思考/工具步骤卡片只要有任何一步就显示收起控制条。生成过程中仍会显示最后几步，方便你看模型正在思考什么、正在调用哪个工具；本条消息生成结束后全部收起、连最后一条也不留（只保留顶部控制条，不影响正文阅读）；正在等你确认或回答的步骤永远不会被收起。关闭（默认）：官方行为——超过两步才可折叠，折叠时仍保留最后两步。</string>
   <string name="setting_display_page_force_skill_review_desc">关闭（默认）：只注入技能名称清单，由模型自行判断是否翻阅。打开：注入一条强制指令，要求模型在首次回答前对每个已开启的技能调一次 use_skill 翻阅入口说明（SKILL.md），入口之外的细节仍由模型按需自取。没有已开启技能时不注入任何内容。</string>
   <string name="setting_display_page_show_context_usage_desc">在输入框上方常显当前对话已经占用多少上下文，以及距离自动压缩触发值还有多远。关闭自动压缩时只显示已用量。这个开关只管输入框上方那一条，不影响每条消息下方的 Token 显示。</string>
   <string name="setting_display_page_show_context_usage_title">常显当前上下文占用</string>
@@ -1211,8 +1214,6 @@ mDNS 地址：使用 .local 主机名，同一网络中的其他设备可通过�
   <string name="share">分享</string>
   <string name="share_handler_page_title">选择一个助手处理分享</string>
   <string name="shortcut_take_picture">拍照提问</string>
-  <string name="silicon_flow_description">**全球领先的 AI 能力提供商，加速 AGI 普惠人类。**</string>
-  <string name="silicon_flow_website">官网: [https://cloud.siliconflow.cn/](https://cloud.siliconflow.cn/i/u1Ia4Ycf)</string>
   <string name="skill_detail_page_content">内容</string>
   <string name="skill_detail_page_create">创建</string>
   <string name="skill_detail_page_delete_confirm">确定要删除文件“%s”吗？</string>
@@ -1613,6 +1614,33 @@ mDNS 地址：使用 .local 主机名，同一网络中的其他设备可通过�
   <string name="agent_tools_tool_timeout_minutes">%1$d 分钟</string>
   <string name="agent_tools_read_limit_title">子代理工具返回上限</string>
   <string name="agent_tools_read_limit_desc">子代理一次工具返回最多带回多少内容（读文件、搜索结果）。**只影响子代理，主对话完全按原样不动。**子代理没有终端，被截掉的部分它拿不回来，只能分成好几段接着读。调大 = 读大文件少跑几步；调小 = 对上下文窗口小的模型更安全（窗口不够会直接请求失败）。</string>
+  <!-- v305：Gemini 账号登录界面汉化。原先 34 条键里只有 10 条做了中文，缺的 24 条在
+       中文环境下回退成英文（与 v282 汉化 Grok 时漏掉 Gemini 是同一件事的两侧）。
+       照 v280 惯例只补中文，其余语言保持回退英文。 -->
+  <string name="gemini_provider_description">用自己的谷歌账号登录，通过与 Antigravity 相同的后台（Google Cloud Code Assist）生成回答，不需要 API 密钥。</string>
+  <string name="gemini_provider_short_description">谷歌账号登录 · 请先看封号提醒</string>
+  <string name="gemini_ban_warning_title">这可能导致你的谷歌账号被封</string>
+  <string name="gemini_ban_warning_body">这个供应商使用 Antigravity 自身的 OAuth 凭据登录，并调用谷歌未公开的私有接口，而本应用并非谷歌发布。谷歌条款允许他们以「通过未经批准的客户端访问服务」为由暂停或终止账号，并且没有为此准备申诉通道。请使用一个丢了也不心疼的小号，不要用绑定邮箱、相册、购物或工作的主要账号。</string>
+  <string name="gemini_sign_in">用谷歌账号登录</string>
+  <string name="gemini_enable">启用 Gemini 账号登录</string>
+  <string name="gemini_round_robin_description">按顺序轮流使用已启用的账号。</string>
+  <string name="gemini_sign_in_required">请先登录至少一个谷歌账号。</string>
+  <string name="gemini_accounts_count">账号（%1$d）</string>
+  <string name="gemini_check_status">检查状态</string>
+  <string name="gemini_no_accounts">还没有登录任何谷歌账号。</string>
+  <string name="gemini_oauth_success">谷歌登录完成</string>
+  <string name="gemini_refresh_failed">刷新账号失败</string>
+  <string name="gemini_remove_account_title">删除这个谷歌账号？</string>
+  <string name="gemini_remove_account_message">删除后需要重新登录才能继续使用这个账号。</string>
+  <string name="gemini_remove">删除</string>
+  <string name="gemini_project_id">云项目：%1$s</string>
+  <string name="gemini_token_available">凭据可用</string>
+  <string name="gemini_token_expired">凭据已过期</string>
+  <string name="gemini_token_unavailable">凭据不可用</string>
+  <string name="gemini_token_not_checked">未检查凭据状态</string>
+  <string name="gemini_refresh">刷新</string>
+  <string name="gemini_reauthenticate">重新登录</string>
+  <string name="gemini_oauth_ports_unavailable">本地回调端口被占用，无法开始谷歌登录。请关掉占用该端口的程序后重试。</string>
   <!-- v280：Gemini 官方账号额度面板（原先这些键只有英文，界面是中英混排） -->
   <string name="gemini_daily_limit">短期额度（估算）</string>
   <string name="gemini_weekly_limit">每周额度（估算）</string>
@@ -1834,7 +1862,7 @@ mDNS 地址：使用 .local 主机名，同一网络中的其他设备可通过�
   <string name="chat_generation_network_unreachable">无法连接到服务器</string>
   <string name="chat_generation_network_disconnected">网络连接已断开</string>
   <string name="setting_page_preferences_network_auto_retry">自动重试</string>
-  <string name="setting_page_preferences_network_auto_retry_desc">发生网络错误时自动重试模型请求，最多重试 3 次。</string>
+  <string name="setting_page_preferences_network_auto_retry_desc">发生网络错误时自动重试模型请求：开启了「回复异常中断时自动续写」时，重试次数跟随该次数（0 或关闭续写时为 3 次）。每次重试前的等待从 1 秒起翻倍，最长 30 秒。</string>
 
     <!-- v274: 官方账号 OAuth 登录（三套，照搬 ExTV rikkahub-agent） -->
 <string name="codex_provider_description">使用 OpenAI Codex OAuth 和 Responses API。此集成依赖 Codex 服务兼容性。</string>
@@ -1922,10 +1950,18 @@ mDNS 地址：使用 .local 主机名，同一网络中的其他设备可通过�
   <string name="workspace_detail_settings_save_failed">保存设置失败</string>
   <string name="chat_message_tool_ask_skip">跳过</string>
   <string name="chat_conversation_token_cost">≈ 消耗</string>
-  <string name="chat_conversation_token_cost_note">按你填写的单价估算（每 100 万 token 的价格）。缓存没填价时按输入价计算。不含起标题、生成建议、压缩历史、翻译等后台调用，也不含子代理的消耗。</string>
+  <string name="chat_conversation_token_requests">请求次数</string>
+  <string name="chat_conversation_token_cost_note">按你填写的单价估算：token 部分按每 100 万 token 的价格，按次部分按每次请求的价格。缓存没填价时按输入价计算。不含起标题、生成建议、压缩历史、翻译等后台调用，也不含子代理的消耗。</string>
   <string name="chat_conversation_token_cost_unpriced">%1$d 条消息未计入：它的模型没有填写价格</string>
   <string name="setting_provider_page_model_input_price">输入价（每百万 token）</string>
   <string name="setting_provider_page_model_output_price">输出价（每百万 token）</string>
   <string name="setting_provider_page_model_cached_price">缓存命中价（每百万 token）</string>
+  <string name="setting_provider_page_model_request_price">按次价格（每次请求，选填）</string>
+  <string name="setting_provider_page_model_request_price_hint">选填。只用于「本对话 token 明细」的花费估算。按真实请求次数计费：一次回答里每调用一轮工具、每次自动续跑，都各算一次请求。</string>
   <string name="setting_provider_page_model_price_hint">选填。只用于「本对话 token 明细」里的花费估算，不填就不估。缓存价留空时按输入价计算。界面不显示货币符号，按你自己的货币单位填即可。</string>
+  <string name="setting_display_page_background_effect_title">输入栏背景效果</string>
+  <string name="setting_display_page_background_effect_desc">为聊天输入栏启用模糊或玻璃效果</string>
+  <string name="setting_display_page_background_effect_type">背景效果类型</string>
+  <string name="setting_display_page_background_effect_blur">模糊</string>
+  <string name="setting_display_page_background_effect_glass">玻璃</string>
 </resources>

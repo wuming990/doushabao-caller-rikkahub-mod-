@@ -112,6 +112,22 @@ interface AgentBackend {
         onMessage: suspend (AgentMessage) -> Unit,
         onEvent: suspend (AgentEvent) -> Unit,
     ): AgentRunOutcome
+
+    /**
+     * v304：指定「这一趟从候选链的哪个模型开始」，供上层在
+     * 「续跑次数用完 → 换下一个候选模型」之后调用；传 null = 清掉指定。
+     *
+     * 为什么用独立钩子而不是给 [run] 加参数：`run` 在测试里有九个假实现
+     *（AgentAutoResumeTest / AgentThreadManagerTest / AgentControlToolsTest 等），
+     * 给抽象方法加参数会让它们全部编译失败，而那些测试与「换模型」毫无关系。
+     * 这个方法的默认实现是空操作，所以假后端与既有测试一行都不用改，
+     * 行为也与 v303 完全一致（不指定 = 从候选链第一棒开始）。
+     *
+     * 语义是**一次性指令**：真实后端读完即清；实现方遇到不存在的 id 应回落整条候选链。
+     */
+    fun setPreferredStartModel(threadId: String, modelId: String?) {
+        // 默认空实现：只有真实后端（GenerationAgentBackend）需要它
+    }
 }
 
 /** 演示/测试后端：不调用任何模型，模拟流式产出消息与事件 */

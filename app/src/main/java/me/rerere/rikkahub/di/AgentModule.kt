@@ -16,6 +16,8 @@ import me.rerere.rikkahub.agent.repo.AgentThreadRepository
 import me.rerere.rikkahub.agent.repo.RoomAgentThreadRepository
 import me.rerere.rikkahub.agent.runtime.AgentThreadManager
 import me.rerere.rikkahub.agent.runtime.GenerationAgentBackend
+import me.rerere.rikkahub.agent.runtime.ResumeModelCandidate
+import me.rerere.rikkahub.agent.runtime.resolveModelChain
 import me.rerere.rikkahub.data.datastore.findModelById
 import org.koin.dsl.module
 
@@ -88,6 +90,13 @@ val agentModule = module {
                 val minutes = settingsStore.settingsFlow.first()
                     .agentThreadTimeoutMinutes.coerceIn(0, 120)
                 if (minutes <= 0) 0L else minutes * 60_000L
+            },
+            // v304：续跑次数用完 → 自动换下一个候选模型接着跑。
+            // 候选链必须与内层（GenerationAgentBackend）用同一套解析，否则事件里说的
+            // 「第几个候选 / 换成谁」和实际跑起来的模型会对不上（v242 的假换模型事故同款）。
+            resumeModelChain = { thread ->
+                resolveModelChain(thread, settingsStore.settingsFlow.first())
+                    .map { model -> ResumeModelCandidate(model.id.toString(), model.displayName) }
             },
         )
         // 并发上限跟随设置（运行时生效，1~8）

@@ -545,7 +545,7 @@
   <string name="reasoning_picker_title">調整模型思考深度</string>
   <string name="reasoning_xhigh">超高</string>
   <string name="regenerate">重新生成</string>
-  <string name="regenerate_confirm_message">您確定要重新產生這則訊息嗎？</string>
+  <string name="regenerate_confirm_message">您確定要重新生成此訊息嗎？此訊息下方的所有訊息都會被刪除。</string>
   <string name="render_with_webview">網頁視圖渲染</string>
   <string name="rikkahub_provider_description">官方免費 AI 服務，使用用戶贊助資金為新用戶提供部分免費模型作為備用，無需 API 金鑰。具有嚴格速率限制，若您已購買自己的提供者，請盡量使用自有提供者。</string>
   <string name="safe_mode_assistants">助理</string>
@@ -991,8 +991,6 @@
   <string name="share">分享</string>
   <string name="share_handler_page_title">選擇一個助手處理分享</string>
   <string name="shortcut_take_picture">拍照提問</string>
-  <string name="silicon_flow_description">**全球領先的 AI 能力提供商，加速 AGI 普惠人類。**</string>
-  <string name="silicon_flow_website">官網: [https://cloud.siliconflow.cn/](https://cloud.siliconflow.cn/i/u1Ia4Ycf)</string>
   <string name="skill_detail_page_content">內容</string>
   <string name="skill_detail_page_create">建立</string>
   <string name="skill_detail_page_delete_confirm">確定要刪除檔案「%s」嗎？</string>
@@ -1315,7 +1313,7 @@
   <string name="chat_generation_network_unreachable">無法連線到伺服器</string>
   <string name="chat_generation_network_disconnected">網路連線已中斷</string>
   <string name="setting_page_preferences_network_auto_retry">自動重試</string>
-  <string name="setting_page_preferences_network_auto_retry_desc">發生網路錯誤時自動重試模型請求，最多重試 3 次。</string>
+  <string name="setting_page_preferences_network_auto_retry_desc">發生網路錯誤時自動重試模型請求：開啟「Auto-continue interrupted replies」時，重試次數跟隨該次數（0 或關閉續寫時為 3 次）。每次重試前的等待從 1 秒起翻倍，最長 30 秒。</string>
 
     <!-- v274: 官方账号 OAuth 登录（三套，照搬 ExTV rikkahub-agent） -->
 <string name="codex_provider_description">使用 OpenAI Codex OAuth 和 Responses API。此整合依賴 Codex 服務相容性。</string>
@@ -1410,5 +1408,10 @@
   <string name="setting_provider_page_model_output_price">輸出價（每百萬 token）</string>
   <string name="setting_provider_page_model_cached_price">快取命中價（每百萬 token）</string>
   <string name="setting_provider_page_model_price_hint">選填。僅用於「本對話 token 明細」的花費估算，未填則不估算。快取價留空時以輸入價計算。介面不顯示貨幣符號，請以你使用的貨幣單位填寫。</string>
+  <string name="setting_display_page_background_effect_title">輸入列背景效果</string>
+  <string name="setting_display_page_background_effect_desc">在聊天輸入列上啟用模糊或玻璃效果</string>
+  <string name="setting_display_page_background_effect_type">背景效果類型</string>
+  <string name="setting_display_page_background_effect_blur">模糊</string>
+  <string name="setting_display_page_background_effect_glass">玻璃</string>
 </resources>
 

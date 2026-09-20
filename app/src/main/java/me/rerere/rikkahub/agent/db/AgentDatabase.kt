@@ -8,7 +8,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 /**
  * v218：独立 Agent 数据库。
  *
- * 与主数据库（AppDatabase，version 24）完全分离：
+ * 与主数据库（AppDatabase，version 25）完全分离：
  * - 不修改主库版本、不迁移真实聊天数据；
  * - 代理线程/消息/事件只写这里；
  * - 代理功能出问题时可直接停用，不影响聊天与圆桌。
@@ -19,7 +19,8 @@ import androidx.sqlite.db.SupportSQLiteDatabase
  *
  * v236：version 2 → 3，新增 writable_paths / active_model_id 两列
  * （编程位的可写白名单 + 备用模型链实际用了哪个模型）。同样只加列、不动既有数据。
- * 注意：主数据库 AppDatabase 仍然是 24，本次一个字都没碰 —— 聊天记录零风险。
+ * 注意：主数据库 AppDatabase 当时是 24、本次一个字都没碰 —— 聊天记录零风险。
+ * （v300 起主库已由用户授权升到 25，带 AutoMigration 24→25，与本库无关。）
  */
 @Database(
     entities = [

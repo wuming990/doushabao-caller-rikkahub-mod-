@@ -38,6 +38,27 @@ data class UIMessage(
      * 新字段带默认值，旧聊天 JSON/数据库记录仍可正常反序列化，无需迁移。
      */
     val cumulativeUsage: TokenUsage? = null,
+    /**
+     * v303：本条回答各轮「从请求发出到本轮写完」的时间之和（毫秒，含首字等待）。
+     *
+     * 与 [cumulativeUsage] 同一套记账方式（基线 + 本次累计的绝对值覆盖），两者配套才能算
+     * 「响应速度 = 累计输出 token ÷ 累计响应时间」。旧聊天记录没有这个字段，读出来是 null
+     * （界面退回官方原算法），新字段带默认值，无需数据库迁移。
+     */
+    val cumulativeResponseMs: Long? = null,
+    /**
+     * v303：本条回答各轮「从吐出第一个字到本轮写完」的时间之和（毫秒，不含首字等待），
+     * 用于算「生成速度」（与 LM Studio / Cherry Studio 同口径）。
+     * 整趟都没量到生成时间（例如非流式输出）时为 null，界面据此不显示这一格。
+     */
+    val cumulativeGenerationMs: Long? = null,
+    /**
+     * v304：这条回答一共发出去多少次模型请求（工具轮、续跑轮各算一次）。
+     *
+     * 只给「按次计价」用：按次收费的中转站是按请求次数扣钱的。老消息没有这个字段，
+     * 统计时按「至少 1 次」兜底。null 不落库（配置了 explicitNulls=false）。
+     */
+    val cumulativeRequestCount: Int? = null,
     val translation: String? = null,
     // 请求期间生成的内部消息；该标记仅在内存中使用
     @Transient

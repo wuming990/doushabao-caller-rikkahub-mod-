@@ -652,6 +652,19 @@ private fun ModelSettingsForm(
                             onValueChange = { onModelChange(model.copy(cachedPricePerMillion = it)) },
                             label = stringResource(R.string.setting_provider_page_model_cached_price),
                         )
+                        // v304：按次价格 —— 每一次模型请求多少钱（按次计费的中转站用）。
+                        // 与 token 单价可以同时填，两边各自算、最后相加。
+                        PriceInputField(
+                            identity = model.id,
+                            value = model.requestPrice,
+                            onValueChange = { onModelChange(model.copy(requestPrice = it)) },
+                            label = stringResource(R.string.setting_provider_page_model_request_price),
+                        )
+                        Text(
+                            text = stringResource(R.string.setting_provider_page_model_request_price_hint),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                         Text(
                             text = stringResource(R.string.setting_provider_page_model_price_hint),
                             style = MaterialTheme.typography.bodySmall,

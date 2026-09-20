@@ -23,12 +23,14 @@ class ConversationTokenCostTest {
         completion: Long = 0,
         cached: Long = 0,
         messages: Int = 1,
+        requests: Int = 0,
     ) = ModelUsageSlice(
         modelId = modelId,
         promptTokens = prompt,
         completionTokens = completion,
         cachedTokens = cached,
         messageCount = messages,
+        requestCount = requests,
     )
 
     @Test
@@ -156,5 +158,80 @@ class ConversationTokenCostTest {
         assertEquals("1.23", formatCost(1.234))
         assertEquals("12", formatCost(12.0))
         assertEquals("0.00005", formatCost(0.00005))
+    }
+
+    // ── v304：按次计价 ─────────────────────────────────────────────
+    // 单价是「每一次请求多少钱」，不是每百万 token，所以**不能**除 1,000,000。
+
+    @Test
+    fun `按次计价_次数乘单价_不除一百万`() {
+        val result = computeConversationCost(
+            slices = listOf(slice(requests = 7)),
+            priceOf = { ModelPrice(perRequest = 0.02) },
+        )
+        assertEquals(0.14, result.cost, delta)
+        assertTrue(result.hasAnyPrice)
+    }
+
+    @Test
+    fun `按次价与token价可以同时填_两边各自算再相加`() {
+        val result = computeConversationCost(
+            slices = listOf(slice(prompt = 1_000_000, completion = 1_000_000, requests = 3)),
+            priceOf = {
+                ModelPrice(
+                    inputPerMillion = 10.0,
+                    outputPerMillion = 30.0,
+                    perRequest = 1.0,
+                )
+            },
+        )
+        // 10 + 30 + 3×1 = 43
+        assertEquals(43.0, result.cost, delta)
+    }
+
+    @Test
+    fun `只填按次价也算定过价_不会被当成未定价`() {
+        val result = computeConversationCost(
+            slices = listOf(slice(modelId = "per-call-only", requests = 2)),
+            priceOf = { ModelPrice(perRequest = 0.5) },
+        )
+        assertEquals(1.0, result.cost, delta)
+        assertEquals(0, result.unpricedMessages)
+        assertEquals(1, result.pricedModels)
+    }
+
+    @Test
+    fun `请求次数为0或负数时_按次部分算0_绝不把花费算成负数`() {
+        val zero = computeConversationCost(
+            slices = listOf(slice(requests = 0)),
+            priceOf = { ModelPrice(perRequest = 9.0) },
+        )
+        assertEquals(0.0, zero.cost, delta)
+        val negative = computeConversationCost(
+            slices = listOf(slice(requests = -3)),
+            priceOf = { ModelPrice(perRequest = 9.0) },
+        )
+        assertEquals(0.0, negative.cost, delta)
+    }
+
+    @Test
+    fun `只报请求次数没报token时_也算计入过_花费要能显示出来`() {
+        // 按次计费的中转站可能整趟都不报 token 用量：这时不能因为「一条都没定价」
+        // 把整行花费藏起来（明明按次算出了钱）。
+        val result = computeConversationCost(
+            slices = listOf(slice(prompt = 0, completion = 0, messages = 0, requests = 3)),
+            priceOf = { ModelPrice(perRequest = 0.5) },
+        )
+        assertEquals(1.5, result.cost, delta)
+        assertTrue(result.hasAnyPrice)
+    }
+
+    @Test
+    fun `按次价没填时_次数再多也不多收钱`() {
+        val result = computeConversationCost(
+            slices = listOf(slice(requests = 99)),
+            priceOf = { ModelPrice(inputPerMillion = 1.0, outputPerMillion = 1.0) },
+        )
+        assertEquals(0.0, result.cost, delta)
     }
 }

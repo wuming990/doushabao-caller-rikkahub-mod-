@@ -20,9 +20,12 @@ data class ModelPrice(
     val inputPerMillion: Double? = null,
     val outputPerMillion: Double? = null,
     val cachedPerMillion: Double? = null,
+    /** v304：按次价格 —— 每一次模型请求多少钱。 */
+    val perRequest: Double? = null,
 ) {
-    /** 输入价与输出价都没填 = 这个模型没法定价（只有缓存价没有意义）。 */
-    val isUsable: Boolean get() = inputPerMillion != null || outputPerMillion != null
+    /** 三档单价全都没填 = 这个模型没法定价（只有缓存价没有意义）。 */
+    val isUsable: Boolean get() =
+        inputPerMillion != null || outputPerMillion != null || perRequest != null
 }
 
 /** 按「生成这条回答的模型」分组后的一段用量。 */
@@ -32,6 +35,8 @@ data class ModelUsageSlice(
     val completionTokens: Long = 0,
     val cachedTokens: Long = 0,
     val messageCount: Int = 0,
+    /** v304：这一组消息一共发出去多少次模型请求。 */
+    val requestCount: Int = 0,
 )
 
 /**
@@ -60,11 +65,13 @@ data class ConversationCost(
  * (输入token − 缓存token) × 输入价 + 缓存token × 缓存价 + 输出token × 输出价
  * ───────────────────────────────────────────────────────────────  （单价按每百万 token）
  *                          1,000,000
+ *                  + 请求次数 × 按次价格（这一项是单价 × 次数，不除 1,000,000）
  * ```
  * 几条刻意定下的口径（都是为了不把数算得比真实更小或更大）：
  * - **缓存价留空 → 按输入价算**。缓存那部分 token 现实里不是免费的；按 0 算会明显少报。
  *   想按 0 算就自己填 0。
  * - 只填了其中一项价（比如只填输出价）时，另一项按 0 算 —— 这是用户的显式选择，不替他猜。
+ * - 按次价格与 token 单价可以同时填，两边各自算再相加；只填按次价也算定过价（按次计费的中转站就是这种）。
  * - 缓存 token 数超过输入 token 数时按输入数封顶（服务商口径不一致时不至于算出负数）。
  * - 模型没填价 / 模型已删 → 这一段**完全不计入**，只累加「未计入条数」，不用 0 冒充。
  */
@@ -78,9 +85,14 @@ fun computeConversationCost(
     var pricedModels = 0
 
     slices.forEach { slice ->
+        // v304：只报了请求次数、没报 token 的消息（按次计费的中转站可能整趟都不报用量）
+        // 也要算成「这条消息有消耗」—— 否则整行花费会被「一条都没定价」的判据藏起来，
+        // 明明按次算出了钱却看不到（审查位指出的连带问题）。
+        val countedMessages = slice.messageCount.coerceAtLeast(0)
+            .coerceAtLeast(if (slice.requestCount > 0) 1 else 0)
         val price = priceOf(slice.modelId)
         if (price == null || !price.isUsable) {
-            unpricedMessages += slice.messageCount.coerceAtLeast(0)
+            unpricedMessages += countedMessages
             return@forEach
         }
         val prompt = slice.promptTokens.coerceAtLeast(0L)
@@ -95,7 +107,9 @@ fun computeConversationCost(
         cost += plainInput / 1_000_000.0 * inputPrice
         cost += cached / 1_000_000.0 * cachedPrice
         cost += completion / 1_000_000.0 * outputPrice
-        pricedMessages += slice.messageCount.coerceAtLeast(0)
+        // v304：按次计费 —— 单价是「每一次请求多少钱」，不除以 1,000,000。
+        cost += (price.perRequest ?: 0.0) * slice.requestCount.coerceAtLeast(0)
+        pricedMessages += countedMessages
         pricedModels++
     }
 

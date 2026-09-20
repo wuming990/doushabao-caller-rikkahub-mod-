@@ -80,6 +80,11 @@ import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.blur.HazeBlurStyle
 import dev.chrisbanes.haze.blur.hazeBlur
 import dev.chrisbanes.haze.blur.material3.Material3
+import dev.chrisbanes.haze.glass.GlassDefaults
+import dev.chrisbanes.haze.glass.GlassStyle
+import dev.chrisbanes.haze.glass.OpticalSizeValue
+import dev.chrisbanes.haze.glass.hazeGlass
+import dev.chrisbanes.haze.glass.material3.Material3
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.collectLatest
 import me.rerere.ai.provider.Model
@@ -94,6 +99,7 @@ import me.rerere.hugeicons.stroke.Cancel01
 import me.rerere.hugeicons.stroke.Fullscreen
 import me.rerere.hugeicons.stroke.Zap
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.data.datastore.BackgroundEffectType
 import me.rerere.rikkahub.service.ContextUsageInfo
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.getCurrentAssistant
@@ -173,14 +179,16 @@ fun ChatInput(
 
     // 键盘弹出时让底部两角变直角，贴合 IME
     val imeVisible = WindowInsets.isImeVisible
-    val containerShape = if (imeVisible) {
-        MaterialTheme.shapes.largeIncreased.copy(
-            bottomStart = CornerSize(0.dp),
-            bottomEnd = CornerSize(0.dp),
-        )
-    } else {
-        MaterialTheme.shapes.largeIncreased
-    }
+    val themeShape = MaterialTheme.shapes.largeIncreased
+    // v306 合并上游 2.5.3：玻璃效果（hazeGlass）的 shape() 要求 RoundedCornerShape，
+    // 而 themeShape.copy(...) 返回的是 CornerBasedShape 不满足 —— 官方为此改成显式构造。
+    // 这里在官方写法上保留我们的 IME 直角二改。
+    val containerShape = RoundedCornerShape(
+        topStart = themeShape.topStart,
+        topEnd = themeShape.topEnd,
+        bottomEnd = if (imeVisible) CornerSize(0.dp) else themeShape.bottomEnd,
+        bottomStart = if (imeVisible) CornerSize(0.dp) else themeShape.bottomStart,
+    )
 
     fun sendMessage() {
         focusManager.clearFocus(force = true)
@@ -254,11 +262,28 @@ fun ChatInput(
                     .fillMaxWidth()
                     .clip(containerShape)
                     .then(
-                        if (settings.displaySetting.enableBlurEffect) Modifier.hazeBlur(
-                            input = HazeInput.Sources(hazeState),
-                            style = inputHazeStyle,
-                        )
-                        else Modifier
+                        if (settings.displaySetting.enableBlurEffect) {
+                            when (settings.displaySetting.backgroundEffectType) {
+                                BackgroundEffectType.BLUR -> Modifier.hazeBlur(
+                                    input = HazeInput.Sources(hazeState),
+                                    style = inputHazeStyle,
+                                )
+                                BackgroundEffectType.GLASS -> Modifier.hazeGlass(
+                                    input = HazeInput.Sources(hazeState),
+                                    style = GlassStyle.Material3(
+                                        containerColor = hazeTintColor,
+                                        tint = hazeTintColor.copy(alpha = 0.72f),
+                                    ) {
+                                        // Keep background text from competing with the input text.
+                                        optics(GlassDefaults.optics.copy(
+                                            blurRadius = OpticalSizeValue.Fixed(16.dp),
+                                            depth = OpticalSizeValue.Fixed(0.5f),
+                                        ))
+                                        shape(containerShape)
+                                    },
+                                )
+                            }
+                        } else Modifier
                     ),
                 shape = containerShape,
                 tonalElevation = 0.dp,

@@ -260,6 +260,19 @@ fun SettingPreferencesUIPage(vm: SettingVM = koinViewModel()) {
                             )
                         },
                     )
+                    // v306：思考卡片单步可收起（默认关 = 官方行为；开 = 单步可折叠、折叠时全部收起）
+                    item(
+                        headlineContent = { Text(stringResource(R.string.setting_display_page_collapse_thinking_card_title)) },
+                        supportingContent = { Text(stringResource(R.string.setting_display_page_collapse_thinking_card_desc)) },
+                        trailingContent = {
+                            Switch(
+                                checked = displaySetting.collapseThinkingCardFully,
+                                onCheckedChange = {
+                                    updateDisplaySetting(displaySetting.copy(collapseThinkingCardFully = it))
+                                }
+                            )
+                        },
+                    )
                     item(
                         headlineContent = { Text(stringResource(R.string.setting_display_page_show_context_usage_title)) },
                         supportingContent = { Text(stringResource(R.string.setting_display_page_show_context_usage_desc)) },

@@ -9,6 +9,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
@@ -44,7 +45,14 @@ class AssistantDetailVM(
 
     init {
         viewModelScope.launch(Dispatchers.IO) {
-            _skills.value = skillManager.listSkills()
+            // v304：技能列表要跟着「技能顺序」变化刷新。
+            // 这个页面在返回栈里可能一直活着，只读一次会一直显示旧顺序 ——
+            // 用户在技能页拖动排序后回到助手编辑页，看到的还是老排列（审查位指出）。
+            // 顺带也修掉了「在别处新增/删除技能后本页不刷新」的老毛病。
+            settingsStore.settingsFlow
+                .map { settings -> settings.skillOrder }
+                .distinctUntilChanged()
+                .collect { _skills.value = skillManager.listSkills() }
         }
     }
 

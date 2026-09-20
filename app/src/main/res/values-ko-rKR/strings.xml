@@ -545,7 +545,7 @@
   <string name="reasoning_picker_title">모델 사고 깊이 조정</string>
   <string name="reasoning_xhigh">XHigh</string>
   <string name="regenerate">다시 생성</string>
-  <string name="regenerate_confirm_message">이 메시지를 다시 생성하시겠습니까?</string>
+  <string name="regenerate_confirm_message">이 메시지를 다시 생성하시겠습니까? 이 메시지 아래의 모든 메시지가 삭제됩니다.</string>
   <string name="render_with_webview">WebView로 렌더링</string>
   <string name="rikkahub_provider_description">공식 무료 AI 서비스로, 사용자 후원금으로 일부 무료 모델을 신규 사용자에게 대체 수단으로 제공하며 API 키가 필요 없습니다. 엄격한 요청 제한이 있으므로, 자체 제공자를 구매한 경우 되도록 자체 제공자를 사용하세요.</string>
   <string name="safe_mode_assistants">도우미</string>
@@ -993,8 +993,6 @@ mDNS 주소: .local 호스트네임을 사용하며, IP를 몰라도 같은 네�
   <string name="share">공유</string>
   <string name="share_handler_page_title">어시스턴트 선택</string>
   <string name="shortcut_take_picture">사진 찍고 질문하기</string>
-  <string name="silicon_flow_description">**세계를 선도하는 AI 서비스 제공업체로, 인공 일반 지능(AGI)의 발전을 통해 인류에 기여합니다.**</string>
-  <string name="silicon_flow_website">웹사이트: [https://cloud.siliconflow.cn/](https://cloud.siliconflow.cn/i/u1Ia4Ycf)</string>
   <string name="skill_detail_page_content">콘텐츠</string>
   <string name="skill_detail_page_create">생성</string>
   <string name="skill_detail_page_delete_confirm">파일 "%s"을(를) 삭제하시겠습니까?</string>
@@ -1317,7 +1315,7 @@ mDNS 주소: .local 호스트네임을 사용하며, IP를 몰라도 같은 네�
   <string name="chat_generation_network_unreachable">서버에 연결할 수 없습니다</string>
   <string name="chat_generation_network_disconnected">네트워크 연결이 끊어졌습니다</string>
   <string name="setting_page_preferences_network_auto_retry">자동 재시도</string>
-  <string name="setting_page_preferences_network_auto_retry_desc">네트워크 오류 발생 시 모델 요청을 최대 3회 재시도합니다.</string>
+  <string name="setting_page_preferences_network_auto_retry_desc">네트워크 오류 발생 시 모델 요청을 자동으로 재시도합니다. 재시도 횟수는 \"Auto-continue interrupted replies\" 값과 같아지며, 그 설정이 꺼져 있거나 0이면 기존처럼 3회입니다. 각 재시도 전 대기 시간은 1초에서 시작해 두 배씩 늘어나며 최대 30초입니다.</string>
 
     <!-- v274: 官方账号 OAuth 登录（三套，照搬 ExTV rikkahub-agent） -->
 <string name="codex_provider_description">OpenAI Codex OAuth 및 Responses API를 사용합니다. 이 통합은 Codex 서비스 호환성에 따라 달라집니다.</string>
@@ -1412,5 +1410,10 @@ mDNS 주소: .local 호스트네임을 사용하며, IP를 몰라도 같은 네�
   <string name="setting_provider_page_model_output_price">출력 단가(100만 토큰당)</string>
   <string name="setting_provider_page_model_cached_price">캐시 입력 단가(100만 토큰당)</string>
   <string name="setting_provider_page_model_price_hint">선택 사항. 대화 토큰 상세에서 비용을 추정하는 데만 사용합니다. 비워 두면 추정하지 않습니다. 캐시 단가가 비어 있으면 입력 단가로 계산합니다. 통화 기호는 표시하지 않으니 사용하는 통화로 입력하세요.</string>
+  <string name="setting_display_page_background_effect_title">입력창 배경 효과</string>
+  <string name="setting_display_page_background_effect_desc">채팅 입력창에 블러 또는 글래스 효과를 사용합니다</string>
+  <string name="setting_display_page_background_effect_type">배경 효과 유형</string>
+  <string name="setting_display_page_background_effect_blur">블러</string>
+  <string name="setting_display_page_background_effect_glass">글래스</string>
 </resources>
 

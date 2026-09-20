@@ -16,15 +16,20 @@ plugins {
 
 android {
     namespace = "me.rerere.rikkahub"
-    compileSdk = 37
+    // v306 合并上游 2.5.3：官方改用 AGP 新语法声明「37 的小幅版本 2」
+    compileSdk {
+        version = release(37) {
+            minorApiLevel = 2
+        }
+    }
 
     defaultConfig {
         // 二改版: 独立 applicationId, 可与官方版同时安装 (namespace 保持不变以免动全部代码引用)
         applicationId = "me.rerere.rikkahub.mod"
         minSdk = 26
         targetSdk = 37
-        versionCode = 302
-        versionName = "2.5.1-mod69"
+        versionCode = 307
+        versionName = "2.5.3-mod74"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -143,7 +148,19 @@ kotlin {
     }
 }
 
+// v306 合并上游 2.5.3：官方换了 JS 引擎库（quickjs-kt），本地 JVM 单测要用桌面版
+// 原生库而不是 Android AAR，官方靠这段依赖替换实现。照抄，否则 :app 的 JVM 单测会挂。
+// Local JVM tests need the desktop native library instead of the Android AAR.
+configurations.matching { it.name.endsWith("UnitTestRuntimeClasspath") }.configureEach {
+    resolutionStrategy.dependencySubstitution {
+        substitute(module("io.github.dokar3:quickjs-kt-android"))
+            .using(module("io.github.dokar3:quickjs-kt-jvm:${libs.versions.quickjs.get()}"))
+    }
+}
+
 dependencies {
+    // v306 合并上游 2.5.3：app 模块直接使用 quickjs（JavascriptTool 重写），官方显式加依赖
+    implementation(libs.quickjs)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.process)
@@ -186,10 +203,12 @@ dependencies {
     // https://github.com/drewnoakes/metadata-extractor
     implementation(libs.metadata.extractor)
 
-    // Haze (background blur)
+    // Haze (background blur and glass) —— v306 合并上游 2.5.3：官方新增玻璃效果两个模块
     implementation(libs.haze)
     implementation(libs.haze.blur)
     implementation(libs.haze.blur.material3)
+    implementation(libs.haze.glass)
+    implementation(libs.haze.glass.material3)
 
     // koin
     implementation(platform(libs.koin.bom))

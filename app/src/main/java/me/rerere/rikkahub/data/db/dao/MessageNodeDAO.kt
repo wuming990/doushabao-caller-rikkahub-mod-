@@ -83,6 +83,7 @@ data class ConversationTokenStats(
     val cachedTokens: Long = 0,
     val reasoningTokens: Long = 0,
     val usageMessages: Int = 0,
+    val requestCount: Int = 0,
 )
 
 /**
@@ -99,6 +100,7 @@ data class ModelTokenStats(
     val completionTokens: Long = 0,
     val cachedTokens: Long = 0,
     val messageCount: Int = 0,
+    val requestCount: Int = 0,
 )
 
 data class MessageDayCount(val day: String, val count: Int)
@@ -128,6 +130,19 @@ private fun usageFieldSql(field: String): String =
 private fun sumOfUsageField(field: String): String =
     "COALESCE(SUM(CAST(${usageFieldSql(field)} AS INTEGER)), 0)"
 
+/**
+ * v304：请求次数（按次计价用）。
+ *
+ * - 有新账本 `cumulativeRequestCount` 就用它（每条回答真实发出去的请求数）；
+ * - 老消息没有这个字段：只要它有用量报数，就按「至少 1 次」算 —— 按次计费时
+ *   一次请求都没有却能出内容是矛盾的，宁可少算也不能算成 0 次；
+ * - 既没新账本也没有用量 → 0 次（这类消息本来就不参与计价）。
+ */
+private fun sumOfRequestCount(): String =
+    "COALESCE(SUM(CAST(COALESCE(json_extract(j.value, '\$.cumulativeRequestCount'), " +
+        "CASE WHEN ${usageFieldSql("promptTokens")} > 0 OR ${usageFieldSql("completionTokens")} > 0 " +
+        "OR ${usageFieldSql("totalTokens")} > 0 THEN 1 ELSE 0 END) AS INTEGER)), 0)"
+
 // v297：本对话累计。conversation_id 走绑定参数，不做字符串拼接
 private val CONVERSATION_TOKEN_STATS_SQL: String =
     "SELECT ${sumOfUsageField("promptTokens")} AS promptTokens, " +
@@ -135,7 +150,8 @@ private val CONVERSATION_TOKEN_STATS_SQL: String =
         "${sumOfUsageField("cachedTokens")} AS cachedTokens, " +
         "${sumOfUsageField("reasoningTokens")} AS reasoningTokens, " +
         // 三项任一 > 0 就算「这条消息有用量」：只报分项不报 total 的服务商也要被认出来
-        "COALESCE(SUM(CASE WHEN ${usageFieldSql("promptTokens")} > 0 OR ${usageFieldSql("completionTokens")} > 0 OR ${usageFieldSql("totalTokens")} > 0 THEN 1 ELSE 0 END), 0) AS usageMessages " +
+        "COALESCE(SUM(CASE WHEN ${usageFieldSql("promptTokens")} > 0 OR ${usageFieldSql("completionTokens")} > 0 OR ${usageFieldSql("totalTokens")} > 0 THEN 1 ELSE 0 END), 0) AS usageMessages, " +
+        "${sumOfRequestCount()} AS requestCount " +
         "FROM message_node mn, json_each($VALID_MESSAGES_JSON) j " +
         "WHERE mn.conversation_id = ?"
 
@@ -148,7 +164,8 @@ private val CONVERSATION_TOKEN_STATS_BY_MODEL_SQL: String =
         "${sumOfUsageField("completionTokens")} AS completionTokens, " +
         "${sumOfUsageField("cachedTokens")} AS cachedTokens, " +
         "COALESCE(SUM(CASE WHEN ${usageFieldSql("promptTokens")} > 0 OR ${usageFieldSql("completionTokens")} > 0 " +
-        "OR ${usageFieldSql("totalTokens")} > 0 THEN 1 ELSE 0 END), 0) AS messageCount " +
+        "OR ${usageFieldSql("totalTokens")} > 0 THEN 1 ELSE 0 END), 0) AS messageCount, " +
+        "${sumOfRequestCount()} AS requestCount " +
         "FROM message_node mn, json_each($VALID_MESSAGES_JSON) j " +
         "WHERE mn.conversation_id = ? " +
         "GROUP BY json_extract(j.value, '\$.modelId')"

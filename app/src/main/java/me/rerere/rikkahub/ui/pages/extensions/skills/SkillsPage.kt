@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
@@ -35,6 +36,7 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.SheetValue
 import androidx.compose.material3.rememberBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -60,9 +62,11 @@ import me.rerere.hugeicons.stroke.MoreVertical
 import me.rerere.hugeicons.stroke.Puzzle
 import me.rerere.rikkahub.data.files.SkillFrontmatterParser
 import me.rerere.rikkahub.data.files.SkillMetadata
+import me.rerere.rikkahub.data.files.moveItemTo
 import me.rerere.rikkahub.Screen
 import me.rerere.rikkahub.ui.components.nav.BackButton
 import me.rerere.rikkahub.ui.components.ui.RikkaConfirmDialog
+import me.rerere.rikkahub.ui.components.ui.dragToReorder
 import me.rerere.rikkahub.ui.context.LocalNavController
 import me.rerere.rikkahub.ui.context.LocalToaster
 import me.rerere.rikkahub.ui.theme.CustomColors
@@ -81,6 +85,19 @@ fun SkillsPage() {
     var showAddDialog by rememberSaveable { mutableStateOf(false) }
     var showImportDialog by rememberSaveable { mutableStateOf(false) }
     var deleteTarget by remember { mutableStateOf<SkillMetadata?>(null) }
+    // v304：拖动排序。拖动期间先用本地顺序渲染 —— 顺序要先落盘、再由设置回流才更新列表，
+    // 直接依赖它会出现「松手前顺序弹回去」。等回流顺序与本地一致了再交还给数据源。
+    var draggingOrder by remember { mutableStateOf<List<SkillMetadata>?>(null) }
+    val displaySkills = draggingOrder ?: skills
+    // v304：长按松手时卡片自身的「点击进详情」有可能被顺带触发一次
+    //（手势收尾顺序由 Compose 决定，不能假定谁先谁后）。用「拖动结束 + 300ms」当宽限窗口挡住它。
+    var dragGuardUntil by remember { mutableStateOf(0L) }
+    LaunchedEffect(skills) {
+        val local = draggingOrder ?: return@LaunchedEffect
+        if (skills.map { it.skillDir.absolutePath } == local.map { it.skillDir.absolutePath }) {
+            draggingOrder = null
+        }
+    }
     val fileImportLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
@@ -150,11 +167,31 @@ fun SkillsPage() {
                 }
             }
 
-            items(skills, key = { it.skillDir.absolutePath }) { skill ->
+            itemsIndexed(displaySkills, key = { _, skill -> skill.skillDir.absolutePath }) { index, skill ->
                 SkillCard(
                     skill = skill,
-                    onClick = { navController.navigate(Screen.SkillDetail(skill.name)) },
+                    onClick = {
+                        // 拖动刚结束时的那一下点击不算（见 dragGuardUntil 注释）
+                        if (System.currentTimeMillis() > dragGuardUntil) {
+                            navController.navigate(Screen.SkillDetail(skill.name))
+                        }
+                    },
                     onDelete = { deleteTarget = skill },
+                    modifier = Modifier
+                        .animateItem()
+                        // v304：长按拖动排序，松手时把新顺序写进设置（全局一套，所有助手共用）。
+                        .dragToReorder(
+                            index = index,
+                            horizontal = false,
+                            onMove = { from, to ->
+                                draggingOrder = moveItemTo(displaySkills, from, to)
+                            },
+                            onDrop = { vm.reorderSkills(displaySkills) },
+                            onDragStateChange = { active ->
+                                dragGuardUntil = if (active) Long.MAX_VALUE
+                                else System.currentTimeMillis() + 300L
+                            },
+                        ),
                 )
             }
         }
@@ -235,12 +272,14 @@ private fun SkillCard(
     skill: SkillMetadata,
     onClick: () -> Unit,
     onDelete: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
 
     Card(
         onClick = onClick,
-        modifier = Modifier.fillMaxWidth(),
+        // v304：拖动排序用的 modifier 由列表传进来（长按拖动 + 拖动中轻微放大）
+        modifier = modifier.fillMaxWidth(),
         colors = CustomColors.cardColorsOnSurfaceContainer,
     ) {
         Row(

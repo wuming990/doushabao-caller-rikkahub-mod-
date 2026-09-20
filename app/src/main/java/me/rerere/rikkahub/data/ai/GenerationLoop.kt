@@ -30,6 +30,7 @@ import me.rerere.ai.provider.TextGenerationParams
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.ai.ui.ToolApprovalState
+import me.rerere.ai.ui.RoundTiming
 import me.rerere.ai.ui.StreamChunkHandler
 import me.rerere.ai.ui.handleTextGenerationResult
 import me.rerere.ai.ui.limitContext
@@ -61,6 +62,29 @@ internal const val MAX_TOOL_OUTPUT_CHARS = 32 * 1024
 private const val TOOL_OUTPUT_PREVIEW_CHARS = 4 * 1024
 private const val MAX_PROVIDER_NETWORK_RETRIES = 3
 private const val INITIAL_PROVIDER_RETRY_DELAY_MS = 1_000L
+
+// v305：单次重试等待的封顶。官方是 1s/2s/4s… 指数翻倍，续跑次数被放宽到 99 后
+// 不封顶会等到以「年」计，用户看到的就是一直转圈。30 秒是官方同类实现的常见上限。
+private const val MAX_PROVIDER_NETWORK_RETRY_DELAY_MS = 30_000L
+
+/**
+ * v305：网络重试上限跟随「回复异常中断时自动续写」的次数（用户拍板）。
+ *
+ * 只有主对话会传非 0 的 truncationAutoResumeMax（隔离规矩见 generateText 的 KDoc），
+ * 因此圆桌 / 子代理 / 压缩 / 翻译一律落回 else 分支、保持官方固定 3 次，一个字节没变。
+ * 滑条为 0 的语义是「关掉自动续写」，不等于「关掉断网重连」，所以此时仍用官方 3 次。
+ */
+internal fun providerNetworkRetryLimit(truncationAutoResumeMax: Int): Int =
+    if (truncationAutoResumeMax > 0) truncationAutoResumeMax else MAX_PROVIDER_NETWORK_RETRIES
+
+/**
+ * v305：指数退避 + 封顶。coerceIn(0, 16) 是必须的 —— Long 的 shl 对移位量取模 64，
+ * 例如移位量 64 会当成移位 0（等待退化为 1 秒、变成瞬间狂发），100 会当成移位 36
+ * （退化为两千多年）。先把指数夹在 0..16 再封顶，两头都堵死；顺带防住负数入参。
+ */
+internal fun providerNetworkRetryDelayMs(retryCount: Int): Long =
+    (INITIAL_PROVIDER_RETRY_DELAY_MS shl retryCount.coerceIn(0, 16))
+        .coerceAtMost(MAX_PROVIDER_NETWORK_RETRY_DELAY_MS)
 
 /** v289：续跑状态要同时显示实际错误，避免用户只能看到「回复中断」而无法判断原因。 */
 private fun formatResumeError(error: Throwable): String {
@@ -678,7 +702,9 @@ class GenerationLoop(
                 modelBodies = model.customBodies,
                 providerIds = requestProviderIds,
             ),
-            sessionId = conversationId?.toString(),
+            // v306 合并上游 2.5.3：官方把无对话 id 的场合（后台生成、压缩等）也补一个随机
+            // session id。主对话仍用真实 conversationId，行为不变。
+            sessionId = (conversationId ?: Uuid.random()).toString(),
         )
         // v297：「真实消耗」累计。工具循环每调用一次工具就重进一次本函数，所以基线取
         // 助手消息上已有的 cumulativeUsage（已含之前几步）；本次调用内的每一轮请求都往
@@ -689,6 +715,23 @@ class GenerationLoop(
         val entryCumulativeUsage = messages.lastOrNull()
             ?.takeIf { it.role == MessageRole.ASSISTANT }?.cumulativeUsage
         var roundsUsage: TokenUsage? = null
+        // v303：时间与用量同一套账 —— 也按「基线 + 本次累计」的绝对值覆盖写入，
+        // 工具轮、续跑轮、异常中断轮都算得进去，且任何一轮重算都得到同一总数。
+        val entryResponseMs = messages.lastOrNull()
+            ?.takeIf { it.role == MessageRole.ASSISTANT }?.cumulativeResponseMs ?: 0L
+        val entryGenerationMs = messages.lastOrNull()
+            ?.takeIf { it.role == MessageRole.ASSISTANT }?.cumulativeGenerationMs ?: 0L
+        var roundsResponseMs = 0L
+        var roundsGenerationMs = 0L
+        // v304：请求次数账（按次计价用），与上面两本账同一套「基线 + 本次累计」的绝对值覆盖写法。
+        // 「一轮」= 一次走完的模型请求（含工具轮与续跑轮）；服务商没报用量也算 ——
+        // 按次计费的中转站是按请求次数扣钱的，跟有没有报 token 无关。
+        val entryCumulativeRequestCount = messages.lastOrNull()
+            ?.takeIf { it.role == MessageRole.ASSISTANT }?.cumulativeRequestCount ?: 0
+        var roundsRequestCount = 0
+        // 至少有一轮量到过「首字→写完」，才写 cumulativeGenerationMs；
+        // 整趟都没量到（非流式）时保持 null，界面就只显示响应速度那一格。
+        var generationMeasured = false
 
         /**
          * 把本轮服务商报出的用量计入这条回答的 cumulativeUsage。
@@ -697,16 +740,43 @@ class GenerationLoop(
          * 也不把上一轮的数重复计入。写法照 v269 续跑次数记账那套：改完立刻 onUpdateMessages，
          * 否则 break 出循环后这次写入不会落库。
          */
-        suspend fun foldRoundUsage(round: TokenUsage?) {
+        suspend fun foldRoundUsage(round: TokenUsage?, timing: RoundTiming? = null) {
+            // v304：本函数被调用 = 这一轮模型请求走完了 → 请求次数 +1（本轮没报用量也照样算）
+            roundsRequestCount += 1
             if (round != null) {
                 roundsUsage = roundsUsage.accumulate(round)
             }
-            val total = roundsUsage ?: return
+            timing?.let { t ->
+                roundsResponseMs += t.responseMs
+                t.generationMs?.let { ms ->
+                    generationMeasured = true
+                    roundsGenerationMs += ms
+                }
+            }
+            // v304：请求次数与 token 用量**解耦** —— 按次计费的中转站可能整趟都不报用量，
+            // 那种情况下这一趟的请求次数同样必须落库，否则「按次价格 × 请求次数」会算成 0 元
+            //（这正是本功能要覆盖的场景；审查位抓到的必修项）。
+            val total = roundsUsage
+            if (total == null && roundsRequestCount <= 0) return
             val idx = messages.indexOfLast { it.role == MessageRole.ASSISTANT }
             if (idx < 0) return
+            val totalGenerationMs = if (generationMeasured || entryGenerationMs > 0L) {
+                entryGenerationMs + roundsGenerationMs
+            } else {
+                null
+            }
             messages = messages.toMutableList().also { list ->
                 list[idx] = list[idx].copy(
-                    cumulativeUsage = entryCumulativeUsage.accumulate(total)
+                    // total 为 null（这一趟服务商一直没报用量）时**保留消息上已有的值**：
+                    // 绝不能写成 0 或空，那会把之前几步真实消耗的账抹掉。
+                    cumulativeUsage = if (total != null) {
+                        entryCumulativeUsage.accumulate(total)
+                    } else {
+                        list[idx].cumulativeUsage
+                    },
+                    cumulativeResponseMs = entryResponseMs + roundsResponseMs,
+                    cumulativeGenerationMs = totalGenerationMs,
+                    cumulativeRequestCount = entryCumulativeRequestCount + roundsRequestCount,
                 )
             }
             onUpdateMessages(messages)
@@ -777,7 +847,7 @@ class GenerationLoop(
                         }
                         messages = attemptMessages
                         // v297：本轮服务商报的用量计入「真实消耗」（本轮没报用量则不动这本账）
-                        foldRoundUsage(streamChunkHandler.reportedUsage)
+                        foldRoundUsage(streamChunkHandler.reportedUsage, streamChunkHandler.roundTiming)
                         // v263：续跑轮新增的文字是新的 Text part，先把相邻 Text 合并，
                         // 接缝处才不会在界面上显示成两个段落。
                         val assistantIndex = messages.indexOfLast { it.role == MessageRole.ASSISTANT }
@@ -882,8 +952,9 @@ class GenerationLoop(
                                     "silentlyTruncated=$silentlyTruncated), " +
                                     "auto continuing ($truncatedResumeCount/$maxTruncationResumes)",
                             )
-                            // v263：续跑是一趟全新的模型请求，网络重试预算重新计满 3 次，
+                            // v263：续跑是一趟全新的模型请求，网络重试预算重新计满，
                             // 不与上一轮共享（否则连续续跑时后面几轮可能一次断网就放弃）。
+                            // v305：这里重新计满的额度就是 maxRetries（跟随续写次数滑条）。
                             retryCount = 0
                             // v288：撞输出上限这条路强制走「继续」——「重新生成」必然再撞
                             // 同一个上限，是必然失败而不是取舍，所以不看用户选的 resumeStrategy。
@@ -922,6 +993,17 @@ class GenerationLoop(
                         // 已显示的半截内容回退掉（v289 铁律区）。下一次成功收尾的轮会用
                         // 「基线 + roundsUsage」的绝对值把它一并写进去。用户主动取消在上面已上抛。
                         streamChunkHandler.reportedUsage?.let { roundsUsage = roundsUsage.accumulate(it) }
+                        // v304：中断的那一轮也算发出去过一次请求（按次计费的中转站照收）
+                        roundsRequestCount += 1
+                        // v303：中断轮的时间同样只进计数器、**不在此处写消息**（理由同上：
+                        // 此刻 messages 还是上一轮的旧快照，写库会把界面上已显示的半截内容回退掉）。
+                        // 下一次成功收尾的轮会用「基线 + 累计」把它一并写进去。
+                        val interruptedTiming = streamChunkHandler.roundTiming
+                        roundsResponseMs += interruptedTiming.responseMs
+                        interruptedTiming.generationMs?.let { ms ->
+                            generationMeasured = true
+                            roundsGenerationMs += ms
+                        }
                         // v264：异常中断自动续跑 —— 流中途断掉（连接断 / 服务商临时故障）且已经
                         // 写出一部分内容时，不丢弃已写内容，从断点接着写。与长度上限截断
                         // （v263）同一条续跑通道、共用同一个次数设置。
@@ -1034,6 +1116,8 @@ class GenerationLoop(
                             retryCount = retryCount,
                             processingStatus = processingStatus,
                             allowUpstreamErrors = truncationAutoResumeMax > 0,
+                            // v305：重试次数上限跟随「回复异常中断时自动续写」滑条
+                            maxRetries = providerNetworkRetryLimit(truncationAutoResumeMax),
                             // v273 合并上游 2.4.16：官方新增「自动重试」总开关；与二改的
                             // allowUpstreamErrors（续跑开启时把 429/5xx 等服务商临时故障也纳入重试）
                             // 互补共存——enabled=false 时任何网络重试都不做（官方语义），
@@ -1043,10 +1127,15 @@ class GenerationLoop(
                     }
                 }
             } else {
+                // v303：非流式整段一次性返回，量不到「首字时刻」，只能量「从发出到收完」，
+                // 因此这一趟只有响应速度、没有生成速度 —— 界面照实只显示前者。
+                val requestStartNanos = System.nanoTime()
                 val result = executeProviderRequestWithRetry(
                     processingStatus = processingStatus,
                     allowUpstreamErrors = truncationAutoResumeMax > 0,
                     enabled = settings.networkSetting.enableAutoRetry,
+                    // v305：重试次数上限跟随「回复异常中断时自动续写」滑条
+                    maxRetries = providerNetworkRetryLimit(truncationAutoResumeMax),
                 ) {
                     providerImpl.generateText(
                         providerSetting = provider,
@@ -1054,9 +1143,13 @@ class GenerationLoop(
                         params = params,
                     )
                 }
+                val responseMs = ((System.nanoTime() - requestStartNanos) / 1_000_000L).coerceAtLeast(0L)
                 messages = messages.handleTextGenerationResult(result = result, model = model)
                 // v297：非流式路径同样计入真实消耗（一次请求就是一轮）
-                foldRoundUsage(result.usage)
+                foldRoundUsage(
+                    round = result.usage,
+                    timing = RoundTiming(responseMs = responseMs, generationMs = null),
+                )
                 onUpdateMessages(messages)
             }
         } finally {
@@ -1068,6 +1161,8 @@ class GenerationLoop(
         processingStatus: MutableStateFlow<String?>,
         allowUpstreamErrors: Boolean = false,
         enabled: Boolean,
+        // v305：重试上限跟随续写次数（仅主对话传非 0，其余路径落回官方 3 次）
+        maxRetries: Int = MAX_PROVIDER_NETWORK_RETRIES,
         block: suspend () -> T,
     ): T {
         var retryCount = 0
@@ -1081,6 +1176,7 @@ class GenerationLoop(
                     processingStatus = processingStatus,
                     allowUpstreamErrors = allowUpstreamErrors,
                     enabled = enabled,
+                    maxRetries = maxRetries,
                 )
             }
         }
@@ -1095,6 +1191,9 @@ class GenerationLoop(
         // allowUpstreamErrors（续跑开启时把服务商临时故障也纳入重试）互补共存——
         // enabled=false 时任何网络重试都不做（官方语义）。
         enabled: Boolean,
+        // v305：重试上限跟随「回复异常中断时自动续写」的次数（仅主对话显式传值）。
+        // 默认值 = 官方常量，保证不传参的路径（圆桌 / 子代理 / 压缩 / 翻译）行为一字不变。
+        maxRetries: Int = MAX_PROVIDER_NETWORK_RETRIES,
     ): Int {
         // 用户主动停止生成时，底层连接也可能以 IOException("canceled") 收尾；
         // 先检查协程状态，确保取消不会被当作网络波动重新拉起。
@@ -1103,15 +1202,19 @@ class GenerationLoop(
         // 纳入整趟重试；圆桌/子代理/压缩走默认 false，行为与官方完全一致。
         // v292（用户拍板「全拆黑名单」）：不再看错误分类——除用户主动取消（本函数开头的
         // ensureActive 与调用方的 CancellationException 保护）外，任何服务商报错（含
-        // 401/402/403/404 等「重试必无用」的错误）一律按临时故障整趟重试（3 次上限 + 指数
-        // 退避），重试用尽后交给外层按用户设置的续跑次数继续，直到次数耗尽才最终报错停下。
+        // 401/402/403/404 等「重试必无用」的错误）一律按临时故障整趟重试，重试用尽后交给
+        // 外层按用户设置的续跑次数继续，直到次数耗尽才最终报错停下。
+        // v305（用户拍板）：整趟重试的次数上限不再固定 3 次，改为跟随「回复异常中断时自动
+        // 续写」滑条（见 providerNetworkRetryLimit）；单次等待改为封顶 30 秒
+        // （见 providerNetworkRetryDelayMs），否则次数放开后翻倍退避会等到以「年」计。
         val recoverable = error is IOException || allowUpstreamErrors
-        if (!enabled || !recoverable || retryCount >= MAX_PROVIDER_NETWORK_RETRIES) {
+        if (!enabled || !recoverable || retryCount >= maxRetries) {
             throw error
         }
 
         val nextRetryCount = retryCount + 1
-        val retryDelay = INITIAL_PROVIDER_RETRY_DELAY_MS shl retryCount
+        // v305：等待时间走封顶 30 秒的退避函数，避免次数放开后翻倍到以「年」计。
+        val retryDelay = providerNetworkRetryDelayMs(retryCount)
         // v264：服务商临时故障（非 IOException）没有对应的分类文案，直接展示原始错误文本，
         // 用户能看见「429 Too Many Requests」这类具体原因。
         val retryReason = if (error is IOException) {
@@ -1123,12 +1226,13 @@ class GenerationLoop(
             R.string.chat_generation_network_retrying,
             retryReason,
             nextRetryCount,
-            MAX_PROVIDER_NETWORK_RETRIES,
+            // v305：界面提示的「总数」用真实上限，否则会一直显示成 (1/3)
+            maxRetries,
         )
         Log.w(
             TAG,
             "Provider connection failed, retrying in ${retryDelay}ms " +
-                    "($nextRetryCount/$MAX_PROVIDER_NETWORK_RETRIES)",
+                    "($nextRetryCount/$maxRetries)",
             error,
         )
         delay(retryDelay)

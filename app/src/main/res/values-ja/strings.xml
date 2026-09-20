@@ -545,7 +545,7 @@
   <string name="reasoning_picker_title">モデルの思考深度を調整</string>
   <string name="reasoning_xhigh">XHigh</string>
   <string name="regenerate">再生成</string>
-  <string name="regenerate_confirm_message">このメッセージを再生成してもよろしいですか？</string>
+  <string name="regenerate_confirm_message">このメッセージを再生成してもよろしいですか？このメッセージより下のメッセージはすべて削除されます。</string>
   <string name="render_with_webview">WebViewで表示</string>
   <string name="rikkahub_provider_description">公式の無料AIサービスです。ユーザーのスポンサー資金を使い、新規ユーザーのためのフォールバック用の一部無料モデルを提供します。APIキーは不要です。厳しいレート制限があります。独自のプロバイダーを購入済みの場合は、可能な限りそちらをご利用ください。</string>
   <string name="safe_mode_assistants">アシスタント</string>
@@ -993,8 +993,6 @@ mDNSアドレス: .localホスト名を使用し、IPを知らなくても同じ
   <string name="share">共有</string>
   <string name="share_handler_page_title">共有を処理するアシスタントを選択</string>
   <string name="shortcut_take_picture">写真で質問</string>
-  <string name="silicon_flow_description">**世界をリードするAI能力プロバイダー、AGIの普及を加速して人類に貢献。**</string>
-  <string name="silicon_flow_website">公式サイト: [https://cloud.siliconflow.cn/](https://cloud.siliconflow.cn/i/u1Ia4Ycf)</string>
   <string name="skill_detail_page_content">コンテンツ</string>
   <string name="skill_detail_page_create">作成</string>
   <string name="skill_detail_page_delete_confirm">ファイル"%s"を削除してもよろしいですか？</string>
@@ -1317,7 +1315,7 @@ mDNSアドレス: .localホスト名を使用し、IPを知らなくても同じ
   <string name="chat_generation_network_unreachable">サーバーに接続できません</string>
   <string name="chat_generation_network_disconnected">ネットワーク接続が切断されました</string>
   <string name="setting_page_preferences_network_auto_retry">自動再試行</string>
-  <string name="setting_page_preferences_network_auto_retry_desc">ネットワークエラー時、モデルリクエストを最大3回再試行します。</string>
+  <string name="setting_page_preferences_network_auto_retry_desc">ネットワークエラー時にモデルリクエストを自動再試行します。再試行回数は“Auto-continue interrupted replies”の設定値に追従し、その設定がオフまたは 0 の場合は従来どおり 3 回です。各再試行前の待機時間は 1 秒から倍々に増え、最大 30 秒です。</string>
 
     <!-- v274: 官方账号 OAuth 登录（三套，照搬 ExTV rikkahub-agent） -->
 <string name="codex_provider_description">OpenAI Codex OAuth と Responses API を使用します。この連携は Codex サービスとの互換性に依存します。</string>
@@ -1412,5 +1410,10 @@ mDNSアドレス: .localホスト名を使用し、IPを知らなくても同じ
   <string name="setting_provider_page_model_output_price">出力単価（100万トークンあたり）</string>
   <string name="setting_provider_page_model_cached_price">キャッシュ入力単価（100万トークンあたり）</string>
   <string name="setting_provider_page_model_price_hint">任意。会話のトークン詳細で費用を概算するためだけに使います。未入力なら概算しません。キャッシュ単価が空欄なら入力単価で計算します。通貨記号は表示しないので、ご自身の通貨で入力してください。</string>
+  <string name="setting_display_page_background_effect_title">入力バーの背景エフェクト</string>
+  <string name="setting_display_page_background_effect_desc">チャット入力バーのぼかしまたはガラス効果を有効にします</string>
+  <string name="setting_display_page_background_effect_type">背景効果の種類</string>
+  <string name="setting_display_page_background_effect_blur">ぼかし</string>
+  <string name="setting_display_page_background_effect_glass">ガラス</string>
 </resources>
 

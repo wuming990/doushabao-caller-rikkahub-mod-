@@ -137,6 +137,13 @@ fun ConversationTokenStatsDialog(
                     label = stringResource(R.string.chat_conversation_token_total),
                     value = formatTokenTotal(stats.promptTokens + stats.completionTokens),
                 )
+                // v304：请求次数（按次计价用）。为 0 时整行不出现 —— 显示 0 没有意义。
+                if (stats.requestCount > 0) {
+                    StatsRow(
+                        label = stringResource(R.string.chat_conversation_token_requests),
+                        value = stats.requestCount.toString(),
+                    )
+                }
                 // v301：按用户自填单价估算的花费。
                 // 一条消息都没定上价时**不显示这一行** —— 显示「≈ 0」会被当成「免费」。
                 if (cost != null && cost.hasAnyPrice) {

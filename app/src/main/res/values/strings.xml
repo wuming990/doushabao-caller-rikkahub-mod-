@@ -231,6 +231,7 @@
   <string name="cancel_edit">Cancel Edit</string>
   <string name="chain_of_thought_collapse">Collapse</string>
   <string name="chain_of_thought_show_more_steps">Show %d more steps</string>
+  <string name="chain_of_thought_show_all_steps">Show all %d steps</string>
   <string name="chat_input_placeholder">Chat with AI</string>
   <string name="chat_input_unsupported_file_type">Unsupported file type: %s</string>
   <string name="chat_input_file_read_failed">Failed to read file: %s</string>
@@ -320,7 +321,7 @@
   <string name="setting_workspace_command_timeout_desc">Default time limit for a single workspace shell command when the AI does not set one. Unlimited by default.</string>
   <string name="setting_workspace_command_timeout_unlimited">Unlimited</string>
   <string name="setting_truncation_auto_resume_title">Auto-continue interrupted replies</string>
-  <string name="setting_truncation_auto_resume_desc">When a reply stops mid-way (output limit, dropped connection, or a temporary provider failure), automatically continue writing from where it stopped. 0 = off.</string>
+  <string name="setting_truncation_auto_resume_desc">When a reply stops mid-way (output limit, dropped connection, or a temporary provider failure), automatically continue writing from where it stopped. 0 = off. When it is on, the network retry limit follows this value too (see Network → Automatic retry).</string>
   <string name="setting_truncation_auto_resume_off">Off</string>
   <string name="setting_resume_strategy_title">Resume method</string>
   <string name="setting_resume_strategy_desc">What to do when a reply is cut off part-way. \"Send continue\" keeps what was written and asks the model to carry on. \"Regenerate last output\" throws away the broken part and re-sends the same request, so only that last stretch is redone — the rest of the conversation is untouched. Only active when auto-continue is on. Note: when the reply hits the output-length cap, \"send continue\" is always used, because regenerating would just hit the same cap again.</string>
@@ -711,7 +712,7 @@
   <string name="reasoning_xhigh">XHigh</string>
   <string name="reasoning_max">Max</string>
   <string name="regenerate">Regenerate</string>
-  <string name="regenerate_confirm_message">Are you sure you want to regenerate this message?</string>
+  <string name="regenerate_confirm_message">Are you sure you want to regenerate this message? All messages below this message will be deleted.</string>
   <string name="render_with_webview">Render with WebView</string>
   <string name="rikkahub_provider_description">Official free AI service, using user sponsorship funds to provide some free models for new users as fallback, no API key required. Has strict rate limits, if you have purchased your own provider, please use your own provider as much as possible.</string>
   <string name="safe_mode_assistants">Assistants</string>
@@ -888,6 +889,8 @@
   <string name="setting_display_page_highlight_key_points_title">Key point highlighting</string>
   <string name="setting_display_page_highlight_key_points_desc">Off (default): the model never knows this exists, nothing is injected. On: a short neutral note is appended telling the model it MAY mark key points in red/yellow/green — it is told the capability exists, not how to answer. The chat view already renders these color tags.</string>
   <string name="setting_display_page_force_skill_review_title">Force skill review</string>
+  <string name="setting_display_page_collapse_thinking_card_title">Collapse thinking card with a single step</string>
+  <string name="setting_display_page_collapse_thinking_card_desc">On: the thinking/tool card shows a collapse control as long as it has any step. While a reply is being generated it still shows the last few steps, so you can watch what the model is thinking or which tool it is calling; once generation finishes every step is hidden (only the control bar remains, reading is unaffected); a step that is waiting for your approval or answer is never hidden. Off (default): official behaviour — collapsible only when more than two steps, keeps the last two steps visible when collapsed.</string>
   <string name="setting_display_page_force_skill_review_desc">Off (default): only a menu of skill names is injected, the model decides whether to open one. On: a mandatory instruction is injected requiring the model to open every enabled skill\'s entry guide (SKILL.md) via use_skill before its first reply — details beyond the entry guide are still read on demand. No effect when no skill is enabled.</string>
   <string name="setting_display_page_show_context_usage_desc">Show how much context the current conversation uses above the input box, and how close it is to the auto-compress trigger value. This switch only controls that bar; the per-message token stats are not affected.</string>
   <string name="setting_display_page_show_context_usage_title">Always Show Context Usage</string>
@@ -1234,8 +1237,6 @@
   <string name="share">Share</string>
   <string name="share_handler_page_title">Select an Assistant</string>
   <string name="shortcut_take_picture">Take Picture &amp; Ask</string>
-  <string name="silicon_flow_description">**Leading global AI capability provider, accelerating AGI to benefit humanity.**</string>
-  <string name="silicon_flow_website">Website: [https://cloud.siliconflow.cn/](https://cloud.siliconflow.cn/i/u1Ia4Ycf)</string>
   <string name="skill_detail_page_content">Content</string>
   <string name="skill_detail_page_create">Create</string>
   <string name="skill_detail_page_delete_confirm">Are you sure you want to delete file "%s"?</string>
@@ -1792,7 +1793,7 @@
   <string name="chat_generation_network_unreachable">Unable to connect to server</string>
   <string name="chat_generation_network_disconnected">Network connection lost</string>
   <string name="setting_page_preferences_network_auto_retry">Automatic retry</string>
-  <string name="setting_page_preferences_network_auto_retry_desc">Retry model requests up to 3 times when network errors occur.</string>
+  <string name="setting_page_preferences_network_auto_retry_desc">When a network error occurs the request is retried automatically: if \"Auto-continue interrupted replies\" is enabled the retry limit follows that value, otherwise it stays at 3. Each retry waits twice as long as the previous one, up to 30 seconds.</string>
 
     <!-- v274: 官方账号 OAuth 登录（三套，照搬 ExTV rikkahub-agent） -->
 <string name="codex_provider_description">Uses the OpenAI Codex OAuth and Responses API flow. This integration depends on Codex service compatibility.</string>
@@ -1949,10 +1950,18 @@
   <string name="workspace_detail_settings_save_failed">Failed to save settings</string>
   <string name="chat_message_tool_ask_skip">Skip</string>
   <string name="chat_conversation_token_cost">≈ Cost</string>
-  <string name="chat_conversation_token_cost_note">Estimated from the prices you typed (per 1M tokens). Cached tokens without a cached price are counted at the input price. Background calls (title, suggestions, compression, translation) and sub-agents are not included.</string>
+  <string name="chat_conversation_token_requests">Requests</string>
+  <string name="chat_conversation_token_cost_note">Estimated from the prices you typed: the token part uses the per-1M-token prices, the per-request part uses the price per request. Cached tokens without a cached price are counted at the input price. Background calls (title, suggestions, compression, translation) and sub-agents are not included.</string>
   <string name="chat_conversation_token_cost_unpriced">%1$d messages not counted: their model has no price set</string>
   <string name="setting_provider_page_model_input_price">Input price (per 1M tokens)</string>
   <string name="setting_provider_page_model_output_price">Output price (per 1M tokens)</string>
   <string name="setting_provider_page_model_cached_price">Cached input price (per 1M tokens)</string>
+  <string name="setting_provider_page_model_request_price">Price per request (optional)</string>
+  <string name="setting_provider_page_model_request_price_hint">Optional. Used only for the cost estimate in this conversation\'s token details. Counted by actual request count: every tool round and every auto-continue is a separate request.</string>
   <string name="setting_provider_page_model_price_hint">Optional. Only used to estimate spending in the conversation token details. Leave blank to skip. If the cached price is blank, cached tokens are counted at the input price. No currency symbol is shown — type the price in your own currency.</string>
+  <string name="setting_display_page_background_effect_title">Input bar background effect</string>
+  <string name="setting_display_page_background_effect_desc">Enable a blur or glass effect on the chat input bar</string>
+  <string name="setting_display_page_background_effect_type">Background effect type</string>
+  <string name="setting_display_page_background_effect_blur">Blur</string>
+  <string name="setting_display_page_background_effect_glass">Glass</string>
 </resources>

@@ -235,6 +235,10 @@ fun SettingProviderPage(vm: SettingVM = koinViewModel()) {
 private fun RecommendProviderButton(
     onAdd: (ProviderSetting) -> Unit
 ) {
+    // v305（用户拍板「推荐清单空了就整个隐藏按钮」）：推荐清单已清空（见
+    // RecommendedProviders 的注释），没有可展示项时连入口一起隐藏，
+    // 避免点进去一个空弹层。
+    if (RECOMMENDED_PROVIDERS.isEmpty()) return
     val toaster = LocalToaster.current
     var showSheet by remember { mutableStateOf(false) }
     val importSuccessMessage = stringResource(R.string.setting_provider_page_import_success)
@@ -640,11 +644,6 @@ private fun ProviderItem(
                                 provider.models.size
                             )
                         )
-                    }
-                    if (provider.name == "AiHubMix") {
-                        Tag(type = TagType.INFO) {
-                            Text("10% 优惠")
-                        }
                     }
                 }
             }

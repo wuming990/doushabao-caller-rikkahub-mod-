@@ -23,7 +23,7 @@ class SkillManager(
 
     fun listSkills(): List<SkillMetadata> {
         val skillsDir = getSkillsDir()
-        return skillsDir.listFiles()
+        val raw = skillsDir.listFiles()
             ?.filter { it.isDirectory }
             ?.mapNotNull { dir ->
                 val skillFile = dir.resolve("SKILL.md")
@@ -31,6 +31,10 @@ class SkillManager(
                 parseSkillFile(skillFile, dir)
             }
             ?: emptyList()
+        // v304：按用户在设置里拖出来的顺序排。
+        // settingsFlow 是内存态 StateFlow（可同步读 .value），所以这里不用改成挂起函数，
+        // 全部调用点（技能页、助手扩展页、给模型看的技能清单）自动获得同一个顺序。
+        return sortSkillsByOrder(raw, settingsStore.settingsFlow.value.skillOrder)
     }
 
     fun readSkillBody(skillName: String): String? {

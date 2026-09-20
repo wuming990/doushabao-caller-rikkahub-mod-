@@ -23,6 +23,20 @@ interface FolderDAO {
     @Update
     suspend fun update(folder: FolderEntity)
 
+    /**
+     * v304：整批写回文件夹（拖动排序用）。Room 会把一次 @Update 的列表包在一个事务里，
+     * 中途失败不会写出一半排序。
+     */
+    @Update
+    suspend fun updateAll(folders: List<FolderEntity>)
+
+    /**
+     * v304：新文件夹的排序号 —— 排在最后。
+     * 用户手动排过序之后，库里是 0..n-1 的连续编号，新文件夹若还用 0 会插到最前面。
+     */
+    @Query("SELECT COALESCE(MAX(sort_index), -1) + 1 FROM conversation_folder WHERE assistant_id = :assistantId")
+    suspend fun nextSortIndex(assistantId: String): Int
+
     @Query("UPDATE conversation_folder SET name = :name WHERE id = :id")
     suspend fun rename(id: String, name: String)
 

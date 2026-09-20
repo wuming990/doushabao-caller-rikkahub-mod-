@@ -231,6 +231,7 @@ class ChatVM(
                                         inputPerMillion = model.inputPricePerMillion,
                                         outputPerMillion = model.outputPricePerMillion,
                                         cachedPerMillion = model.cachedPricePerMillion,
+                                        perRequest = model.requestPrice,
                                     )
                                 }
                         },
@@ -659,23 +660,19 @@ class ChatVM(
 
     fun updatePinnedStatus(conversation: Conversation) {
         viewModelScope.launch {
-            conversationRepo.togglePinStatus(conversation.id)
+            // v306 合并上游 2.5.3：置顶改走 ChatService（会话级元数据更新，只更新对应列）
+            chatService.toggleConversationPinned(conversation.id)
         }
     }
 
     fun moveConversationToAssistant(conversation: Conversation, targetAssistantId: Uuid) {
         viewModelScope.launch {
-            val conversationFull = conversationRepo.getConversationById(conversation.id) ?: return@launch
-            // 文件夹是助手内分组，切换助手后原文件夹在新助手下不可见，需清空归属避免会话丢失
-            val updatedConversation = conversationFull.copy(
-                assistantId = targetAssistantId,
-                folderId = null,
-            )
+            // v306 合并上游 2.5.3：移动改走 ChatService.moveConversationToAssistant
+            // （内部用 session.updateMetadata 只更新 assistantId/folder_id 两列，
+            //  避免整对象保存把正在流式输出的消息覆盖回旧快照；原「手动查库+整对象保存」写法已由官方取代）
+            chatService.moveConversationToAssistant(conversation.id, targetAssistantId)
             if (conversation.id == _conversationId) {
-                chatService.saveConversation(_conversationId, updatedConversation)
                 settingsStore.updateAssistant(targetAssistantId)
-            } else {
-                conversationRepo.updateConversation(updatedConversation)
             }
         }
     }
@@ -746,4 +743,5 @@ private fun ModelTokenStats.toCostSlice(): ModelUsageSlice = ModelUsageSlice(
     completionTokens = completionTokens,
     cachedTokens = cachedTokens,
     messageCount = messageCount,
+    requestCount = requestCount,
 )

@@ -28,6 +28,13 @@ data class Model(
     val inputPricePerMillion: Double? = null,
     val outputPricePerMillion: Double? = null,
     val cachedPricePerMillion: Double? = null,
+    /**
+     * v304：按次价格 —— 每**一次模型请求**多少钱（不是每百万 token）。
+     *
+     * 给「按次计费」的中转站/套餐用：与 token 单价可以同时填，两边各自算、最后相加。
+     * null = 用户没填这一项，不参与估算。
+     */
+    val requestPrice: Double? = null,
 )
 
 @Serializable

@@ -306,8 +306,37 @@ class TruncationAutoResumeGuardTest {
     fun `断网重试的官方逻辑没有被截断续跑改坏`() {
         val src = source(handlerPath)
         assertTrue(
-            "断网重试上限 MAX_PROVIDER_NETWORK_RETRIES = 3 丢了",
+            "断网重试的官方兜底上限常量 MAX_PROVIDER_NETWORK_RETRIES = 3 丢了",
             src.contains("MAX_PROVIDER_NETWORK_RETRIES = 3")
+        )
+        // v305：上限不再直接使用该常量，改为跟随续写次数滑条；但滑条为 0 时必须落回 3，
+        // 否则圆桌 / 子代理 / 压缩 / 翻译（一律不传 truncationAutoResumeMax）会被静默砍成 0 次重试。
+        assertTrue(
+            "v305 断网重试上限跟随续写次数的函数丢了",
+            src.contains("internal fun providerNetworkRetryLimit(truncationAutoResumeMax: Int): Int")
+        )
+        assertTrue(
+            "v305 重试上限的官方兜底分支丢了",
+            src.contains("else MAX_PROVIDER_NETWORK_RETRIES")
+        )
+        assertTrue(
+            "v305 判定处不再使用 maxRetries（仍是硬编码上限）",
+            src.contains("retryCount >= maxRetries")
+        )
+        // v305：指数退避必须封顶，否则次数放开到 99 时会等到以「年」计。
+        assertTrue(
+            "v305 重试等待封顶常量 30 秒丢了",
+            src.contains("MAX_PROVIDER_NETWORK_RETRY_DELAY_MS = 30_000L")
+        )
+        assertTrue(
+            "v305 等待时间未走封顶函数",
+            src.contains("val retryDelay = providerNetworkRetryDelayMs(retryCount)")
+        )
+        // 反向断言：等待时间在调用点直接由起始常量算出来（不经过封顶函数）的旧写法不许复活。
+        // 注意不要写成「起始常量 shl retryCount」——封顶函数内部本来就是这个形态，会误伤自己。
+        assertTrue(
+            "v305 旧的不封顶退避写法复活了",
+            !src.contains("val retryDelay = INITIAL_PROVIDER_RETRY_DELAY_MS")
         )
         assertTrue(
             "断网重试的输入快照语义 responseBaseMessages 声明丢了",

@@ -24,10 +24,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.flatMapLatest
-import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.update
@@ -155,20 +152,26 @@ private const val MIN_ROUND_TABLE_SUMMARY_PROPOSALS = 2
 
 internal fun backgroundTextGenerationParams(
     model: Model,
+    conversationId: Uuid,
     reasoningLevel: ReasoningLevel = ReasoningLevel.AUTO,
 ): TextGenerationParams = TextGenerationParams(
     model = model,
     reasoningLevel = reasoningLevel,
     customHeaders = model.customHeaders,
     customBody = model.customBodies,
+    // v306 合并上游 2.5.3：官方给后台生成（标题/建议/压缩）补上会话级 session id，
+    // 与主对话一致，便于服务端按会话归组。
+    sessionId = conversationId.toString(),
 )
 
 /** Codex compaction 继承当前助手思考档位；摘要输出不设置应用层 maxTokens。 */
 internal fun compressionTextGenerationParams(
     model: Model,
     assistant: Assistant,
+    conversationId: Uuid? = null,
 ): TextGenerationParams = backgroundTextGenerationParams(
     model = model,
+    conversationId = conversationId ?: Uuid.random(),
     reasoningLevel = assistant.reasoningLevel,
 ).copy(
     maxTokens = null,
@@ -293,9 +296,14 @@ internal fun buildContextUsageInfo(
 internal fun createForkConversation(
     source: Conversation,
     messageNodes: List<MessageNode>,
+    existingTitles: Set<String> = emptySet(),
 ): Conversation = Conversation(
     id = Uuid.random(),
     assistantId = source.assistantId,
+    // v306 合并上游 2.5.3：分支标题按「原名(N)」自动避让同助手已有标题。
+    title = generateSequence(1) { it + 1 }
+        .map { "${source.title}($it)" }
+        .first { it !in existingTitles },
     messageNodes = messageNodes,
     customSystemPrompt = source.customSystemPrompt,
     modeInjectionIds = source.modeInjectionIds,
@@ -366,8 +374,27 @@ class ChatService(
     private val workspaceReminderTransformer = WorkspaceReminderTransformer(workspaceRepository)
 
     // 统一会话管理
-    private val sessions = ConcurrentHashMap<Uuid, ConversationSession>()
-    private val _sessionsVersion = MutableStateFlow(0L)
+    // v306 合并上游 2.5.3：底层换成官方 ConversationSessionManager（生命周期、引用计数、
+    // 空闲回收都在里面），下面 getOrCreateSession / launchWithConversationReference 等
+    // 调用名全部保留，作为转发层，避免 2707 行二改（圆桌等）跟着官方重构重写。
+    private val sessionManager = ConversationSessionManager(
+        scope = appScope,
+        createInitialConversation = { id ->
+            Conversation.ofId(
+                id = id,
+                assistantId = settingsStore.settingsFlow.value.getCurrentAssistant().id
+            )
+        },
+        onGenerationFinished = ::onSessionGenerationFinished,
+    )
+
+    // v306：per-session 写锁。官方 ConversationSession 的 state 是只读 StateFlow，
+    // 不能再像旧版那样用 MutableStateFlow.update{} 做原子读改写（见 mutateAndSaveConversation
+    // 的 v229 KDoc）。这把锁把「读 → 改 → 写回」整段串行化，恢复 v229 关闭的竞争窗口。
+    private val conversationWriteLocks = ConcurrentHashMap<Uuid, Mutex>()
+
+    private fun conversationWriteLock(conversationId: Uuid): Mutex =
+        conversationWriteLocks.computeIfAbsent(conversationId) { Mutex() }
 
     // 错误状态
     private val _errors = MutableStateFlow<List<ChatError>>(emptyList())
@@ -397,90 +424,50 @@ class ChatService(
     private val _generationDoneFlow = MutableSharedFlow<Uuid>()
     val generationDoneFlow: SharedFlow<Uuid> = _generationDoneFlow.asSharedFlow()
 
-    fun cleanup() = runCatching {
-        sessions.values.forEach { it.cleanup() }
-        sessions.clear()
-    }
+    fun cleanup() = runCatching { sessionManager.cleanup() }
 
     // ---- Session 管理 ----
 
-    private fun getOrCreateSession(conversationId: Uuid): ConversationSession {
-        return sessions.computeIfAbsent(conversationId) { id ->
-            val settings = settingsStore.settingsFlow.value
-            ConversationSession(
-                id = id,
-                initial = Conversation.ofId(
-                    id = id,
-                    assistantId = settings.getCurrentAssistant().id
-                ),
-                scope = appScope,
-                onIdle = { removeSession(it) },
-                onGenerationFinished = { id, cause ->
-                    val session = sessions[id]
-                    if (cause != null) session?.messageQueue?.pause()
-                    if (session?.state?.value?.currentMessages?.any { message ->
-                            message.parts.any { it is UIMessagePart.Tool && it.isPending }
-                        } == true) {
-                        session.messageQueue.failReplyWaiters(context.getString(R.string.chat_page_voice_tool_approval))
-                    }
-                    appScope.launch { dispatchNextQueuedMessage(id) }
-                },
-            ).also {
-                _sessionsVersion.value++
-                Log.i(TAG, "createSession: $id (total: ${sessions.size + 1})")
-            }
+    private fun onSessionGenerationFinished(session: ConversationSession, cause: Throwable?) {
+        if (cause != null) session.messageQueue.pause()
+        if (session.state.value.currentMessages.any { message ->
+                message.parts.any { it is UIMessagePart.Tool && it.isPending }
+            }) {
+            session.messageQueue.failReplyWaiters(context.getString(R.string.chat_page_voice_tool_approval))
         }
+        appScope.launch { dispatchNextQueuedMessage(session.id) }
     }
 
-    private fun removeSession(conversationId: Uuid) {
-        val session = sessions[conversationId] ?: return
-        if (session.isInUse) {
-            Log.d(TAG, "removeSession: skipped $conversationId (still in use)")
-            return
-        }
-        if (sessions.remove(conversationId, session)) {
-            session.cleanup()
-            _sessionsVersion.value++
-            Log.i(TAG, "removeSession: $conversationId (remaining: ${sessions.size})")
-        }
-    }
+    private fun getOrCreateSession(conversationId: Uuid): ConversationSession =
+        sessionManager.getOrCreate(conversationId)
 
     // ---- 引用管理 ----
 
     fun addConversationReference(conversationId: Uuid) {
-        getOrCreateSession(conversationId).acquire()
+        sessionManager.acquire(conversationId)
     }
 
     fun removeConversationReference(conversationId: Uuid) {
-        sessions[conversationId]?.release()
+        sessionManager.release(conversationId)
     }
 
+    // 转发层：语义与官方 launchWithSession 一致（acquire -> block -> release），
+    // 保留无参 block 签名，既有调用点（含圆桌）一行不改。
     private fun launchWithConversationReference(
         conversationId: Uuid,
         block: suspend () -> Unit
-    ): Job = appScope.launch {
-        addConversationReference(conversationId)
-        try {
-            block()
-        } finally {
-            removeConversationReference(conversationId)
-        }
-    }
+    ): Job = sessionManager.launchWithSession(conversationId) { block() }
 
     // ---- 对话状态访问 ----
 
-    fun getConversationFlow(conversationId: Uuid): StateFlow<Conversation> {
-        return getOrCreateSession(conversationId).state
-    }
+    fun getConversationFlow(conversationId: Uuid): StateFlow<Conversation> =
+        sessionManager.getConversationFlow(conversationId)
 
-    fun getGenerationJobStateFlow(conversationId: Uuid): Flow<Job?> {
-        val session = sessions[conversationId] ?: return flowOf(null)
-        return session.generationJob
-    }
+    fun getGenerationJobStateFlow(conversationId: Uuid): Flow<Job?> =
+        sessionManager.getGenerationJobStateFlow(conversationId)
 
-    fun getProcessingStatusFlow(conversationId: Uuid): StateFlow<String?> {
-        return getOrCreateSession(conversationId).processingStatus
-    }
+    fun getProcessingStatusFlow(conversationId: Uuid): StateFlow<String?> =
+        sessionManager.getProcessingStatusFlow(conversationId)
 
     // 2.4.13：后台生成保活。生成仍归 ChatService 管，这里只借前台服务的生命周期，
     // 让切到后台后流式生成不被系统杀进程打断。
@@ -508,60 +495,52 @@ class ChatService(
         }
     }
 
-    fun getConversationJobs(): Flow<Map<Uuid, Job?>> {
-        return _sessionsVersion.flatMapLatest {
-            val currentSessions = sessions.values.toList()
-            if (currentSessions.isEmpty()) {
-                flowOf(emptyMap())
-            } else {
-                combine(currentSessions.map { s ->
-                    s.generationJob.map { job -> s.id to job }
-                }) { pairs ->
-                    pairs.filter { it.second != null }.toMap()
-                }
-            }
-        }
-    }
+    fun getConversationJobs(): Flow<Map<Uuid, Job?>> = sessionManager.getConversationJobs()
 
     // ---- 初始化对话 ----
 
     suspend fun initializeConversation(conversationId: Uuid) {
-        val session = getOrCreateSession(conversationId)
-        session.initializeOnce {
+        // v306 合并上游 2.5.3：官方 initialize(load: suspend () -> Conversation) 取代了
+        // 旧 initializeOnce，并用 withSession 包住（acquire/release 引用计数，防止查库
+        // 挂起期间会话被空闲回收）。官方 initialize 的并发安全（initializationMutex +
+        // initialized 标志 + synchronized 双重检查）比旧版强，但 v229 硬保护必须保留 ——
+        // 把判断搬进 load 闭包：生成中或内存已有消息时返回内存态（Session 内部不会覆盖）。
+        sessionManager.withSession(conversationId) { session ->
+        session.initialize {
             // 生成已经开始时，内存态比数据库新，绝不能用旧快照覆盖。
             if (session.isGenerating) {
                 Log.i(TAG, "initializeConversation: keep active in-memory state for $conversationId")
-                return@initializeOnce
+                return@initialize session.state.value
             }
             // v229 硬保护：内存里只要已经有消息，就绝不允许用「空的新对话」覆盖。
             // 旧版只看 isGenerating 这个瞬时状态，判断落空就会把刚写进去的用户消息冲掉。
             if (session.state.value.messageNodes.isNotEmpty()) {
                 Log.i(TAG, "initializeConversation: memory already has messages, skip for $conversationId")
-                return@initializeOnce
+                return@initialize session.state.value
             }
             val conversation = conversationRepo.getConversationById(conversationId)
             if (session.isGenerating) {
                 Log.i(TAG, "initializeConversation: generation started while loading $conversationId; keep memory")
-                return@initializeOnce
+                return@initialize session.state.value
             }
             if (session.state.value.messageNodes.isNotEmpty()) {
                 Log.i(TAG, "initializeConversation: messages appeared while loading $conversationId; keep memory")
-                return@initializeOnce
+                return@initialize session.state.value
             }
             if (conversation != null) {
-                updateConversation(conversationId, conversation)
                 settingsStore.updateAssistant(conversation.assistantId)
+                conversation
             } else {
                 // 新建对话, 并添加预设消息
                 val currentSettings = settingsStore.settingsFlowRaw.first()
                 val assistant = currentSettings.getCurrentAssistant()
-                val newConversation = Conversation.ofId(
+                Conversation.ofId(
                     id = conversationId,
                     assistantId = assistant.id,
                     newConversation = true
                 ).updateCurrentMessages(assistant.presetMessages)
-                updateConversation(conversationId, newConversation)
             }
+        }
         }
     }
 
@@ -571,19 +550,19 @@ class ChatService(
         getOrCreateSession(conversationId).messageQueue.state
 
     fun removeQueuedMessage(conversationId: Uuid, messageId: Uuid) {
-        sessions[conversationId]?.messageQueue?.remove(messageId)?.let(::cleanupQueuedAttachments)
+        sessionManager.get(conversationId)?.messageQueue?.remove(messageId)?.let(::cleanupQueuedAttachments)
         dispatchNextQueuedMessage(conversationId)
     }
 
     fun beginEditQueuedMessage(conversationId: Uuid, messageId: Uuid): QueuedMessage? =
-        sessions[conversationId]?.messageQueue?.beginEdit(messageId)
+        sessionManager.get(conversationId)?.messageQueue?.beginEdit(messageId)
 
     fun finishEditQueuedMessage(
         conversationId: Uuid,
         messageId: Uuid,
         parts: List<UIMessagePart>? = null
     ) {
-        sessions[conversationId]?.messageQueue?.finishEdit(messageId, parts)
+        sessionManager.get(conversationId)?.messageQueue?.finishEdit(messageId, parts)
             ?.let(::cleanupQueuedAttachments)
         dispatchNextQueuedMessage(conversationId)
     }
@@ -597,7 +576,7 @@ class ChatService(
                 val persistedReferences =
                     candidates.filter { conversationRepo.hasFileReference(it) }.toSet()
                 // 数据库查询挂起期间队列可能已推进，删除前重新读取内存引用。
-                val currentSessions = sessions.values.toList()
+                val currentSessions = sessionManager.snapshot()
                 val unusedFiles = unreferencedQueuedAttachmentUrls(
                     previous = previous,
                     conversations = currentSessions.map { it.state.value },
@@ -617,7 +596,7 @@ class ChatService(
     }
 
     fun resumeMessageQueue(conversationId: Uuid) {
-        sessions[conversationId]?.messageQueue?.resume()
+        sessionManager.get(conversationId)?.messageQueue?.resume()
         dispatchNextQueuedMessage(conversationId)
     }
 
@@ -651,7 +630,7 @@ class ChatService(
     }
 
     private fun dispatchNextQueuedMessage(conversationId: Uuid): Job? {
-        val session = sessions[conversationId] ?: return null
+        val session = sessionManager.get(conversationId) ?: return null
         synchronized(session) {
             // A pending tool approval is still part of the current turn.
             if (session.getJob() != null || session.state.value.currentMessages.any { message ->
@@ -2979,7 +2958,7 @@ class ChatService(
                     workspaceCwd = conversation.workspaceCwd,
                 )
             } catch (error: InvalidMcpServerNamesException) {
-                sessions[conversationId]?.messageQueue?.pause()
+                sessionManager.get(conversationId)?.messageQueue?.pause()
                 addError(
                     error = IllegalStateException(
                         context.getString(
@@ -3185,7 +3164,7 @@ class ChatService(
                 )
             }
             if (it is CancellationException) throw it
-            sessions[conversationId]?.messageQueue?.pause()
+            sessionManager.get(conversationId)?.messageQueue?.pause()
 
             it.printStackTrace()
             addError(it, conversationId, title = context.getString(R.string.error_title_generation))
@@ -3328,7 +3307,7 @@ class ChatService(
                                 .takeLast(4).joinToString("\n\n") { it.summaryAsText(maxLength = 500) })
                     ),
                 ),
-                params = backgroundTextGenerationParams(model, settings.fastModelReasoningLevel),
+                params = backgroundTextGenerationParams(model, conversationId, settings.fastModelReasoningLevel),
             )
 
             // 生成完，conversation可能不是最新了，因此需要重新获取
@@ -3362,7 +3341,7 @@ class ChatService(
                 ?: return@runCatching
             val provider = model.findProvider(settings.providers) ?: return@runCatching
 
-            sessions[conversationId]?.let { session ->
+            sessionManager.get(conversationId)?.let { session ->
                 updateConversation(
                     conversationId,
                     session.state.value.copy(chatSuggestions = emptyList())
@@ -3380,14 +3359,14 @@ class ChatService(
                                 .takeLast(8).joinToString("\n\n") { it.summaryAsText(maxLength = 500) }),
                     )
                 ),
-                params = backgroundTextGenerationParams(model, settings.fastModelReasoningLevel),
+                params = backgroundTextGenerationParams(model, conversationId, settings.fastModelReasoningLevel),
             )
             val suggestions =
                 result.message.toText().split("\n").map { it.trim() }
                     .filter { it.isNotBlank() }
 
             val latestConversation = conversationRepo.getConversationById(conversationId)
-                ?: sessions[conversationId]?.state?.value
+                ?: sessionManager.get(conversationId)?.state?.value
                 ?: conversation
             saveConversation(
                 conversationId,
@@ -3447,6 +3426,7 @@ class ChatService(
         val params = compressionTextGenerationParams(
             model = model,
             assistant = assistant,
+            conversationId = conversationId,
         ).copy(
             customBody = scopedCustomBodies(
                 assistantBodies = emptyList(),
@@ -3597,7 +3577,7 @@ class ChatService(
             val result = providerHandler.generateText(
                 providerSetting = provider,
                 messages = listOf(UIMessage.user(prompt)),
-                params = backgroundTextGenerationParams(model),
+                params = backgroundTextGenerationParams(model, conversationId),
             )
 
             return result.message.toText().trim().takeIf { it.isNotBlank() }
@@ -3670,12 +3650,48 @@ class ChatService(
         if (conversation.id != conversationId) return
         val session = getOrCreateSession(conversationId)
         checkFilesDelete(conversation, session.state.value)
-        session.state.value = conversation
+        // v306：改用官方 session.updateConversation —— 会设置 initialized 标志，
+        // 官方 initialize 的双重检查才不会在加载窗口内用旧快照覆盖新写入的消息。
+        session.updateConversation(conversation)
     }
 
     fun updateConversationState(conversationId: Uuid, update: (Conversation) -> Conversation) {
         val current = getConversationFlow(conversationId).value
         updateConversation(conversationId, update(current))
+    }
+
+    // v306 合并上游 2.5.3：官方新增的元数据更新通道（置顶 / 移动会话到其它助手）。
+    // 先经 session.updateMetadata 把改动应用到最新内存态、只更新对应列，
+    // 避免用旧消息快照整对象覆盖正在流式输出的会话。
+    private suspend fun updateConversationMetadata(
+        conversationId: Uuid,
+        update: (Conversation) -> Conversation,
+        persist: suspend (Conversation) -> Unit,
+    ) {
+        sessionManager.withSession(conversationId) { session ->
+            session.initialize {
+                conversationRepo.getConversationById(conversationId)
+                    ?: throw NotFoundException("Conversation not found")
+            }
+            session.updateMetadata(update, persist)
+        }
+    }
+
+    suspend fun toggleConversationPinned(conversationId: Uuid) {
+        updateConversationMetadata(
+            conversationId = conversationId,
+            update = { it.copy(isPinned = !it.isPinned) },
+            persist = { conversationRepo.updatePinStatus(conversationId, it.isPinned) },
+        )
+    }
+
+    suspend fun moveConversationToAssistant(conversationId: Uuid, assistantId: Uuid) {
+        updateConversationMetadata(
+            conversationId = conversationId,
+            // 文件夹属于助手，移动后清除原助手的文件夹归属。
+            update = { it.copy(assistantId = assistantId, folderId = null) },
+            persist = { conversationRepo.updateConversationAssistant(conversationId, it.assistantId) },
+        )
     }
 
     /**
@@ -3687,7 +3703,7 @@ class ChatService(
      * 先改内存可确保这段窗口内的整对象保存也带上新 folderId。
      */
     suspend fun moveConversationToFolder(conversationId: Uuid, folderId: Uuid?) {
-        if (sessions.containsKey(conversationId)) {
+        if (sessionManager.get(conversationId) != null) {
             updateConversationState(conversationId) { it.copy(folderId = folderId) }
         }
         conversationRepo.updateConversationFolderId(conversationId, folderId)
@@ -3698,7 +3714,7 @@ class ChatService(
      * 仅活跃 session 可能在生成；内存态 folderId 为权威（移动会先同步内存态）。
      */
     fun hasGeneratingConversationInFolder(folderId: Uuid): Boolean {
-        return sessions.values.any { it.isGenerating && it.state.value.folderId == folderId }
+        return sessionManager.snapshot().any { it.isGenerating && it.state.value.folderId == folderId }
     }
 
     /**
@@ -3709,14 +3725,14 @@ class ChatService(
      * 后续整对象保存会写回一个已被删除的 folder_id，导致会话在列表中悬空。
      */
     suspend fun deleteFolder(folderId: Uuid) {
-        sessions.values
+        sessionManager.snapshot()
             .filter { it.state.value.folderId == folderId }
             .forEach { updateConversationState(it.id) { c -> c.copy(folderId = null) } }
         folderRepository.deleteFolder(folderId)
     }
 
     private fun checkFilesDelete(newConversation: Conversation, oldConversation: Conversation) {
-        val session = sessions[newConversation.id]
+        val session = sessionManager.get(newConversation.id)
         val queuedFiles = (session?.messageQueue?.state?.value?.messages.orEmpty() +
                 listOfNotNull(session?.submittingMessage))
             .flatMap { it.parts }.localFileUrls().map { it.toUri() }
@@ -3759,36 +3775,36 @@ class ChatService(
      * 用户刚发出的消息就这么丢了（真机事故：圆桌页在、用户那句话没了）。
      *
      * 这里改成在 [MutableStateFlow.update] 里完成读改写，中间不给别人插手的机会。
+     *
+     * v306 合并上游 2.5.3：官方 ConversationSession 的 state 变成只读 StateFlow，
+     * 不能再直接用 [MutableStateFlow.update]。改为用 [conversationWriteLock] 把
+     * 「读 state.value → 应用 update → session.updateConversation」整段锁住，
+     * 把同一会话的**本函数**并发调用串行化 —— 覆盖范围与 v229 的原子读改写相同
+     *（v229 的 [MutableStateFlow.update] 也只保护本函数内的读改写，其它写路径
+     *  如 saveConversation / 流式 updateConversation 同样不参与，这一点没变）。
+     * ⚠️ 不许退回「读快照 → 改 → 整份写回」的无锁写法（v229 真机事故就是它造成的）。
      */
     private suspend fun mutateAndSaveConversation(
         conversationId: Uuid,
         update: (Conversation) -> Conversation,
-    ): Conversation {
+    ): Conversation = conversationWriteLock(conversationId).withLock {
         val session = getOrCreateSession(conversationId)
-        var previous: Conversation? = null
-        var next: Conversation? = null
-        session.state.update { current ->
-            val updated = update(current)
-            if (updated.id != conversationId) {
-                current
-            } else {
-                previous = current
-                next = updated
-                updated
-            }
+        val before = session.state.value
+        val updated = update(before)
+        val after = if (updated.id != conversationId) before else updated
+        if (updated.id == conversationId) {
+            session.updateConversation(updated)
+            checkFilesDelete(after, before)
         }
-        val before = previous
-        val after = next ?: session.state.value
-        if (before != null) checkFilesDelete(after, before)
 
         val exists = conversationRepo.existsConversationById(after.id)
-        if (!exists && after.title.isBlank() && after.messageNodes.isEmpty()) return after
+        if (!exists && after.title.isBlank() && after.messageNodes.isEmpty()) return@withLock after
         if (!exists) {
             conversationRepo.insertConversation(after)
         } else {
             conversationRepo.updateConversation(after)
         }
-        return after
+        after
     }
 
     // ---- 翻译消息 ----
@@ -3918,7 +3934,11 @@ class ChatService(
                 )
             }
 
-        val forkConversation = createForkConversation(currentConversation, copiedNodes)
+        val existingTitles = conversationRepo
+            .getConversationsOfAssistant(currentConversation.assistantId)
+            .first()
+            .mapTo(mutableSetOf()) { it.title }
+        val forkConversation = createForkConversation(currentConversation, copiedNodes, existingTitles)
 
         saveConversation(forkConversation.id, forkConversation)
         return forkConversation
@@ -4057,7 +4077,7 @@ class ChatService(
      * 剩下的收尾放到后台等，僵尸连接自己超时死掉，不再堵住界面。
      */
     suspend fun stopGeneration(conversationId: Uuid) {
-        val session = sessions[conversationId] ?: return
+        val session = sessionManager.get(conversationId) ?: return
         val job = session.getJob() ?: return
 
         // 圆桌：立刻把还在跑的位置标成中断并推给界面，不等卡住的连接

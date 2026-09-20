@@ -54,7 +54,14 @@ import kotlin.time.Clock
  * 该类保存着一次响应流的合并状态，不是无状态转换器。每条并发响应流都必须使用独立实例，且
  * 事件应按 Provider 产生的顺序交给同一实例处理。
  */
-class StreamChunkHandler(private val model: Model? = null) {
+class StreamChunkHandler(
+    private val model: Model? = null,
+    /**
+     * v303：单调时钟（默认 System.nanoTime）。留成参数是为了让单测能喂假时间 ——
+     * 时间相关的逻辑必须能注入「现在几点」才测得准，见项目手册的踩坑记录。
+     */
+    private val nowNanos: () -> Long = { System.nanoTime() },
+) {
     // v297：本轮请求服务商报的用量（水位语义，同轮内多个 usage 分片互相覆盖）。
     // 上层在每轮结束时读它做「真实消耗」累加 —— 只有 handler 自己知道本轮报了什么，
     // 消息对象上的 usage 分不清「本轮没报」和「本轮报得跟上次一样」。
@@ -62,6 +69,29 @@ class StreamChunkHandler(private val model: Model? = null) {
 
     /** 本轮服务商报出的用量；一条都没报时为 null（上层据此决定要不要计入累计）。 */
     val reportedUsage: TokenUsage? get() = roundUsage
+
+    // v303：本轮耗时的三个时刻。构造时 = 请求发出；第一个内容分片 = 首字；
+    // 收到 Finish = 写完。没有 Finish 时（异常中断/用户停止）在第一次被读取时冻结为当时时刻，
+    // 免得后续再读把空白时间算进去。
+    private val startedNanos: Long = nowNanos()
+    private var firstContentNanos: Long? = null
+    private var endNanos: Long? = null
+
+    /**
+     * v303：本轮请求的耗时切分，供上层累加成「本条回答的真实耗时」。
+     *
+     * 外面工具算「每秒多少 token」分两派，两派的分母都不含工具执行时间与用户审批等待：
+     * - [RoundTiming.generationMs] = 不含首字等待（LM Studio / Cherry Studio 那一派）
+     * - [RoundTiming.responseMs] = 含首字等待（Claude Code 插件 / ccstatusline 那一派）
+     */
+    val roundTiming: RoundTiming
+        get() {
+            val end = endNanos ?: nowNanos().also { endNanos = it }
+            val responseMs = ((end - startedNanos) / 1_000_000L).coerceAtLeast(0L)
+            val generationMs = firstContentNanos
+                ?.let { ((end - it) / 1_000_000L).coerceAtLeast(0L) }
+            return RoundTiming(responseMs = responseMs, generationMs = generationMs)
+        }
 
     // Map 的值是对应 part 在当前助手消息 parts 列表中的下标。
     private val textPartIndexes = mutableMapOf<String, Int>()
@@ -81,6 +111,11 @@ class StreamChunkHandler(private val model: Model? = null) {
             messages + UIMessage(modelId = model?.id, role = MessageRole.ASSISTANT, parts = emptyList())
         } else {
             messages
+        }
+        // v303：第一个「内容分片」出现的时刻就是首字时刻。思考分片也算 —— 服务商把思考 token
+        // 计入输出，它占的时间必须留在分母里，排掉会把生成速度算得虚高。
+        if (firstContentNanos == null && chunk.producesOutput()) {
+            firstContentNanos = nowNanos()
         }
         val updatedMessage = append(targetMessages.last(), chunk)
         return targetMessages.dropLast(1) + updatedMessage
@@ -310,6 +345,8 @@ class StreamChunkHandler(private val model: Model? = null) {
                 // v269：保留「流结束时从未收到协议终止信号」这一事实，供上层识别无声截断
                 truncatedWithoutSentinel = chunk.terminatedWithoutSentinel,
             ).finishReasoning().also {
+                // v303：本轮「写完」的时刻
+                endNanos = nowNanos()
                 // Finish 同时结束尚未显式结束的 reasoning，并释放本次响应流的索引状态。
                 textPartIndexes.clear()
                 reasoningPartIndexes.clear()
@@ -335,6 +372,39 @@ private fun mergeMetadata(old: JsonObject?, new: JsonObject?): JsonObject? = whe
     old == null -> new
     new == null -> old
     else -> JsonObject(old + new)
+}
+
+/**
+ * v303：一轮请求的耗时切分（毫秒）。
+ *
+ * 为什么拆两段：业界算「每秒多少 token」分两派 —— 一派只看「模型真正在吐字」的时间
+ * （LM Studio、Cherry Studio：分母扣掉首字等待），另一派看「这次请求等了多久」
+ * （Claude Code 插件、ccstatusline：分母含首字等待）。两个数回答的是不同问题，所以都留。
+ * 两派都**不含工具执行时间与用户审批等待**（工具跑在两次请求之间，天然不在任何一轮里）。
+ */
+data class RoundTiming(
+    /** 从请求发出到本轮结束（含首字等待）。 */
+    val responseMs: Long,
+    /** 从吐出第一个内容分片到本轮结束；一个内容都没吐时为 null。 */
+    val generationMs: Long?,
+)
+
+/**
+ * v303：这个分片算不算「模型吐出来的内容」。
+ *
+ * 思考分片也算（服务商把思考 token 计入输出，时间必须留在分母里，否则速度虚高）；
+ * 工具调用参数、图像同理 —— 它们都计入输出。只带用量或收尾信息的分片一律不算。
+ */
+private fun StreamChunk.producesOutput(): Boolean = when (this) {
+    is StreamChunk.TextDelta,
+    is StreamChunk.ReasoningDelta,
+    is StreamChunk.ToolCallDelta,
+    is StreamChunk.ServerToolInputDelta,
+    is StreamChunk.ImageDelta,
+    is StreamChunk.ImageSnapshot,
+    -> true
+
+    else -> false
 }
 
 fun List<UIMessage>.handleTextGenerationResult(

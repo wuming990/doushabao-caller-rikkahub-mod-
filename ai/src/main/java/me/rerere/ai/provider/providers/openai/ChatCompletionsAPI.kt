@@ -596,10 +596,13 @@ class ChatCompletionsAPI(
                     reasoningPart = null // 清空，下一个 group 可能有新的 reasoning
 
                     // 紧跟 tool 结果消息
+                    // v306 合并上游 2.5.3：官方删掉了这里的 name 字段 ——
+                    // 部分 OpenAI 兼容网关拒收 tool 结果消息里的 name（官方新增测试
+                    // ChatCompletionsRequestMessageTest 钉着「Tool results must omit
+                    // unsupported name field」）。tool_calls 里 function.name 保留不动。
                     group.tools.forEach { tool ->
                         add(buildJsonObject {
                             put("role", "tool")
-                            put("name", tool.toolName)
                             put("tool_call_id", tool.toolCallId)
                             put("content", tool.toToolResultContent(supportInputModalities))
                         })
