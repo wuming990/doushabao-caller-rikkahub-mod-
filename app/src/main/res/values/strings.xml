@@ -341,6 +341,7 @@
   <string name="chat_page_export_format">Export Format</string>
   <string name="chat_page_export_image">Export as Image</string>
   <string name="chat_page_export_image_desc">Export conversation as PNG image</string>
+  <string name="chat_page_export_include_reasoning">Export Reasoning</string>
   <string name="chat_page_export_image_expand_reasoning">Expand Reasoning</string>
   <string name="chat_page_export_markdown">Markdown</string>
   <string name="chat_page_export_markdown_desc">Export conversation as a markdown file</string>
@@ -1475,6 +1476,7 @@
   <string name="common_cancel">Cancel</string>
   <string name="common_save">Save</string>
   <string name="common_delete">Delete</string>
+  <string name="common_delete_confirm_message">Are you sure you want to delete "%s"? This action cannot be undone.</string>
   <string name="common_rename">Rename</string>
   <string name="common_export">Export</string>
   <string name="common_share">Share</string>
@@ -1578,6 +1580,10 @@
   <string name="round_table_status_done">%1$s done</string>
   <string name="round_table_status_failed">%1$s failed</string>
   <string name="round_table_status_summarizing">Main model is merging the proposals…</string>
+  <string name="round_table_status_phase_contract">Round table is drafting the task contract…</string>
+  <string name="round_table_status_phase_proposals">Round table is waiting for the next member to start…</string>
+  <string name="round_table_status_phase_rebuttal">Round table is waiting for the rebuttal round…</string>
+  <string name="round_table_status_phase_finished">Round table finished</string>
   <string name="round_table_unknown_model">Unknown model</string>
   <string name="agent_tools_section_title">Subagents (Codex style)</string>
   <string name="agent_tools_section_summary_on">On · the main model can dispatch subagents by itself</string>
@@ -1964,4 +1970,17 @@
   <string name="setting_display_page_background_effect_type">Background effect type</string>
   <string name="setting_display_page_background_effect_blur">Blur</string>
   <string name="setting_display_page_background_effect_glass">Glass</string>
+  <string name="skills_page_search_placeholder">Search skills</string>
+  <string name="skills_page_search_no_result">No matching skills</string>
+  <string name="assistant_page_local_tools_chart_display_title">Chart Display</string>
+  <string name="assistant_page_local_tools_chart_display_desc">Let the AI display line, bar, and scatter charts</string>
+  <string name="chat_message_tool_chart_display">Display chart</string>
+  <string name="chat_message_tool_chart_display_with_title">Display chart: %1$s</string>
+  <string name="chart_mode_chart">Chart</string>
+  <string name="chart_mode_table">Table</string>
+  <string name="chart_series">Series</string>
+  <string name="chart_series_name">Series %1$d</string>
+  <string name="error_fast_model_not_found">Fast model not found. Please select one in settings.</string>
+  <string name="error_fast_model_provider_not_found">Provider of the fast model not found</string>
+  <string name="assistant_page_clone_with_memories">Also copy memories</string>
 </resources>

@@ -25,6 +25,7 @@ import me.rerere.rikkahub.data.ai.GenerationLoop
 import me.rerere.rikkahub.data.ai.tools.createConversationTools
 import me.rerere.rikkahub.data.ai.tools.createSearchTools
 import me.rerere.rikkahub.data.datastore.SettingsStore
+import me.rerere.rikkahub.data.datastore.displayLabel
 import me.rerere.rikkahub.data.datastore.findModelById
 import me.rerere.rikkahub.data.datastore.getCurrentAssistant
 import me.rerere.rikkahub.data.repository.ConversationRepository
@@ -935,6 +936,9 @@ class GenerationAgentBackend(
             .coerceIn(0, 10)
             .coerceAtLeast(1)
         modelChain.forEachIndexed { index, model ->
+            // v311：事件里一律用「模型名 · 供应商名」。两家供应商放同一个模型名是常见用法，
+            // 只印模型名的话换人前后一个字都不差，用户无法判断到底换没换成（真机反馈）。
+            val modelLabel = model.displayLabel(settings.providers)
             if (index > 0) {
                 onEvent(
                     AgentEvent(
@@ -942,7 +946,7 @@ class GenerationAgentBackend(
                         type = "MODEL_FALLBACK",
                         detail = "上一个模型连试 $modelAttempts 次都失败" +
                             "（${(lastFailure?.message ?: "未知错误").take(160)}），" +
-                            "自动换用备用模型「${model.displayName}」" +
+                            "自动换用备用模型「$modelLabel」" +
                             "（第 ${index + 1}/${modelChain.size} 个候选，" +
                             "之前产出的内容为空，可以安全重来）",
                         createdAt = Instant.now(),
@@ -957,7 +961,7 @@ class GenerationAgentBackend(
                         AgentEvent(
                             threadId = thread.id,
                             type = "MODEL_RETRY",
-                            detail = "模型「${model.displayName}」第 ${attempt - 1} 次失败" +
+                            detail = "模型「$modelLabel」第 ${attempt - 1} 次失败" +
                                 "（${(lastFailure?.message ?: "未知错误").take(160)}），" +
                                 "${AGENT_MODEL_RETRY_DELAY_MILLIS / 1000} 秒后用同一个模型再试" +
                                 "（第 $attempt/$modelAttempts 次）",
@@ -1029,7 +1033,7 @@ class GenerationAgentBackend(
                         AgentEvent(
                             threadId = thread.id,
                             type = "TIMEOUT",
-                            detail = "模型「${model.displayName}」" +
+                            detail = "模型「$modelLabel」" +
                                 if (progress.toolTimedOut) {
                                     "调用的工具连续 $toolCeilingMinutes 分钟没有返回结果，按卡死处理"
                                 } else if (progress.idleTimedOut) {

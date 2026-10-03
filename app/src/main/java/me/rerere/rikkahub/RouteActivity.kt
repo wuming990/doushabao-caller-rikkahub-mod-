@@ -138,6 +138,7 @@ import kotlin.uuid.Uuid
 
 private const val TAG = "RouteActivity"
 private const val ACTION_TRANSLATE = "me.rerere.rikkahub.action.TRANSLATE"  // 官方 2.5.1
+private const val ACTION_IMAGE_GEN = "me.rerere.rikkahub.action.IMAGE_GEN"  // v312 官方 2.5.6
 
 class RouteActivity : ComponentActivity() {
     private val okHttpClient by inject<OkHttpClient>()
@@ -269,6 +270,7 @@ class RouteActivity : ComponentActivity() {
         }
         val destination = when (intent.action) {
             ACTION_TRANSLATE -> Screen.Translator
+            ACTION_IMAGE_GEN -> Screen.ImageGen  // v312 官方 2.5.6
             Intent.ACTION_SEND -> Screen.ShareHandler(
                 text = intent.getStringExtra(Intent.EXTRA_TEXT).orEmpty(),
                 // v255：EXTRA_STREAM 是 Parcelable Uri，getStringExtra 只会拿到 null

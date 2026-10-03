@@ -60,6 +60,8 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
@@ -160,6 +162,9 @@ fun ChatInput(
     onStartVoiceMode: (() -> Unit)? = null,
     voiceState: VoiceSessionState = VoiceSessionState(),
     onStopVoiceMode: () -> Unit = {},
+    // v314：外部请求把光标放进输入框（群讨论面板的「✏️ 我要插话」按钮用）。
+    // 默认 0 = 永不触发，改动前的行为一个字节都不变。
+    focusRequestSignal: Int = 0,
 ) {
     val toaster = LocalToaster.current
     val assistant = settings.getCurrentAssistant()
@@ -170,6 +175,14 @@ fun ChatInput(
 
     val keyboardController = LocalSoftwareKeyboardController.current
     val focusManager = LocalFocusManager.current
+    // v314：「我要插话」按钮把光标送进输入框。信号自增才触发，0 表示不请求。
+    val inputFocusRequester = remember { FocusRequester() }
+    LaunchedEffect(focusRequestSignal) {
+        if (focusRequestSignal > 0) {
+            inputFocusRequester.requestFocus()
+            keyboardController?.show()
+        }
+    }
     // v2.5.0 合并：模型列表选择弹层状态（官方）
     val modelListState = rememberModelListState(
         modelId = assistant.chatModelId ?: settings.chatModelId,
@@ -272,7 +285,7 @@ fun ChatInput(
                                     input = HazeInput.Sources(hazeState),
                                     style = GlassStyle.Material3(
                                         containerColor = hazeTintColor,
-                                        tint = hazeTintColor.copy(alpha = 0.72f),
+                                        tint = hazeTintColor.copy(alpha = 0.3f),
                                     ) {
                                         // Keep background text from competing with the input text.
                                         optics(GlassDefaults.optics.copy(
@@ -316,7 +329,9 @@ fun ChatInput(
                     TextInputRow(
                         state = state,
                         completionProviders = completionProviders,
-                        onSendMessage = { sendMessage() }
+                        onSendMessage = { sendMessage() },
+                        // v314：焦点请求器，供群面板「我要插话」按钮用
+                        focusRequester = inputFocusRequester,
                     )
 
                     Row(
@@ -557,6 +572,8 @@ private fun TextInputRow(
     state: ChatInputState,
     completionProviders: List<ChatCompletionProvider>,
     onSendMessage: () -> Unit,
+    // v314：输入框的焦点请求器（群面板「我要插话」按钮用）
+    focusRequester: FocusRequester,
 ) {
     val settings = LocalSettings.current
     val filesManager: FilesManager = koinInject()
@@ -684,6 +701,7 @@ private fun TextInputRow(
             state = state.textContent,
             modifier = Modifier
                 .fillMaxWidth()
+                .focusRequester(focusRequester)
                 .testTag("chat_input")
                 .contentReceiver(receiveContentListener)
                 .onFocusChanged {

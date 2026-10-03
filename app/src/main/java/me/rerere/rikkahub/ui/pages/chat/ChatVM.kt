@@ -57,6 +57,12 @@ import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.AutoCompressModelSource
 import me.rerere.rikkahub.data.model.Avatar
 import me.rerere.rikkahub.data.model.Conversation
+import me.rerere.rikkahub.data.model.GroupChatConfig
+import me.rerere.rikkahub.data.model.GroupChatPreset
+import me.rerere.rikkahub.data.model.GroupPresetOpKind
+import me.rerere.rikkahub.data.model.GroupPresetOpResult
+import me.rerere.rikkahub.data.model.validateNewPresetName
+import me.rerere.rikkahub.data.model.validatePresetRename
 import me.rerere.rikkahub.data.model.toMessageNode
 import me.rerere.rikkahub.data.model.MessageNode
 import me.rerere.rikkahub.data.model.NodeFavoriteTarget
@@ -65,6 +71,7 @@ import me.rerere.rikkahub.data.repository.FavoriteRepository
 import me.rerere.rikkahub.service.ChatError
 import me.rerere.rikkahub.service.CompressionModelSource
 import me.rerere.rikkahub.service.ChatService
+import me.rerere.rikkahub.service.GroupRunState
 import me.rerere.rikkahub.service.RoundTableGapDecision
 import me.rerere.rikkahub.service.RoundTableRunState
 import me.rerere.rikkahub.service.RoundTableSeatCommand
@@ -515,6 +522,238 @@ class ChatVM(
     internal fun resolveRoundTableGap(decision: RoundTableGapDecision): Boolean =
         chatService.resolveRoundTableGap(_conversationId, decision)
 
+    // ---- v313：AI 讨论群组 ----
+
+    /**
+     * 当前对话的群讨论状态。null = 这个对话没建群、或没在讨论。
+     *
+     * 刻意与圆桌的 roundTableRun 并列、互不引用：两者形态不同（流水线 vs 共享时间线），
+     * 硬共用一个状态会把两边的判定都搞糊。
+     */
+    internal val groupRun: StateFlow<GroupRunState?> =
+        chatService.getGroupRunFlow(_conversationId)
+
+    /**
+     * v316：群方案写操作的回执（存 / 覆盖 / 改名 / 删除）。
+     *
+     * 为什么不直接用函数返回值：写盘是协程里异步做的，返回值只能代表「校验过了、
+     * 任务提交了」，用它报「已存好」会在写失败时说谎（审查位 v316 抓的 P2）。
+     * 模式照 v302 的备份传输状态：VM 里跑、界面只显示，读完即清。
+     */
+    private val _groupPresetOp = MutableStateFlow<GroupPresetOpResult?>(null)
+    internal val groupPresetOp: StateFlow<GroupPresetOpResult?> = _groupPresetOp.asStateFlow()
+
+    /** v316：界面报完就清，避免同一个回执被反复弹出 */
+    fun consumeGroupPresetOp() {
+        _groupPresetOp.value = null
+    }
+
+    /** v315：点「开始/继续讨论」——带上用户在弹框里写的「这次想讨论什么」 */
+    fun startGroupDiscussion(topic: String? = null) {
+        analytics.logEvent("ai_group_discussion", null)
+        chatService.startGroupDiscussion(_conversationId, topic)
+    }
+
+    /** 停止这场讨论，已经说过的内容全部保留 */
+    fun stopGroupDiscussion() {
+        viewModelScope.launch { chatService.stopGroupDiscussion(_conversationId) }
+    }
+
+    /** 不想回答这次提问：把「未作答」如实回传给提问的成员，让讨论接着走 */
+    fun skipGroupQuestion() {
+        chatService.skipGroupQuestion(_conversationId)
+    }
+
+    /** 保存这个对话的群设置（成员、批次、是否允许提问…） */
+    fun saveGroupConfig(config: GroupChatConfig) {
+        viewModelScope.launch {
+            settingsStore.update { settings ->
+                settings.copy(
+                    groupChatConfigs = settings.groupChatConfigs + (_conversationId to config)
+                )
+            }
+            chatService.refreshGroupState(_conversationId)
+        }
+    }
+
+    /**
+     * v314：解散这个讨论群。
+     *
+     * 为什么必须有：建过群之后，用户在这个对话里发的每一条消息都会按「插话」处理
+     * （进讨论、不触发助手回复）。没有这个出口，用户就再也回不到普通聊天了 ——
+     * 那是功能，不是惩罚。删掉配置后这个对话立刻恢复成普通对话，已经聊过的内容一条不动。
+     */
+    /**
+     * v315：暂停 / 重新启用这个对话的讨论群。
+     *
+     * **配置一个字节都不动**（成员、批次、续写次数全留着），只是不再把用户输入当插话、
+     * 也不让引擎继续跑。用户口径：「解散丢配置也可以，但……」，所以两个动作都给：
+     * 想暂时不用就用这个，想彻底清就用 [deleteGroupConfig]。
+     */
+    fun setGroupEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            if (!enabled) chatService.stopGroupDiscussion(_conversationId)
+            settingsStore.update { settings ->
+                val current = settings.groupChatConfigs[_conversationId] ?: return@update settings
+                settings.copy(
+                    groupChatConfigs = settings.groupChatConfigs +
+                        (_conversationId to current.copy(enabled = enabled))
+                )
+            }
+            chatService.clearGroupRunState(_conversationId)
+        }
+    }
+
+    /**
+     * v315：彻底删除这个对话的群设置（成员与次数一起没掉）。
+     *
+     * 与「暂停」的区别必须在界面上说清楚：这个动作**不可撤销**，
+     * 下次要用得重新建群（但可以用「一键套用成员组合」快速重建）。
+     */
+    fun deleteGroupConfig() {
+        viewModelScope.launch {
+            // 顺序要紧：先停下（如果正在跑）→ 删配置 → 再把面板状态清掉。
+            // 反过来的话会留下一个「按钮还在、点了没反应」的空面板（审查位 v314 抓的 P1）。
+            chatService.stopGroupDiscussion(_conversationId)
+            settingsStore.update { settings ->
+                settings.copy(groupChatConfigs = settings.groupChatConfigs - _conversationId)
+            }
+            chatService.clearGroupRunState(_conversationId)
+        }
+    }
+
+    /** 这个对话的群设置；没建过群返回 null */
+    fun groupConfig(): GroupChatConfig? =
+        settingsStore.settingsFlow.value.groupChatConfigs[_conversationId]
+
+    /**
+     * v316：把界面上当前这套存成一个**新方案**（用户口径：「提前设置好几个方案，
+     * 然后直接选择方案几来一键配置」）。
+     *
+     * 审查位 v316 抓的 P2：旧写法返回 Boolean，但 true 只代表「名字合法、任务已提交」，
+     * DataStore 真写失败时界面照样报「方案已存好」= 说谎；而"存满 8 条挤掉最旧一条"
+     * 是静默丢用户数据。改成两段：
+     * - **同步校验**（空名 / 存满 / 重名）：当场给原因，这是用户能改的错误；
+     * - **异步回执**（[groupPresetOp]）：写成功才说「已存好」，写失败原样摊出来。
+     * 校验交给顶层纯函数，能真单测（`GroupChatTest`）。
+     */
+    fun requestSaveGroupPreset(name: String, config: GroupChatConfig) {
+        val presets = settingsStore.settingsFlow.value.groupChatPresets
+        val (cleanName, reason) = validateNewPresetName(name, presets)
+        if (cleanName == null) {
+            _groupPresetOp.value = GroupPresetOpResult.Rejected(GroupPresetOpKind.SAVE, reason)
+            return
+        }
+        val preset = GroupChatPreset(
+            id = Uuid.random(),
+            name = cleanName,
+            memberModelIds = config.memberModelIds,
+            turnsPerRun = config.turnsPerRun,
+            resumeMax = config.resumeMax,
+        )
+        persistPresetOp(GroupPresetOpKind.SAVE, cleanName) { settings ->
+            settings.copy(groupChatPresets = settings.groupChatPresets + preset)
+        }
+    }
+
+    /** v316：用当前这套配置**覆盖**指定方案（成员与次数一起换，名字留着） */
+    fun requestOverwriteGroupPreset(presetId: Uuid, config: GroupChatConfig) {
+        val target = settingsStore.settingsFlow.value.groupChatPresets.firstOrNull { it.id == presetId }
+        if (target == null) {
+            _groupPresetOp.value = GroupPresetOpResult.Rejected(
+                GroupPresetOpKind.OVERWRITE, "那个方案已经不在了（可能被删了），请重新存一个",
+            )
+            return
+        }
+        persistPresetOp(GroupPresetOpKind.OVERWRITE, target.name) { settings ->
+            settings.copy(
+                groupChatPresets = settings.groupChatPresets.map { preset ->
+                    if (preset.id != presetId) preset else preset.copy(
+                        memberModelIds = config.memberModelIds,
+                        turnsPerRun = config.turnsPerRun,
+                        resumeMax = config.resumeMax,
+                    )
+                }
+            )
+        }
+    }
+
+    /** v316：改方案名字（重名 / 空名当场拒绝并说原因） */
+    fun requestRenameGroupPreset(presetId: Uuid, name: String) {
+        val presets = settingsStore.settingsFlow.value.groupChatPresets
+        val (cleanName, reason) = validatePresetRename(name, presets, presetId)
+        if (cleanName == null) {
+            _groupPresetOp.value = GroupPresetOpResult.Rejected(GroupPresetOpKind.RENAME, reason)
+            return
+        }
+        persistPresetOp(GroupPresetOpKind.RENAME, cleanName) { settings ->
+            settings.copy(
+                groupChatPresets = settings.groupChatPresets.map { preset ->
+                    if (preset.id == presetId) preset.copy(name = cleanName) else preset
+                }
+            )
+        }
+    }
+
+    /** v316：删除方案。只动方案表，不影响任何对话的现有群配置 */
+    fun requestDeleteGroupPreset(presetId: Uuid) {
+        val target = settingsStore.settingsFlow.value.groupChatPresets.firstOrNull { it.id == presetId }
+        if (target == null) {
+            _groupPresetOp.value = GroupPresetOpResult.Rejected(
+                GroupPresetOpKind.DELETE, "那个方案已经不在了",
+            )
+            return
+        }
+        persistPresetOp(GroupPresetOpKind.DELETE, target.name) { settings ->
+            // 按 id 逐条比对剔除（不能用 `- presetId`：那是删「元素」不是删「id」，
+            // 类型也推不出来，编译器会直接拒绝）
+            settings.copy(
+                groupChatPresets = settings.groupChatPresets.filterNot { it.id == presetId }
+            )
+        }
+    }
+
+    /**
+     * v316：方案写操作的统一落库 + 回执。
+     *
+     * ⚠️ 取消异常必须原样上抛（手册 §7：runCatching 会吞掉 CancellationException，
+     * 用户点停止就停不下来），所以这里用显式 try / catch，且 CancellationException
+     * 排在 Exception **之前** —— 顺序反了那个分支永远走不到。
+     */
+    private fun persistPresetOp(
+        kind: GroupPresetOpKind,
+        name: String,
+        transform: (Settings) -> Settings,
+    ) {
+        viewModelScope.launch {
+            try {
+                val before = settingsStore.settingsFlow.value.groupChatPresets
+                settingsStore.update(transform)
+                val after = settingsStore.settingsFlow.value.groupChatPresets
+                // 必须回读比对再报成功：SettingsStore.update(settings) 在设置还是占位的
+                // dummy（init = true）时会**只写一行日志就静默 return**，
+                // 不抛异常。照旧报「已存好」就是说谎 —— 与审查位 v316 抓的 P2 同一类问题。
+                // ⚠️ 残留边界（本轮不扩大改动）：若 persistSettings 自身抛异常，
+                // 内存态已经改过而磁盘没改，官方这条链路本来就没有回读磁盘的能力。
+                if (before === after) {
+                    Log.w(TAG, "群方案写入未生效（设置未初始化或被丢弃）: $kind $name")
+                    _groupPresetOp.value = GroupPresetOpResult.Rejected(
+                        kind, "设置还没准备好，这条改动没落下去，稍后再试一次",
+                    )
+                } else {
+                    _groupPresetOp.value = GroupPresetOpResult.Done(kind, name)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "群方案写入失败: ${e.message}")
+                _groupPresetOp.value = GroupPresetOpResult.Rejected(
+                    kind, "没存上：${e.message ?: e.javaClass.simpleName}",
+                )
+            }
+        }
+    }
+
     /**
      * 最近一组圆桌方案所在的节点；没有则返回 null。
      * 由 ChatService 记录，优先精确匹配圆桌产物，避免误抓普通换模型重新生成的多页消息。
@@ -631,6 +870,11 @@ class ChatVM(
         answer: String,
     ) {
         analytics.logEvent("ai_tool_answer", null)
+        // v313：群里成员提问时，必须由**提问的那位成员**接着说。
+        // 主对话那条路固定用「助手当前模型」续跑，照抄会变成 A 提问、B 回答。
+        // answerGroupQuestion 只在「群引擎确实停在等回答」时返回 true，
+        // 普通对话与圆桌永远走下面那句 —— 主对话行为一个字节都没变。
+        if (chatService.answerGroupQuestion(_conversationId, toolCallId, answer)) return
         chatService.handleToolApproval(_conversationId, toolCallId, approved = true, answer = answer)
     }
 
@@ -656,6 +900,10 @@ class ChatVM(
     fun deleteConversation(conversation: Conversation): Job =
         viewModelScope.launch {
             conversationRepo.deleteConversation(conversation)
+            // v318：对话没了就要停掉它的讨论群与状态转发订阅。
+            // v317 之前这里只是两张表里留个无用条目；v318 加了订阅之后不取消就是
+            // 一个永远挂着的协程（审查位 v318 抓的 P2，因本轮改动升级为必修）。
+            chatService.releaseGroupStateOnDelete(conversation.id)
         }
 
     fun updatePinnedStatus(conversation: Conversation) {

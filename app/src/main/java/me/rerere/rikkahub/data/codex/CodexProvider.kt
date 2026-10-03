@@ -144,6 +144,11 @@ class CodexProvider(
             enabled = providerSetting.enabled,
             name = providerSetting.name,
             models = providerSetting.models,
+            // v312 合并上游 2.5.6：官方新增「高级设置 → 自定义请求头」，
+            // provider 级的头必须透传下去，否则该入口对账号通道是死控件。
+            // ResponseAPI 用 mergeCustomHeaders 合并，provider 级优先级最低，
+            // 不会覆盖 params 里的账号鉴权头；用户不填时行为与改前一字不差。
+            customHeaders = providerSetting.customHeaders,
             baseUrl = CODEX_API_BASE,
             apiKey = account.accessToken,
             useResponseApi = true,

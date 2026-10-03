@@ -14,6 +14,7 @@ import me.rerere.rikkahub.data.codex.CodexCredentialStore
 import me.rerere.rikkahub.data.codex.CodexOAuthManager
 import me.rerere.rikkahub.data.codex.CodexProvider
 import me.rerere.rikkahub.data.gemini.GeminiAccountRepository
+import me.rerere.rikkahub.data.gemini.GeminiSearchClient
 import me.rerere.rikkahub.data.gemini.GeminiCredentialStore
 import me.rerere.rikkahub.data.gemini.GeminiOAuthManager
 import me.rerere.rikkahub.data.gemini.GeminiProvider
@@ -259,6 +260,15 @@ val dataSourceModule = module {
         GeminiAccountRepository(
             store = GeminiCredentialStore(context = get(), json = get()),
             client = get(named("gemini")),
+            json = get(),
+        )
+    }
+
+    // v310：谷歌账号通道的「独立搜索」客户端 —— 搜索拆成单独请求，与函数工具不再互斥
+    single {
+        GeminiSearchClient(
+            repository = get(),
+            baseClient = get(named("gemini")),
             json = get(),
         )
     }

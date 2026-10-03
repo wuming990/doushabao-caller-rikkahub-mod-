@@ -38,10 +38,11 @@ import me.rerere.ai.ui.MessageChunk
 import me.rerere.ai.ui.StreamChunk
 import me.rerere.ai.ui.StreamChunkHandler
 import me.rerere.ai.ui.UIMessage
+import me.rerere.ai.ui.ServerToolStatus
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.ai.util.HttpException
 import me.rerere.ai.util.stringSafe
-import me.rerere.ai.util.toHeaders
+import me.rerere.ai.util.mergeCustomHeaders
 import me.rerere.common.android.Logging
 import me.rerere.common.http.await
 import okhttp3.MediaType.Companion.toMediaType
@@ -133,12 +134,12 @@ class GeminiProvider(
                         )
                     ),
                     messages,
-                )
+                ).also { logAntigravityToolShape(it, params.model.modelId) }
             )
         }
         val request = Request.Builder()
             .url("${GeminiAccountRepository.DAILY_CODE_ASSIST_ENDPOINT}/v1internal:streamGenerateContent?alt=sse")
-            .headers(params.customHeaders.toHeaders())
+            .headers(providerSetting.mergeCustomHeaders(params.customHeaders))  // v312 合并上游 2.5.6：带上「高级设置」里的自定义请求头
             .antigravityHeaders(account.accessToken)
             .addHeader("Content-Type", "application/json")
             .addHeader("Accept", "text/event-stream")
@@ -305,6 +306,31 @@ internal class GeminiStreamChunkAdapter {
                             inputDelta = part.input,
                             metadata = part.metadata,
                         )
+                    }
+
+                    is UIMessagePart.ServerTool -> {
+                        // v308：开启 includeServerSideToolInvocations 后，谷歌把内置工具
+                        // （自家搜索等）的 call/response 直接放进 Content 里回传，GoogleProvider
+                        // 会解析成 ServerTool。本适配器原先没有这一分支，它们会掉进 else 被丢弃 ——
+                        // 于是「搜索能用但看不到搜索过程」，且多轮时这些片段无法回传给模型。
+                        // 形状照 ai 模块的 GoogleStreamDecoder（同一套语义、现成实现）。
+                        openKind = null
+                        if (part.status == ServerToolStatus.IN_PROGRESS) {
+                            out += StreamChunk.ServerToolStart(
+                                id = part.toolCallId,
+                                toolName = part.toolName,
+                                input = part.input,
+                                metadata = part.metadata,
+                            )
+                        } else {
+                            out += StreamChunk.ServerToolEnd(
+                                id = part.toolCallId,
+                                input = part.input,
+                                output = part.output,
+                                status = part.status,
+                                metadata = part.metadata,
+                            )
+                        }
                     }
 
                     else -> Log.w(TAG, "translate: unsupported delta part $part")
@@ -691,7 +717,198 @@ private const val REQUEST_ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
 internal fun withAntigravityRequestShape(
     request: JsonObject,
     messages: List<UIMessage>,
-): JsonObject = withSystemInstructionRole(withStableSessionId(request, messages))
+): JsonObject = withSystemInstructionRole(
+    withStableSessionId(
+        resolveAntigravityToolShape(
+            stripBuiltInSearchTool(request),
+            messages,
+        ),
+        messages,
+    )
+)
+
+/**
+ * v310 起：本函数之前会先跑 [stripBuiltInSearchTool] —— 谷歌搜索已改走独立请求
+ * （GeminiSearchClient），主请求里不会再出现 googleSearch；下面「保内置搜索 / 摘客户端工具」
+ * 两条分支现在只对 urlContext / codeExecution 这类**残留**内置键生效，属纵深防御。
+ *
+ * v309：这条通道上「内置工具」与「客户端函数工具」**不能同请求共存**，二选一并一次算完
+ * tools 与 toolConfig（刻意不做成「一个函数删、另一个函数再加」——那样后者在真实链路上
+ * 永远不可达，是「看着在保护、其实不执行」的假象，审查位抓过）。
+ *
+ * 依据（三家独立实测 + 用户真机两轮，不是推测）：
+ * - 用户真机：v308 补上 camelCase flag + `functionCallingConfig.mode=VALIDATED` 之后，
+ *   400 原样不动（换 gemini-3.1-pro / gemini-3.8-flash 都一样）。
+ * - Antigravity-Manager 源码注释：「v1internal (cloudcode-pa) does NOT support mixing
+ *   googleSearch with functionDeclarations」，最终做法是有 functionDeclarations 时不注入 googleSearch。
+ * - opencode-antigravity-auth 规范：「googleSearch 与 urlContext **不能**与 functionDeclarations 同请求组合」。
+ * - OmniRoute 试过「加 flag + 诱饵工具」，v3.8.49 又整体回滚。
+ *
+ * 二选一的取舍规则（两条分支都有明确理由）：
+ * 1. **默认保内置搜索、摘客户端工具** —— 用户诉求就是「我要用谷歌自带搜索」。
+ *    摘完的形状与官方 gemini-cli 的独立 web-search 调用一致（只带内置工具、无 toolConfig），
+ *    那是已知可工作的形态。
+ * 2. **历史里已出现过客户端工具调用时反过来：保工具、丢内置搜索。**
+ *    因为 `GoogleProvider.buildContents` 会把历史中的 functionCall / functionResponse
+ *    照原样回传（本通道无过滤），「有调用记录、没声明」是不一致形状，后果没人验证过；
+ *    把一段正在用的对话弄坏，比这一轮搜不到更糟。
+ *
+ * 🔴 实现细节两条：
+ * - 必须**逐对象删 functionDeclarations 键**，不能只按条目过滤 —— 自定义请求体可以把两者
+ *   塞进同一个 tool 对象，按条目过滤会把整个对象保留（工具没摘掉、toolConfig 却被删了），
+ *   修复静默失效。
+ * - 内置工具按**已知键白名单**识别（[ANTIGRAVITY_BUILT_IN_TOOL_KEYS]），不用「任意非
+ *   functionDeclarations 的键」—— 后者会让 customBody 里的杂项键误触发摘除客户端工具。
+ *
+ * 未混发的请求（没有内置工具，或没有函数工具）一个字节不动：上游只在真混发时才写
+ * toolConfig，所以这里也不需要额外表态。曾试过「只要带 functionDeclarations 就补
+ * flag + VALIDATED」，被审查位反证推翻：若服务端真对所有 agent 流量要求这个 flag，
+ * 今天不带它的普通工具调用早就全部 400 —— 实际没有；而 OmniRoute 那条旁证又被它自己的
+ * tool-cloak（注入 21 个合成 functionDeclarations）污染。
+ *
+ * 刻意**不做** camelCase + snake_case 双写：ProtoJSON 规范原文
+ * 「A conforming ProtoJSON serializer MUST NOT emit duplicate keys」
+ * 「parse failure on duplicate alternate spellings」，Java JsonFormat 更直接抛
+ * 「Field X has already been set」—— 双写有把 400 换成另一种 400 的实际风险。
+ * 报错文案里的 snake_case 只是服务端按 .proto 字段名渲染消息路径，不代表它只认下划线
+ * （vercel/ai #14655 的日志就是路径 snake_case、被拒的键 camelCase）。
+ */
+internal fun resolveAntigravityToolShape(
+    request: JsonObject,
+    messages: List<UIMessage>,
+): JsonObject {
+    val tools = request["tools"] as? JsonArray ?: return request
+    val functionCount = tools.flatMap { tool ->
+        ((tool as? JsonObject)?.get("functionDeclarations") as? JsonArray).orEmpty()
+    }.size
+    val builtInKeys = tools.flatMap { tool ->
+        ((tool as? JsonObject)?.keys ?: emptySet()).filter { it in ANTIGRAVITY_BUILT_IN_TOOL_KEYS }
+    }.distinct()
+    if (functionCount == 0 || builtInKeys.isEmpty()) return request
+
+    val historyHasToolCalls = messages.any { message ->
+        message.parts.any { it is UIMessagePart.Tool }
+    }
+    val keepFunctions = historyHasToolCalls
+    if (keepFunctions) {
+        Logging.log(
+            TAG,
+            "内置工具与客户端工具在这条通道上互斥，且本对话历史里已有工具调用记录：" +
+                "本轮保留 $functionCount 个客户端工具、不启用内置工具（新建对话即可用）"
+        )
+    } else {
+        Logging.log(
+            TAG,
+            "内置工具与客户端工具在这条通道上互斥：本轮已摘掉 $functionCount 个客户端工具，" +
+                "保留内置工具"
+        )
+    }
+    val kept = tools.mapNotNull { tool ->
+        val obj = tool as? JsonObject ?: return@mapNotNull null
+        val rest = if (keepFunctions) {
+            obj.filterKeys { it !in ANTIGRAVITY_BUILT_IN_TOOL_KEYS }
+        } else {
+            obj.filterKeys { it != "functionDeclarations" }
+        }
+        if (rest.isEmpty()) null else JsonObject(rest)
+    }
+    // 两种形状都不带 toolConfig：混用表态已被证明无效（v308 真机），而单用一类工具本来就不需要它。
+    return JsonObject(request - "toolConfig" + ("tools" to JsonArray(kept)))
+}
+
+/**
+ * v310：把「内置搜索」从主请求里摘掉 —— 它已改由独立搜索请求承担（GeminiSearchClient）。
+ *
+ * 为什么必须摘：这条通道上 googleSearch 与函数工具同请求必 400（三家实测 + 两轮真机），
+ * v308（补开关）与 v309（二选一）都只能缓解；官方 gemini-cli 与反代项目的共同做法是把
+ * 搜索拆成独立请求，所以主请求里从此不该再出现 googleSearch。
+ *
+ * 边界（刻意保守）：
+ * - 只在本轮真的会「混发」（有函数工具 + 有 googleSearch）时才摘；纯搜索请求原样保留；
+ * - 只动 googleSearch 这一个键；urlContext / codeExecution 与 customBody 的其它内容一律不碰；
+ * - 没有 googleSearch 的请求「一个字节不动」；
+ * - 删完后若不再有任何内置工具残留，顺手摘掉配套的 `includeServerSideToolInvocations`
+ *   开关（避免留下「只有函数工具 + 服务端开关」这种没人验证过的形状）；toolConfig 的
+ *   其它内容（例如用户自定义的 functionCallingConfig）原样保留。
+ */
+internal fun stripBuiltInSearchTool(request: JsonObject): JsonObject {
+    val tools = request["tools"] as? JsonArray ?: return request
+    // v310：只有「真会混发」才摘 —— googleSearch 与函数工具同请求必 400；
+    // 纯搜索请求（没有任何函数工具）原样保留，让圆桌/子代理等没有替代搜索工具的路径
+    // 继续能靠内置搜索工作。
+    val functionCount = tools.flatMap { tool ->
+        ((tool as? JsonObject)?.get("functionDeclarations") as? JsonArray).orEmpty()
+    }.size
+    if (functionCount == 0) return request
+    var removed = 0
+    val kept = tools.mapNotNull { tool ->
+        val obj = tool as? JsonObject ?: return@mapNotNull tool
+        if (!obj.containsKey("googleSearch")) return@mapNotNull tool
+        removed += 1
+        val rest = obj.filterKeys { it != "googleSearch" }
+        if (rest.isEmpty()) null else JsonObject(rest)
+    }
+    if (removed == 0) return request
+    val result = request.toMutableMap()
+    if (kept.isEmpty()) result.remove("tools") else result["tools"] = JsonArray(kept)
+    val hasRemainingBuiltIn = kept.any { tool ->
+        (tool as? JsonObject)?.keys?.any { it in ANTIGRAVITY_BUILT_IN_TOOL_KEYS } == true
+    }
+    if (!hasRemainingBuiltIn) {
+        val config = result["toolConfig"] as? JsonObject
+        if (config != null) {
+            val pruned = JsonObject(config - "includeServerSideToolInvocations")
+            if (pruned.isEmpty()) result.remove("toolConfig") else result["toolConfig"] = pruned
+        }
+    }
+    Logging.log(
+        TAG,
+        "v310：已把谷歌内置搜索移出主请求（改走独立搜索），本轮 googleSearch 出现 $removed 次"
+    )
+    return JsonObject(result)
+}
+
+/** Cloud Code Assist 认识的内置工具键（v1internal 原生形态，见 CLIProxyAPI 的 antigravity 翻译层）。 */
+private val ANTIGRAVITY_BUILT_IN_TOOL_KEYS = setOf("googleSearch", "urlContext", "codeExecution")
+
+/**
+ * v309：把「这次到底发了什么工具配置」记进 App 内日志页（设置 → 日志）。
+ *
+ * 为什么必须记：Cloud Code Assist 的报错只给一句 `status=INVALID_ARGUMENT`、**没有字段级
+ * 说明**，而这条通道用的是「干净 OkHttpClient」，没挂 RequestLoggingInterceptor，
+ * 所以打开请求日志也抓不到 —— 前两轮只能靠猜。这里只记**结构与工具名**，
+ * 不记对话内容、不记密钥、不记 token，用户复制一行就能让下一次定位变成确定的事。
+ */
+internal fun logAntigravityToolShape(request: JsonObject, modelId: String) {
+    antigravityToolShapeLog(request, modelId)?.let { Logging.log(TAG, it) }
+}
+
+/**
+ * 纯函数版：把上面那段结构摘要算出来（不写日志），单测可以直接断言它
+ * 「只含结构、不含对话内容」。返回 null 表示这次请求没有任何工具、不值得记。
+ */
+internal fun antigravityToolShapeLog(request: JsonObject, modelId: String): String? {
+    val tools = request["tools"] as? JsonArray
+    val hasFunctionTools = tools?.any { (it as? JsonObject)?.containsKey("functionDeclarations") == true } == true
+    val builtIns = tools?.flatMap { tool ->
+        ((tool as? JsonObject)?.keys ?: emptySet()).filter { it != "functionDeclarations" }
+    }?.distinct().orEmpty()
+    if (!hasFunctionTools && builtIns.isEmpty()) return null
+    val functionNames = tools?.flatMap { tool ->
+        ((tool as? JsonObject)?.get("functionDeclarations") as? JsonArray)
+            ?.mapNotNull { (it as? JsonObject)?.get("name")?.jsonPrimitive?.contentOrNull }
+            .orEmpty()
+    }.orEmpty()
+    val toolConfig = request["toolConfig"] as? JsonObject
+    val mode = (toolConfig?.get("functionCallingConfig") as? JsonObject)
+        ?.get("mode")?.jsonPrimitive?.contentOrNull ?: "-"
+    // 可空链的结果要先落成非空值再 ifEmpty —— 直接在 String? 上调 ifEmpty 编译不过。
+    val configKeys = toolConfig?.keys?.sorted()?.joinToString("/").orEmpty().ifEmpty { "无" }
+    val toolNames = functionNames.take(12).joinToString(",").ifEmpty { "-" }
+    return "Antigravity 请求形状 model=$modelId " +
+        "functionDeclarations=$hasFunctionTools 内置工具=${builtIns.ifEmpty { listOf("无") }} " +
+        "toolConfig=$configKeys mode=$mode 工具名=$toolNames"
+}
 
 internal fun withStableSessionId(
     request: JsonObject,

@@ -17,6 +17,7 @@ import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import me.rerere.rikkahub.data.files.FileFolders
+import me.rerere.rikkahub.data.files.SkillManager
 import me.rerere.rikkahub.data.event.AppEventBus
 import java.io.File
 import kotlinx.coroutines.SupervisorJob
@@ -103,6 +104,9 @@ class RikkaHubApp : Application() {
         // sync upload files to DB
         syncManagedFiles()
 
+        // Extract builtin skills from assets after install/update
+        extractBuiltinSkills()
+
         // Start WebServer if enabled in settings
         startWebServerIfEnabled()
 
@@ -115,10 +119,8 @@ class RikkaHubApp : Application() {
     private fun incrementLaunchCount() {
         get<AppScope>().launch {
             runCatching {
-                val store = get<SettingsStore>()
-                val current = store.settingsFlowRaw.first()
-                store.update(current.copy(launchCount = current.launchCount + 1))
-                Log.i(TAG, "incrementLaunchCount: ${store.settingsFlowRaw.first().launchCount}")
+                val count = get<SettingsStore>().incrementLaunchCount()
+                Log.i(TAG, "incrementLaunchCount: $count")
             }.onFailure {
                 Log.e(TAG, "incrementLaunchCount failed", it)
             }
@@ -162,6 +164,12 @@ class RikkaHubApp : Application() {
                     dir.deleteRecursively()
                 }
             }
+        }
+    }
+
+    private fun extractBuiltinSkills() {
+        get<AppScope>().launch(Dispatchers.IO) {
+            get<SkillManager>().ensureBuiltinSkillsExtracted()
         }
     }
 

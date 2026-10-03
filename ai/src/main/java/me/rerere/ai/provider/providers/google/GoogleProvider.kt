@@ -65,7 +65,7 @@ import me.rerere.ai.util.json
 import me.rerere.ai.util.mergeCustomBody
 import me.rerere.ai.util.sanitizeForGeminiSchema
 import me.rerere.ai.util.stringSafe
-import me.rerere.ai.util.toHeaders
+import me.rerere.ai.util.mergeCustomHeaders
 import me.rerere.common.http.await
 import me.rerere.common.http.jsonPrimitiveOrNull
 import okhttp3.HttpUrl
@@ -108,6 +108,10 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
     private val serviceAccountTokenProvider by lazy {
         ServiceAccountTokenProvider(client)
     }
+    private val interactionsAPI = InteractionsAPI(client = client, keyRoulette = keyRoulette)
+
+    // Interactions API 目前只有 Gemini Developer API 提供，Vertex AI 仍走 generateContent
+    private fun ProviderSetting.Google.usesInteractionsApi() = useInteractionsApi && !vertexAI
 
     private fun buildUrl(providerSetting: ProviderSetting.Google, path: String): HttpUrl {
         return if (!providerSetting.vertexAI) {
@@ -168,6 +172,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
                 providerSetting = providerSetting,
                 request = Request.Builder()
                     .url(url)
+                    .headers(providerSetting.mergeCustomHeaders())
                     .get()
                     .build()
             )
@@ -205,6 +210,10 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
         messages: List<UIMessage>,
         params: TextGenerationParams,
     ): TextGenerationResult = withContext(Dispatchers.IO) {
+        if (providerSetting.usesInteractionsApi()) {
+            return@withContext interactionsAPI.generateText(providerSetting, messages, params)
+        }
+
         val requestBody = buildCompletionRequestBody(messages, params)
 
         val url = buildUrl(
@@ -225,7 +234,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
                 providerSetting = providerSetting,
                 request = Request.Builder()
                     .url(url)
-                    .headers(params.customHeaders.toHeaders())
+                    .headers(providerSetting.mergeCustomHeaders(params.customHeaders))
                     .post(
                         json.encodeToString(requestBody).toRequestBody("application/json".toMediaType())
                     )
@@ -258,6 +267,16 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
         providerSetting: ProviderSetting.Google,
         messages: List<UIMessage>,
         params: TextGenerationParams,
+    ): Flow<StreamChunk> = if (providerSetting.usesInteractionsApi()) {
+        interactionsAPI.streamText(providerSetting, messages, params)
+    } else {
+        streamGenerateContent(providerSetting, messages, params)
+    }
+
+    private fun streamGenerateContent(
+        providerSetting: ProviderSetting.Google,
+        messages: List<UIMessage>,
+        params: TextGenerationParams,
     ): Flow<StreamChunk> = callbackFlow {
         val requestBody = buildCompletionRequestBody(messages, params)
 
@@ -274,7 +293,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
         // 换 key 重试时在 onFailure 里用非挂起的 applyApiKey 直接贴新 key。
         val baseRequest = Request.Builder()
             .url(url)
-            .headers(params.customHeaders.toHeaders())
+            .headers(providerSetting.mergeCustomHeaders(params.customHeaders))
             .post(
                 json.encodeToString(requestBody).toRequestBody("application/json".toMediaType())
             )
@@ -489,12 +508,15 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
 
                     val isGeminiPro =
                         params.model.modelId.contains(Regex("2\\.5.*pro", RegexOption.IGNORE_CASE))
+                    val useThinkingLevel =
+                        ModelRegistry.GEMINI_3_SERIES.match(modelId = params.model.modelId) ||
+                            ModelRegistry.GEMINI_4.match(modelId = params.model.modelId)
 
                     when (params.reasoningLevel) {
                         ReasoningLevel.AUTO -> {} // 自动模式，不设置参数
 
                         ReasoningLevel.OFF -> {
-                            if (ModelRegistry.GEMINI_3_SERIES.match(modelId = params.model.modelId)) {
+                            if (useThinkingLevel) {
                                 // 不发送 thinkingLevel：部分模型/中转站不支持 "minimal"，
                                 // 硬编码会导致 400（"Thinking level MINIMAL is not supported"）。
                                 // 交给服务端默认级别，保证模型可用。
@@ -505,7 +527,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
                         }
 
                         else -> {
-                            if (ModelRegistry.GEMINI_3_SERIES.match(modelId = params.model.modelId)) {
+                            if (useThinkingLevel) {
                                 when (params.reasoningLevel) {
                                     ReasoningLevel.LOW -> put("thinkingLevel", "low")
                                     ReasoningLevel.MEDIUM -> put("thinkingLevel", "medium")
@@ -543,6 +565,9 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
                                     put("description", JsonPrimitive(tool.description))
                                     // v274：黑名单剔除改为白名单清洗（照搬 ExTV rikkahub-agent
                                     // 的 sanitizeForGeminiSchema）：enum/format 同样排除（行为对等），
+                                    // v311 合并上游 2.5.5：官方这次往黑名单补了 propertyNames，
+                                    // 我们的白名单 GEMINI_SCHEMA_ALLOWED_KEYS 本来就不含它，行为已覆盖，
+                                    // 故不采纳官方那行（补丁曾把它错位贴进 parseStreamCandidates，已删）。
                                     // 额外解析 $ref、折叠 oneOf/allOf、归一化 type 数组 ——
                                     // 这些形状原先原样发给 Google 会直接 400。
                                     put(

@@ -45,13 +45,34 @@ internal data class GrokIdentity(
  *
  * xAI 会随 CLI 升级抬高最低版本要求，届时代理会回 426 并在正文里点明需要哪个版本。
  * 那时只改这里的 [CLIENT_VERSION] 与 [USER_AGENT] 即可，不要去动请求逻辑。
+ *
+ * **v313 真机应验**：用户发消息得到
+ * `Your Grok CLI version (0.2.93) is outdated. Please update to version 1.0.13 or later`，
+ * 且被主对话的自动续跑当成临时故障一路重试（截图里是「正在重试 4/99」）——
+ * 这类错误换多少个账号、重试多少次都没用，只能抬版本号。
+ * 官方 Grok Build 发布记录（x.ai/build/changelog）当时最新为 **1.0.46（2026-09-30）**，
+ * 而 0.2.x 一线最后停在 0.2.120，1.0.0 之后就是新的主版本号序列。
+ * 现在由 `GrokCliEndpointTest` 钉住「自报版本不得低于服务端最低要求」，
+ * 并把 [USER_AGENT] 与 [CLIENT_VERSION] 的同步关系也钉住，防止只改一处。
  */
 internal object GrokCliClient {
     const val BASE_URL = "https://cli-chat-proxy.grok.com/v1"
-    const val USER_AGENT = "grok-pager/0.2.93 grok-shell/0.2.93 (linux; x86_64)"
+
+    /**
+     * v313：自报版本号（`x-grok-client-version`）。
+     *
+     * **必须先于 [USER_AGENT] 声明** —— Kotlin 顶层 `const val` 不能前向引用，
+     * 反过来写会直接编译失败（手册 §7.3 记过这个坑）。
+     *
+     * 官方 Grok Build 发布记录：1.0.46（2026-09-30）。服务端当时要求的最低版本是 1.0.13。
+     * 再遇到 426「outdated」时，报错正文会点明新的最低版本，改这一个常量即可。
+     */
+    const val CLIENT_VERSION = "1.0.46"
+
+    /** 由 [CLIENT_VERSION] 推导，保证两处永远一致 —— 只改版本号不会漏掉 UA。 */
+    const val USER_AGENT = "grok-pager/$CLIENT_VERSION grok-shell/$CLIENT_VERSION (linux; x86_64)"
     const val TOKEN_AUTH = "xai-grok-cli"
     const val CLIENT_IDENTIFIER = "grok-pager"
-    const val CLIENT_VERSION = "0.2.93"
     const val AUTHENTICATE_RESPONSE = "authenticate-response"
 }
 

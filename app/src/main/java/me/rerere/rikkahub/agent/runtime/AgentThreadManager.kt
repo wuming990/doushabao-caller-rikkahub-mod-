@@ -28,6 +28,7 @@ import me.rerere.rikkahub.agent.model.AgentRole
 import me.rerere.rikkahub.agent.model.AgentSpawnRequest
 import me.rerere.rikkahub.agent.model.AgentStageSignal
 import me.rerere.rikkahub.agent.model.AgentThread
+import me.rerere.rikkahub.data.datastore.modelLabel
 import me.rerere.rikkahub.agent.model.AgentThreadStatus
 import me.rerere.rikkahub.agent.model.AgentVerdict
 import me.rerere.rikkahub.agent.model.inferVerdictFromConclusion
@@ -87,7 +88,29 @@ internal fun nextResumeModelRound(chainSize: Int, currentRound: Int): Int? {
  * 用 internal 会触发「public function exposes its internal parameter type」（v304 编译期实测）。
  * 项目里的 AgentThreadStatus / AgentRole / AgentErrorKind 也都是公开的，跟惯例一致。
  */
-data class ResumeModelCandidate(val id: String, val displayName: String)
+data class ResumeModelCandidate(
+    val id: String,
+    val displayName: String,
+    /**
+     * v311：所属供应商的名字。
+     *
+     * 用户真机反馈原话：「子代理同名时，即使我切换了其他同名子代理（不同上游供应商）
+     * 还是会用旧的子代理继续」。其中有一层是确定性的**展示**缺陷：两家都叫 glm-4.6 时，
+     * 换人前印「glm-4.6」、换人后还是印「glm-4.6」，一个字都不差，用户没有任何办法
+     * 判断到底换没换成。这里带上供应商标识，事件里就能看出真的换了一家。
+     *
+     * 带默认值 = 老调用点与注入假候选的单测一个都不用改。
+     */
+    val providerName: String = "",
+) {
+    /**
+     * 给人看的候选名。
+     *
+     * 刻意复用 [modelLabel] 而不是在这里自己拼一次：同一件事在两处各写一遍，
+     * 迟早会漂成两种说法（本项目真出过这种「一个界面改了另一个没改」的事故）。
+     */
+    val label: String get() = modelLabel(displayName, providerName)
+}
 
 /**
  * v236：点了停止之后，最多等这么久让线程自己落终态；超时就兜底强制写 STOPPED。
@@ -975,7 +998,7 @@ class AgentThreadManager(
             threadId,
             eventType,
             "自动续跑次数已用完（$used/$max），自动换用候选模型" +
-                "「${chain[nextRound].displayName}」（第 ${nextRound + 1}/${chain.size} 个候选）接着跑；" +
+                "「${chain[nextRound].label}」（第 ${nextRound + 1}/${chain.size} 个候选）接着跑；" +
                 "每个候选各有一份续跑预算，候选轮完才停",
         )
         return true

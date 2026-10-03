@@ -15,26 +15,76 @@ class SkillManager(
         private const val TAG = "SkillManager"
     }
 
+    private val builtinLock = Any()
+
+    @Volatile
+    private var builtinExtracted = false
+
     fun getSkillsDir(): File {
         val dir = context.filesDir.resolve(FileFolders.SKILLS)
         if (!dir.exists()) dir.mkdirs()
         return dir
     }
 
+    fun getBuiltinSkillsDir(): File {
+        val dir = context.filesDir.resolve(FileFolders.BUILTIN_SKILLS)
+        if (!dir.exists()) dir.mkdirs()
+        return dir
+    }
+
+    /**
+     * 确保内置技能已从 assets 解压到 [getBuiltinSkillsDir]，每个进程只检查一次。
+     */
+    fun ensureBuiltinSkillsExtracted() {
+        if (builtinExtracted) return
+        synchronized(builtinLock) {
+            if (builtinExtracted) return
+            runCatching {
+                BuiltinSkills.extractIfNeeded(context, getBuiltinSkillsDir())
+            }.onFailure {
+                Log.w(TAG, "ensureBuiltinSkillsExtracted: Failed to extract builtin skills", it)
+            }
+            builtinExtracted = true
+        }
+    }
+
+    /**
+     * 列出所有可用技能：用户技能 + 内置技能，同名时用户技能覆盖内置技能。
+     *
+     * v304 排序留在合并之后：用户在设置里拖出来的顺序（存的是技能目录名）
+     * 同时作用于用户技能与内置技能；settingsFlow 是内存态 StateFlow（可同步读 .value），
+     * 所以这里不用改成挂起函数，全部调用点（技能页、助手扩展页、给模型看的技能清单）
+     * 自动获得同一个顺序。
+     */
     fun listSkills(): List<SkillMetadata> {
-        val skillsDir = getSkillsDir()
-        val raw = skillsDir.listFiles()
-            ?.filter { it.isDirectory }
+        // v311 合并上游 2.5.5：先合并「用户技能 + 内置技能」（官方新能力），
+        // 再套 v304 的用户拖动顺序。写成 raw 局部变量的形式是有意的：
+        // V304FeatureGuardTest 钉住 sortSkillsByOrder(raw, ...) 这个接线，
+        // 整覆盖本文件时测试会红 —— 保持原写法，守卫不动。
+        val raw = mergeWithBuiltinSkills(
+            local = listSkillsIn(getSkillsDir(), builtin = false),
+            builtin = listBuiltinSkills(),
+        )
+        return sortSkillsByOrder(raw, settingsStore.settingsFlow.value.skillOrder)
+    }
+
+    fun findSkill(name: String): SkillMetadata? = listSkills().firstOrNull { it.name == name }
+
+    private fun listBuiltinSkills(): List<SkillMetadata> {
+        ensureBuiltinSkillsExtracted()
+        return listSkillsIn(getBuiltinSkillsDir(), builtin = true)
+    }
+
+    private fun listSkillsIn(root: File, builtin: Boolean): List<SkillMetadata> {
+        return root.listFiles()
+            // 跳过隐藏目录，如原子写入残留的 .<name>.staging.N.tmp
+            ?.filter { it.isDirectory && !it.name.startsWith(".") }
             ?.mapNotNull { dir ->
                 val skillFile = dir.resolve("SKILL.md")
                 if (!skillFile.exists()) return@mapNotNull null
-                parseSkillFile(skillFile, dir)
+                parseSkillFile(skillFile, dir, builtin)
             }
             ?: emptyList()
-        // v304：按用户在设置里拖出来的顺序排。
-        // settingsFlow 是内存态 StateFlow（可同步读 .value），所以这里不用改成挂起函数，
-        // 全部调用点（技能页、助手扩展页、给模型看的技能清单）自动获得同一个顺序。
-        return sortSkillsByOrder(raw, settingsStore.settingsFlow.value.skillOrder)
     }
 
     fun readSkillBody(skillName: String): String? {
@@ -61,8 +111,11 @@ class SkillManager(
 
     suspend fun deleteSkill(name: String): Boolean = withContext(Dispatchers.IO) {
         val skillDir = resolveSkillDir(name) ?: return@withContext false
+        // 目录不存在时 deleteRecursively 也返回 true，需提前拦截，避免误清理内置技能的启用状态
+        if (!skillDir.exists()) return@withContext false
         val deleted = skillDir.deleteRecursively()
-        if (deleted) {
+        // 删除的是覆盖内置技能的同名用户技能时，内置技能会重新生效，保留启用状态
+        if (deleted && listBuiltinSkills().none { it.name == name }) {
             settingsStore.update { settings ->
                 settings.copy(
                     assistants = settings.assistants.map { assistant ->
@@ -108,16 +161,20 @@ class SkillManager(
     fun saveSkillFile(skillName: String, relativePath: String, content: String): Boolean {
         val skillDir = resolveSkillDir(skillName) ?: return false
         val target = SkillPaths.resolveSkillFile(skillDir, relativePath) ?: return false
-        target.parentFile?.mkdirs()
-        target.writeText(content)
-        return true
-    }
-
-    fun saveSkillFilesAtomically(skillName: String, files: Map<String, String>): Boolean {
-        return saveSkillFileBytesAtomically(
-            skillName = skillName,
-            files = files.mapValues { it.value.toByteArray() },
-        )
+        val parent = target.parentFile ?: return false
+        // 先写同目录临时文件再 rename 覆盖，避免写到一半失败时损坏原文件；
+        // IO 异常（如 mkdirs 失败导致 FileNotFoundException）转为返回 false，不向调用方抛出
+        val tempFile = parent.resolve(".${target.name}.tmp")
+        return try {
+            if (!parent.exists() && !parent.mkdirs()) return false
+            tempFile.writeText(content)
+            tempFile.renameTo(target)
+        } catch (e: Exception) {
+            Log.w(TAG, "saveSkillFile: Failed to save $skillName/$relativePath", e)
+            false
+        } finally {
+            if (tempFile.exists()) tempFile.delete()
+        }
     }
 
     fun saveSkillFileBytesAtomically(skillName: String, files: Map<String, ByteArray>): Boolean {
@@ -190,7 +247,7 @@ class SkillManager(
         return null
     }
 
-    private fun parseSkillFile(skillFile: File, skillDir: File): SkillMetadata? {
+    private fun parseSkillFile(skillFile: File, skillDir: File, builtin: Boolean = false): SkillMetadata? {
         return runCatching {
             val content = skillFile.readText()
             val frontmatter = SkillFrontmatterParser.parse(content)
@@ -201,6 +258,7 @@ class SkillManager(
                 description = description,
                 compatibility = frontmatter["compatibility"],
                 skillDir = skillDir,
+                builtin = builtin,
             )
         }.getOrElse {
             Log.w(TAG, "parseSkillFile: Failed to parse ${skillFile.absolutePath}", it)
@@ -214,6 +272,8 @@ data class SkillMetadata(
     val description: String,
     val compatibility: String? = null,
     val skillDir: File,
+    /** 内置技能，来自 assets 解压，只读 */
+    val builtin: Boolean = false,
 ) {
     val skillFile: File get() = skillDir.resolve("SKILL.md")
 }

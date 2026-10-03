@@ -60,7 +60,7 @@ import me.rerere.ai.util.KEY_RETRYABLE_CODES
 import me.rerere.ai.util.isKeyRetryableError
 import me.rerere.ai.util.streamFailureFallback
 import me.rerere.ai.util.stringSafe
-import me.rerere.ai.util.toHeaders
+import me.rerere.ai.util.mergeCustomHeaders
 import me.rerere.ai.util.withKeyRetry
 import me.rerere.common.http.await
 import me.rerere.common.http.jsonArrayOrNull
@@ -102,7 +102,7 @@ class ChatCompletionsAPI(
         ) { key ->
             val request = Request.Builder()
                 .url("${providerSetting.baseUrl}${providerSetting.chatCompletionsPath}")
-                .headers(params.customHeaders.toHeaders())
+                .headers(providerSetting.mergeCustomHeaders(params.customHeaders))
                 .post(json.encodeToString(requestBody).toRequestBody("application/json".toMediaType()))
                 .addHeader("Authorization", "Bearer $key")
                 .configureReferHeaders(providerSetting.baseUrl)
@@ -169,7 +169,7 @@ class ChatCompletionsAPI(
 
         fun buildRequest(key: String): Request = Request.Builder()
             .url("${providerSetting.baseUrl}${providerSetting.chatCompletionsPath}")
-            .headers(params.customHeaders.toHeaders())
+            .headers(providerSetting.mergeCustomHeaders(params.customHeaders))
             .post(json.encodeToString(requestBody).toRequestBody("application/json".toMediaType()))
             .addHeader("Authorization", "Bearer $key")
             .addHeader("Content-Type", "application/json")
@@ -364,9 +364,10 @@ class ChatCompletionsAPI(
 
                     "dashscope.aliyuncs.com" -> {
                         // 阿里云百炼
-                        // https://bailian.console.aliyun.com/console?tab=doc#/doc/?type=model&url=https%3A%2F%2Fhelp.aliyun.com%2Fdocument_detail%2F2870973.html&renderType=iframe
-                        put("enable_thinking", level.isEnabled)
-                        if (level != ReasoningLevel.AUTO) put("thinking_budget", level.budgetTokens)
+                        // https://help.aliyun.com/zh/model-studio/qwen-api-via-openai-chat-completions
+                        if (level != ReasoningLevel.AUTO) {
+                            put("reasoning_effort", level.effort)
+                        }
                     }
 
                     "ark.cn-beijing.volces.com" -> {
@@ -494,10 +495,8 @@ class ChatCompletionsAPI(
                     // 空回的真正止血点在上面的 max_tokens 兜底（只给 deepseek 兜输出配额）。
 
                     else -> {
-                        // OpenAI 官方
-                        // 文档中，completions API 只支持 "low", "medium", "high"
                         if (level != ReasoningLevel.AUTO) {
-                            put("reasoning_effort", if (level.effort == "none") "low" else level.effort)
+                            put("reasoning_effort", level.effort)
                         }
                     }
                 }

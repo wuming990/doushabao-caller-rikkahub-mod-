@@ -148,6 +148,31 @@ class GrokCliEndpointTest {
     }
 
     @Test
+    fun `自报版本不得低于服务端已知的最低要求`() {
+        // v313 真机：服务端回
+        // `Your Grok CLI version (0.2.93) is outdated. Please update to version 1.0.13 or later`。
+        // 这类 426 换账号、重试都没用（GrokJson 的额度判定里也明确排除了它），只能抬版本号。
+        // 按「数值分段」逐段比，不做字符串比较，避免 1.0.9 被误判成大于 1.0.13。
+        val parts = GrokCliClient.CLIENT_VERSION.split(".").map { it.toInt() }
+        assertTrue("版本号必须是 x.y.z 三段", parts.size == 3)
+        val required = listOf(1, 0, 13)
+        var comparison = 0
+        for (i in required.indices) {
+            comparison = parts[i].compareTo(required[i])
+            if (comparison != 0) break
+        }
+        assertTrue(
+            "自报版本 ${GrokCliClient.CLIENT_VERSION} 不得低于服务端要求的 1.0.13",
+            comparison >= 0,
+        )
+        // User-Agent 里嵌的必须是同一个版本 —— 两处不一致会被代理当成异常客户端。
+        assertTrue(
+            "USER_AGENT 必须内嵌 CLIENT_VERSION，只改一处不会漏",
+            GrokCliClient.USER_AGENT.contains(GrokCliClient.CLIENT_VERSION),
+        )
+    }
+
+    @Test
     fun `OAuth 登录那条路的自报身份不受影响`() {
         // 登录打的是 auth.x.ai（另一个服务，不是 CLI 代理），它的 UA 与代理无关，
         // v283 刻意没动 —— 动它等于在没有证据的情况下改一条已经能跑通登录流程的路。

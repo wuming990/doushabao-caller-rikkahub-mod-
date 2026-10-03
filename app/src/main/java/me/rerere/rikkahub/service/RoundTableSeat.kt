@@ -276,6 +276,21 @@ internal data class RoundTableGapPrompt(
     val remainingCalls: Int,
     /** v229：这次是为什么停下来的，决定界面提示语 */
     val stage: RoundTableGapStage = RoundTableGapStage.PROPOSALS,
+    /**
+     * v313：这个检查点管的是哪些座位。
+     *
+     * 界面据此**实时**重算「现有几份可用材料」，不再用停下那一刻的快照数字。
+     * 真机症状（用户原话「像有堵墙」）：用户在检查点上把半截内容勾成「算进结论」，
+     * 但「用现有材料继续」按钮的 enabled 读的是快照里的 usableCount，永远灰着点不动。
+     */
+    val seatIds: Set<String> = emptySet(),
+    /**
+     * v313：这些座位里**真的留有内容**的位置 id（不看勾选开关）。
+     *
+     * 「可用」= 有内容 且 被勾进结论。勾选状态会变，所以界面用
+     * 「有内容的 ∩ 已勾选的」实时重算 usableCount；停下那一刻的快照数字只是初值。
+     */
+    val seatsWithResults: Set<String> = emptySet(),
 )
 
 /** 界面对某个座位下的指令 */

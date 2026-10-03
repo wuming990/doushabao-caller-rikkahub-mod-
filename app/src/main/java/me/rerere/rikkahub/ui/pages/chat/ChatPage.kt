@@ -91,6 +91,7 @@ import me.rerere.rikkahub.ui.hooks.AttachmentPending
 import me.rerere.rikkahub.ui.hooks.AttachmentPendingStatus
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.Conversation
+import me.rerere.rikkahub.data.model.GroupChatConfig
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
 import me.rerere.rikkahub.service.ChatError
 import me.rerere.rikkahub.service.RoundTableTaskGuard
@@ -342,6 +343,24 @@ private fun ChatPageContent(
     var showFilesSheet by remember { mutableStateOf(false) }
     // v213：圆桌座位状态；控制面板据此显示每个位置由谁负责、跑到哪一步
     val roundTableRun by vm.roundTableRun.collectAsStateWithLifecycle()
+    // v313：群讨论状态（与圆桌并列、互不引用）
+    val groupRun by vm.groupRun.collectAsStateWithLifecycle()
+    var showGroupSettings by remember { mutableStateOf(false) }
+    // v314：「我要插话」按钮的信号 —— 每自增一次，就把光标送进输入框一次
+    var groupInterjectSignal by remember { mutableStateOf(0) }
+    // v316：v315 那个「先弹框写题目」的确认框已撤 —— 用户拍板改走输入框
+    // （能顺手加图片/文件）。开始讨论的入口见 GroupChatPanel 的 onContinue / onStartWithTopic。
+    val groupConfig = setting.groupChatConfigs[conversation.id]
+    // v314：成员是否够两个。删过模型之后配置还在、但讨论开不起来，面板要据此说清楚
+    //（不然用户只会看到「点了没反应」—— 审查位 v314 抓的那类体验问题）。
+    val groupMembersEnough = remember(groupConfig, setting.providers) {
+        val config = groupConfig ?: return@remember false
+        val existing = setting.providers
+            .flatMap { provider -> provider.models }
+            .map { it.id }
+            .toSet()
+        config.memberModelIds.count { it in existing } >= GroupChatConfig.MIN_MEMBERS
+    }
     val agentThreads by vm.agentThreads.collectAsStateWithLifecycle()
     // v209：圆桌确认框的待确认请求；非空时弹框。放在这一层，底部面板关掉也不会跟着消失。
     var roundTableRequest by remember { mutableStateOf<RoundTableConfirmRequest?>(null) }
@@ -475,6 +494,54 @@ private fun ChatPageContent(
                             )
                         },
                     )
+                    // v313：群讨论面板。没建过群、也没在讨论时完全不渲染，普通对话看不到痕迹。
+                    GroupChatPanel(
+                        state = groupRun,
+                        hasConfig = groupConfig != null,
+                        // v315：暂停态（配置留着但不用）走单独分支，只给「重新启用」
+                        paused = groupConfig?.enabled == false,
+                        // v315：不再直接开跑 —— 先弹框让用户写「这次想讨论什么」
+                        // v316 改口径（用户拍板 B）：不弹框，「直接开始」就是立刻开跑；
+                        // 想写题目/配附件走下面的 onStartWithTopic（光标进输入框那条路）。
+                        onContinue = { vm.startGroupDiscussion() },
+                        // v316：写题目开始 —— 复用输入框，图片/文件都能带着一起发。
+                        // 与「我要插话」同一条底层通道（tryGroupInterjection 会把消息原样
+                        // 入库并在讨论停着时自动开批），所以这里只给焦点和一句人话提示。
+                        onStartWithTopic = {
+                            groupInterjectSignal += 1
+                            toaster.show(
+                                "在下面输入框写这次想讨论什么，可以加图片/文件，一发出去讨论就开始",
+                                type = ToastType.Info,
+                            )
+                        },
+                        onStop = { vm.stopGroupDiscussion() },
+                        onSkipQuestion = { vm.skipGroupQuestion() },
+                        // v314：把光标送进输入框 —— 用户直接打字就是「插话」。
+                        // 这里只负责给焦点和一句人话提示，内容怎么进讨论由服务层决定。
+                        onInterject = {
+                            groupInterjectSignal += 1
+                            toaster.show(
+                                "在下面输入框打字发送就行，你这句话会进入讨论",
+                                type = ToastType.Info,
+                            )
+                        },
+                        onResumeGroup = { vm.setGroupEnabled(true) },
+                        membersEnough = groupMembersEnough,
+                        onOpenSettings = { showGroupSettings = true },
+                        // v317：整块可折叠（用户：「这个太占空间了，给我做一个可以折叠起来的」）。
+                        // 偏好存 DisplaySetting.groupPanelCollapsed —— 全局记住，换对话/重启都保持；
+                        // 走设置 JSON，不动数据库（AppDatabase 必须停在 25）。
+                        collapsed = setting.displaySetting.groupPanelCollapsed,
+                        onToggleCollapsed = {
+                            vm.updateSettings(
+                                setting.copy(
+                                    displaySetting = setting.displaySetting.copy(
+                                        groupPanelCollapsed = !setting.displaySetting.groupPanelCollapsed
+                                    )
+                                )
+                            )
+                        },
+                    )
                     ChatInput(
                     onStartVoiceMode = if (
                         setting.getSelectedASRProvider()?.supportsServerVadVoiceMode == true &&
@@ -489,6 +556,8 @@ private fun ChatPageContent(
                     } else null,
                     voiceState = voiceState,
                     onStopVoiceMode = vm.voiceSession::stop,
+                    // v314：群面板「我要插话」按钮点了就把光标送进输入框
+                    focusRequestSignal = groupInterjectSignal,
                     messageQueue = messageQueue,
                     onRemoveQueuedMessage = vm::removeQueuedMessage,
                     onBeginEditQueuedMessage = vm::beginEditQueuedMessage,
@@ -739,8 +808,71 @@ private fun ChatPageContent(
                         attachmentCount = contents.count { it !is UIMessagePart.Text },
                     )
                 },
+                // v313：群设置弹窗的状态留在这一层（面板与弹窗都要读写它），
+                // 内层只透传一个入口回来 —— 与 onRequestRoundTable 同一做法。
+                onOpenGroupSettings = { showGroupSettings = true },
             )
         }
+
+        // v313：群设置弹窗
+        if (showGroupSettings) {
+            GroupChatSettingsDialog(
+                initial = groupConfig ?: GroupChatConfig(),
+                providers = setting.providers,
+                // v315：暂停与彻底删除分开 —— 暂停把配置全留着，彻底删除才是真清空
+                onPauseToggle = { enabled ->
+                    vm.setGroupEnabled(enabled)
+                    showGroupSettings = false
+                    toaster.show(
+                        if (enabled) {
+                            "已重新启用讨论群"
+                        } else {
+                            "已暂停：成员和设置都留着，随时能回来"
+                        },
+                        type = ToastType.Info,
+                    )
+                },
+                onDelete = {
+                    vm.deleteGroupConfig()
+                    showGroupSettings = false
+                    toaster.show(
+                        "已删除群设置，这个对话恢复成普通聊天（聊天记录都在）",
+                        type = ToastType.Info,
+                    )
+                },
+                // v316：用户自己攒的方案（全局共享，存在 setting.groupChatPresets）
+                presets = setting.groupChatPresets,
+                onSaveAsPreset = { name, config -> vm.requestSaveGroupPreset(name, config) },
+                onOverwritePreset = { id, config -> vm.requestOverwriteGroupPreset(id, config) },
+                onRenamePreset = { id, name -> vm.requestRenameGroupPreset(id, name) },
+                onDeletePreset = { id -> vm.requestDeleteGroupPreset(id) },
+                onNotify = { message, isError ->
+                    toaster.show(message, type = if (isError) ToastType.Error else ToastType.Info)
+                },
+                onDismiss = { showGroupSettings = false },
+                onSave = { config ->
+                    vm.saveGroupConfig(config)
+                    showGroupSettings = false
+                    toaster.show("群设置已保存", type = ToastType.Info)
+                },
+            )
+        }
+
+        // v316：方案写操作的回执。成败由 ChatVM 落库结果说话（复审位抓的 P2：
+        // 用返回值报成功会在写失败时说谎）。报完即清，避免同一个回执反复弹。
+        val groupPresetOp by vm.groupPresetOp.collectAsStateWithLifecycle()
+        LaunchedEffect(groupPresetOp) {
+            groupPresetOp?.let { result ->
+                val (message, isError) = me.rerere.rikkahub.data.model.presetOpMessage(result)
+                toaster.show(message, type = if (isError) ToastType.Error else ToastType.Info)
+                vm.consumeGroupPresetOp()
+            }
+        }
+
+        // v316：撤掉 v315 的「开始讨论前弹框写题目」—— 用户拍板改走输入框（可加图片/文件）。
+        // 服务层 startGroupDiscussion(topic) 的 topic 形参与 saveGroupTopic 一并留着不用：
+        // 插话通道已经把用户消息（含附件）原样入库，再走一遍 topic 入库会重复一条。
+        // （ChatService 本轮一行未改，禁区 #13 的隔离口径不变。）
 
         // v209：圆桌确认框。先让用户看清并可以修改本轮任务，确认后才真正开始花钱。
         roundTableRequest?.let { request ->
@@ -973,6 +1105,8 @@ private fun ChatFilesPickerSheet(
     vm: ChatVM,
     onDismiss: () -> Unit,
     onRequestRoundTable: (autoSummarize: Boolean) -> Unit,
+    /** v313：群设置弹窗由外层持有状态，这里只透传入口（与 onRequestRoundTable 同一做法） */
+    onOpenGroupSettings: () -> Unit,
 ) {
     val context = LocalContext.current
     val toaster = LocalToaster.current
@@ -1275,6 +1409,9 @@ private fun ChatFilesPickerSheet(
                     vm.summarizeRoundTableNode(nodeId)
                 }
             },
+            // v313：讨论群组入口。本组件看不到 ChatPageContent 的局部状态，
+            // 所以照 onRequestRoundTable 的做法透传给外层去开弹窗。
+            onOpenGroupSettings = onOpenGroupSettings,
         )
     }
 

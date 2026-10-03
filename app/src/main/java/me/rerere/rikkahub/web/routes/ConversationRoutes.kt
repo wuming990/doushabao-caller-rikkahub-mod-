@@ -157,6 +157,8 @@ fun Route.conversationRoutes(
                 ?: throw NotFoundException("Conversation not found")
 
             conversationRepo.deleteConversation(conversation)
+            // v318：与 App 内删除同一口径 —— 释放讨论群运行态与状态转发订阅
+            chatService.releaseGroupStateOnDelete(uuid)
             call.respond(HttpStatusCode.NoContent)
         }
 

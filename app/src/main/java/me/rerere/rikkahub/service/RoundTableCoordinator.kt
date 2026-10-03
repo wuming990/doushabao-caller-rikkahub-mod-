@@ -68,6 +68,20 @@ internal class RoundTableCoordinator(
             .mapNotNull { seat -> results[seat.seatId]?.let { seat to it } }
 
     /**
+     * v313：这些座位里**真的留有内容**的位置 id，**不看**「算不算进结论」开关。
+     *
+     * 检查点界面要用它做实时重算：「可用」= 有内容 ∩ 已勾选。勾选状态是用户随时能改的，
+     * 而停下那一刻记下的 usableCount 是死数字 —— 旧版就因为它，用户把半截内容勾回结论后
+     * 「用现有材料继续」按钮仍然灰着，等于只能重跑或整轮作废。
+     */
+    fun seatIdsWithResults(seatIds: List<String>): Set<String> =
+        run.snapshot().seats
+            .filter { it.seatId in seatIds }
+            .filter { results[it.seatId]?.toText()?.isNotBlank() == true }
+            .map { it.seatId }
+            .toSet()
+
+    /**
      * 跑一组座位，直到这一组全部有结论（成功 / 疑似无效 / 失败 / 停止 / 跳过）。
      *
      * 组内是并发的；单个座位失败或被停止都不会影响同组其它座位。

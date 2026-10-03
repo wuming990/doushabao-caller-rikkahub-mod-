@@ -29,6 +29,7 @@ sealed class ProviderSetting {
     abstract val name: String
     abstract val models: List<Model>
     abstract val balanceOption: BalanceOption
+    abstract val customHeaders: List<CustomHeader>
 
     abstract val builtIn: Boolean
     abstract val description: @Composable() () -> Unit
@@ -44,6 +45,7 @@ sealed class ProviderSetting {
         name: String = this.name,
         models: List<Model> = this.models,
         balanceOption: BalanceOption = this.balanceOption,
+        customHeaders: List<CustomHeader> = this.customHeaders,
         builtIn: Boolean = this.builtIn,
         description: @Composable (() -> Unit) = this.description,
         shortDescription: @Composable (() -> Unit) = this.shortDescription,
@@ -57,6 +59,7 @@ sealed class ProviderSetting {
         override var name: String = "OpenAI",
         override var models: List<Model> = emptyList(),
         override val balanceOption: BalanceOption = BalanceOption(),
+        override val customHeaders: List<CustomHeader> = emptyList(),
         @Transient override val builtIn: Boolean = false,
         @Transient override val description: @Composable (() -> Unit) = {},
         @Transient override val shortDescription: @Composable (() -> Unit) = {},
@@ -95,6 +98,7 @@ sealed class ProviderSetting {
             name: String,
             models: List<Model>,
             balanceOption: BalanceOption,
+            customHeaders: List<CustomHeader>,
             builtIn: Boolean,
             description: @Composable (() -> Unit),
             shortDescription: @Composable (() -> Unit),
@@ -104,6 +108,7 @@ sealed class ProviderSetting {
                 enabled = enabled,
                 name = name,
                 models = models,
+                customHeaders = customHeaders,
                 builtIn = builtIn,
                 description = description,
                 balanceOption = balanceOption,
@@ -120,6 +125,7 @@ sealed class ProviderSetting {
         override var name: String = "Google",
         override var models: List<Model> = emptyList(),
         override val balanceOption: BalanceOption = BalanceOption(),
+        override val customHeaders: List<CustomHeader> = emptyList(),
         @Transient override val builtIn: Boolean = false,
         @Transient override val description: @Composable (() -> Unit) = {},
         @Transient override val shortDescription: @Composable (() -> Unit) = {},
@@ -131,6 +137,7 @@ sealed class ProviderSetting {
         var serviceAccountEmail: String = "", // only for vertex AI service account
         var location: String = "us-central1", // only for vertex AI service account
         var projectId: String = "", // only for vertex AI service account
+        var useInteractionsApi: Boolean = false, // ignored when vertex AI is enabled
     ) : ProviderSetting() {
         override fun addModel(model: Model): ProviderSetting {
             return copy(models = models + model)
@@ -160,6 +167,7 @@ sealed class ProviderSetting {
             name: String,
             models: List<Model>,
             balanceOption: BalanceOption,
+            customHeaders: List<CustomHeader>,
             builtIn: Boolean,
             description: @Composable (() -> Unit),
             shortDescription: @Composable (() -> Unit),
@@ -169,6 +177,7 @@ sealed class ProviderSetting {
                 enabled = enabled,
                 name = name,
                 models = models,
+                customHeaders = customHeaders,
                 builtIn = builtIn,
                 description = description,
                 shortDescription = shortDescription,
@@ -185,6 +194,7 @@ sealed class ProviderSetting {
         override var name: String = "Claude",
         override var models: List<Model> = emptyList(),
         override val balanceOption: BalanceOption = BalanceOption(),
+        override val customHeaders: List<CustomHeader> = emptyList(),
         @Transient override val builtIn: Boolean = false,
         @Transient override val description: @Composable (() -> Unit) = {},
         @Transient override val shortDescription: @Composable (() -> Unit) = {},
@@ -221,6 +231,7 @@ sealed class ProviderSetting {
             name: String,
             models: List<Model>,
             balanceOption: BalanceOption,
+            customHeaders: List<CustomHeader>,
             builtIn: Boolean,
             description: @Composable (() -> Unit),
             shortDescription: @Composable (() -> Unit),
@@ -231,6 +242,7 @@ sealed class ProviderSetting {
                 name = name,
                 models = models,
                 balanceOption = balanceOption,
+                customHeaders = customHeaders,
                 builtIn = builtIn,
                 description = description,
                 shortDescription = shortDescription,
@@ -247,6 +259,9 @@ sealed class ProviderSetting {
         override var name: String = "Codex",
         override var models: List<Model> = emptyList(),
         override val balanceOption: BalanceOption = BalanceOption(),
+        // v312 合并上游 2.5.6：官方给基类加了 abstract val customHeaders，
+        // 账号登录类通道同样必须实现；带默认值，旧设置 JSON 兼容，不动数据库。
+        override val customHeaders: List<CustomHeader> = emptyList(),
         @Transient override val builtIn: Boolean = true,
         @Transient override val description: @Composable (() -> Unit) = {},
         @Transient override val shortDescription: @Composable (() -> Unit) = {},
@@ -272,6 +287,7 @@ sealed class ProviderSetting {
             name: String,
             models: List<Model>,
             balanceOption: BalanceOption,
+            customHeaders: List<CustomHeader>,
             builtIn: Boolean,
             description: @Composable (() -> Unit),
             shortDescription: @Composable (() -> Unit),
@@ -282,6 +298,7 @@ sealed class ProviderSetting {
                 name = name,
                 models = models,
                 balanceOption = balanceOption,
+                customHeaders = customHeaders,
                 builtIn = builtIn,
                 description = description,
                 shortDescription = shortDescription,
@@ -297,6 +314,9 @@ sealed class ProviderSetting {
         override var name: String = "Grok",
         override var models: List<Model> = emptyList(),
         override val balanceOption: BalanceOption = BalanceOption(),
+        // v312 合并上游 2.5.6：官方给基类加了 abstract val customHeaders，
+        // 账号登录类通道同样必须实现；带默认值，旧设置 JSON 兼容，不动数据库。
+        override val customHeaders: List<CustomHeader> = emptyList(),
         @Transient override val builtIn: Boolean = true,
         @Transient override val description: @Composable (() -> Unit) = {},
         @Transient override val shortDescription: @Composable (() -> Unit) = {},
@@ -322,6 +342,7 @@ sealed class ProviderSetting {
             name: String,
             models: List<Model>,
             balanceOption: BalanceOption,
+            customHeaders: List<CustomHeader>,
             builtIn: Boolean,
             description: @Composable (() -> Unit),
             shortDescription: @Composable (() -> Unit),
@@ -332,6 +353,7 @@ sealed class ProviderSetting {
                 name = name,
                 models = models,
                 balanceOption = balanceOption,
+                customHeaders = customHeaders,
                 builtIn = builtIn,
                 description = description,
                 shortDescription = shortDescription,
@@ -347,6 +369,9 @@ sealed class ProviderSetting {
         override var name: String = "Gemini OAuth",
         override var models: List<Model> = emptyList(),
         override val balanceOption: BalanceOption = BalanceOption(),
+        // v312 合并上游 2.5.6：官方给基类加了 abstract val customHeaders，
+        // 账号登录类通道同样必须实现；带默认值，旧设置 JSON 兼容，不动数据库。
+        override val customHeaders: List<CustomHeader> = emptyList(),
         @Transient override val builtIn: Boolean = true,
         @Transient override val description: @Composable (() -> Unit) = {},
         @Transient override val shortDescription: @Composable (() -> Unit) = {},
@@ -372,6 +397,7 @@ sealed class ProviderSetting {
             name: String,
             models: List<Model>,
             balanceOption: BalanceOption,
+            customHeaders: List<CustomHeader>,
             builtIn: Boolean,
             description: @Composable (() -> Unit),
             shortDescription: @Composable (() -> Unit),
@@ -382,6 +408,7 @@ sealed class ProviderSetting {
                 name = name,
                 models = models,
                 balanceOption = balanceOption,
+                customHeaders = customHeaders,
                 builtIn = builtIn,
                 description = description,
                 shortDescription = shortDescription,

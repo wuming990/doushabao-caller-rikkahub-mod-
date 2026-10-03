@@ -45,6 +45,7 @@ import me.rerere.rikkahub.agent.model.AgentReport
 import me.rerere.rikkahub.agent.model.AgentThread
 import me.rerere.rikkahub.agent.model.AgentThreadStatus
 import me.rerere.rikkahub.agent.runtime.AgentThreadManager
+import me.rerere.rikkahub.data.datastore.displayLabel
 import me.rerere.rikkahub.data.datastore.findModelById
 import me.rerere.rikkahub.ui.hooks.rememberUserSettingsState
 import org.koin.compose.koinInject
@@ -433,7 +434,7 @@ private fun AgentThreadDetailDialog(
     val settings by rememberUserSettingsState()
     val activeModelName = thread.activeModelId
         ?.let { raw -> runCatching { Uuid.parse(raw) }.getOrNull() }
-        ?.let { settings.findModelById(it)?.displayName }
+        ?.let { settings.findModelById(it)?.displayLabel(settings.providers) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = {

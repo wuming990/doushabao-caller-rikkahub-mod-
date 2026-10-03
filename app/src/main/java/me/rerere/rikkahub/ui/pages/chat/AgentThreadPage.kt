@@ -67,6 +67,7 @@ import me.rerere.rikkahub.agent.model.AgentThread
 import me.rerere.rikkahub.agent.model.AgentThreadStatus
 import me.rerere.rikkahub.agent.repo.AgentThreadRepository
 import me.rerere.rikkahub.agent.runtime.AgentThreadManager
+import me.rerere.rikkahub.data.datastore.displayLabel
 import me.rerere.rikkahub.data.datastore.findModelById
 import me.rerere.rikkahub.ui.components.ai.ModelListSheet
 import me.rerere.rikkahub.ui.components.ai.rememberModelListState
@@ -105,7 +106,7 @@ fun AgentThreadPage(
     val settings by rememberUserSettingsState()
     val activeModelName = thread?.activeModelId
         ?.let { raw -> runCatching { Uuid.parse(raw) }.getOrNull() }
-        ?.let { settings.findModelById(it)?.displayName }
+        ?.let { settings.findModelById(it)?.displayLabel(settings.providers) }
     val modelSwitched = events.any { it.type == "MODEL_FALLBACK" }
 
     // v238：跑了多久 / 多久没有新内容。

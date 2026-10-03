@@ -37,6 +37,8 @@ class HistoryVM(
     fun deleteConversation(conversation: Conversation) {
         viewModelScope.launch {
             conversationRepo.deleteConversation(conversation)
+            // v318：删对话要一并释放它的讨论群运行态与状态转发订阅（ChatVM 同一口径）
+            chatService.releaseGroupStateOnDelete(conversation.id)
         }
     }
 

@@ -4,7 +4,6 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -12,6 +11,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -19,8 +19,6 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -50,21 +48,27 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import me.rerere.rikkahub.R
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.Add01
+import me.rerere.hugeicons.stroke.Cancel01
 import me.rerere.hugeicons.stroke.Delete01
 import me.rerere.hugeicons.stroke.Download01
 import me.rerere.hugeicons.stroke.FileImport
-import me.rerere.hugeicons.stroke.MoreVertical
 import me.rerere.hugeicons.stroke.Puzzle
+import me.rerere.hugeicons.stroke.Search01
 import me.rerere.rikkahub.data.files.SkillFrontmatterParser
 import me.rerere.rikkahub.data.files.SkillMetadata
+// v304：拖动换位与拖拽排序手势（与官方 v311 的 longPressReorder 是两套，
+// 官方那套管服务商/提示词列表，我们这套管技能与对话文件夹）
 import me.rerere.rikkahub.data.files.moveItemTo
 import me.rerere.rikkahub.Screen
 import me.rerere.rikkahub.ui.components.nav.BackButton
+import me.rerere.rikkahub.ui.components.ui.ItemAction
+import me.rerere.rikkahub.ui.components.ui.ItemActionMenu
 import me.rerere.rikkahub.ui.components.ui.RikkaConfirmDialog
 import me.rerere.rikkahub.ui.components.ui.dragToReorder
 import me.rerere.rikkahub.ui.context.LocalNavController
@@ -81,10 +85,6 @@ fun SkillsPage() {
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
     val toaster = LocalToaster.current
     val context = LocalContext.current
-    var showImportSheet by rememberSaveable { mutableStateOf(false) }
-    var showAddDialog by rememberSaveable { mutableStateOf(false) }
-    var showImportDialog by rememberSaveable { mutableStateOf(false) }
-    var deleteTarget by remember { mutableStateOf<SkillMetadata?>(null) }
     // v304：拖动排序。拖动期间先用本地顺序渲染 —— 顺序要先落盘、再由设置回流才更新列表，
     // 直接依赖它会出现「松手前顺序弹回去」。等回流顺序与本地一致了再交还给数据源。
     var draggingOrder by remember { mutableStateOf<List<SkillMetadata>?>(null) }
@@ -96,6 +96,24 @@ fun SkillsPage() {
         val local = draggingOrder ?: return@LaunchedEffect
         if (skills.map { it.skillDir.absolutePath } == local.map { it.skillDir.absolutePath }) {
             draggingOrder = null
+        }
+    }
+    var showImportSheet by rememberSaveable { mutableStateOf(false) }
+    var showAddDialog by rememberSaveable { mutableStateOf(false) }
+    var showImportDialog by rememberSaveable { mutableStateOf(false) }
+    var deleteTarget by remember { mutableStateOf<SkillMetadata?>(null) }
+    var searchQuery by rememberSaveable { mutableStateOf("") }
+    // v311 合并上游 2.5.5：官方新增「按名称/描述搜索」。过滤基准用 displaySkills，
+    // 否则拖动期间（draggingOrder 生效时）搜索会把手上的乐观顺序覆盖掉。
+    val searching = searchQuery.isNotBlank()
+    val filteredSkills = remember(displaySkills, searchQuery) {
+        if (searchQuery.isBlank()) {
+            displaySkills
+        } else {
+            displaySkills.filter { skill ->
+                skill.name.contains(searchQuery, ignoreCase = true) ||
+                    skill.description.contains(searchQuery, ignoreCase = true)
+            }
         }
     }
     val fileImportLauncher = rememberLauncherForActivityResult(
@@ -167,11 +185,67 @@ fun SkillsPage() {
                 }
             }
 
-            itemsIndexed(displaySkills, key = { _, skill -> skill.skillDir.absolutePath }) { index, skill ->
+            if (skills.isNotEmpty()) {
+                item(key = "search") {
+                    OutlinedTextField(
+                        value = searchQuery,
+                        onValueChange = { searchQuery = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        placeholder = { Text(stringResource(R.string.skills_page_search_placeholder)) },
+                        leadingIcon = {
+                            Icon(HugeIcons.Search01, contentDescription = null)
+                        },
+                        trailingIcon = {
+                            if (searchQuery.isNotEmpty()) {
+                                IconButton(onClick = { searchQuery = "" }) {
+                                    Icon(HugeIcons.Cancel01, contentDescription = "Clear")
+                                }
+                            }
+                        },
+                        singleLine = true,
+                        shape = CircleShape,
+                    )
+                }
+            }
+
+            if (skills.isNotEmpty() && filteredSkills.isEmpty()) {
+                item(key = "no_result") {
+                    Text(
+                        text = stringResource(R.string.skills_page_search_no_result),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 32.dp),
+                        textAlign = TextAlign.Center,
+                    )
+                }
+            }
+
+            itemsIndexed(filteredSkills, key = { _, skill -> skill.skillDir.absolutePath }) { index, skill ->
+                // v311 合并上游 2.5.5 后的取舍：搜索会把列表变成子集，而 reorderSkills
+                // 落盘的是**整表**顺序 —— 在子集里拖动会把没显示出来的技能顺序写坏，
+                // 因此搜索状态下不提供拖拽（清空搜索框即可继续排序）。
+                val dragModifier = if (searching) {
+                    Modifier
+                } else {
+                    Modifier.dragToReorder(
+                        index = index,
+                        horizontal = false,
+                        onMove = { from, to ->
+                            draggingOrder = moveItemTo(displaySkills, from, to)
+                        },
+                        onDrop = { vm.reorderSkills(displaySkills) },
+                        onDragStateChange = { active ->
+                            dragGuardUntil = if (active) Long.MAX_VALUE
+                            else System.currentTimeMillis() + 300L
+                        },
+                    )
+                }
                 SkillCard(
                     skill = skill,
                     onClick = {
-                        // 拖动刚结束时的那一下点击不算（见 dragGuardUntil 注释）
+                        // v304：拖动刚结束时的那一下点击不算（见 dragGuardUntil 注释）
                         if (System.currentTimeMillis() > dragGuardUntil) {
                             navController.navigate(Screen.SkillDetail(skill.name))
                         }
@@ -179,19 +253,7 @@ fun SkillsPage() {
                     onDelete = { deleteTarget = skill },
                     modifier = Modifier
                         .animateItem()
-                        // v304：长按拖动排序，松手时把新顺序写进设置（全局一套，所有助手共用）。
-                        .dragToReorder(
-                            index = index,
-                            horizontal = false,
-                            onMove = { from, to ->
-                                draggingOrder = moveItemTo(displaySkills, from, to)
-                            },
-                            onDrop = { vm.reorderSkills(displaySkills) },
-                            onDragStateChange = { active ->
-                                dragGuardUntil = if (active) Long.MAX_VALUE
-                                else System.currentTimeMillis() + 300L
-                            },
-                        ),
+                        .then(dragModifier),
                 )
             }
         }
@@ -274,8 +336,6 @@ private fun SkillCard(
     onDelete: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    var menuExpanded by remember { mutableStateOf(false) }
-
     Card(
         onClick = onClick,
         // v304：拖动排序用的 modifier 由列表传进来（长按拖动 + 拖动中轻微放大）
@@ -285,7 +345,7 @@ private fun SkillCard(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(start = 16.dp, top = 12.dp, bottom = 12.dp, end = 4.dp),
+                .padding(start = 16.dp, top = 12.dp, bottom = 12.dp, end = if (skill.builtin) 16.dp else 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Icon(
@@ -310,6 +370,13 @@ private fun SkillCard(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 2,
                 )
+                if (skill.builtin) {
+                    Text(
+                        text = "Built-in",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.secondary,
+                    )
+                }
                 if (!skill.compatibility.isNullOrBlank()) {
                     Text(
                         text = skill.compatibility,
@@ -318,32 +385,18 @@ private fun SkillCard(
                     )
                 }
             }
-            Box {
-                IconButton(onClick = { menuExpanded = true }) {
-                    Icon(
-                        imageVector = HugeIcons.MoreVertical,
-                        contentDescription = stringResource(R.string.skills_page_more_actions),
+            // 内置技能只读，不提供删除
+            if (!skill.builtin) {
+                ItemActionMenu(
+                    actions = listOf(
+                        ItemAction(
+                            text = stringResource(R.string.delete),
+                            icon = HugeIcons.Delete01,
+                            destructive = true,
+                            onClick = onDelete,
+                        ),
                     )
-                }
-                DropdownMenu(
-                    expanded = menuExpanded,
-                    onDismissRequest = { menuExpanded = false },
-                ) {
-                    DropdownMenuItem(
-                        text = { Text(stringResource(R.string.delete), color = MaterialTheme.colorScheme.error) },
-                        leadingIcon = {
-                            Icon(
-                                imageVector = HugeIcons.Delete01,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.error,
-                            )
-                        },
-                        onClick = {
-                            menuExpanded = false
-                            onDelete()
-                        },
-                    )
-                }
+                )
             }
         }
     }

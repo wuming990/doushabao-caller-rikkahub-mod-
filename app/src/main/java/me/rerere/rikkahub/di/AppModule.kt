@@ -83,6 +83,7 @@ val appModule = module {
             mcpManager = get(),
             skillManager = get(),
             workspaceRepository = get(),
+            geminiSearchClient = get(),
         )
     }
 
@@ -106,7 +107,8 @@ val appModule = module {
             skillManager = get(),
             workspaceRepository = get(),
             folderRepository = get(),
-            agentThreadManager = get()
+            agentThreadManager = get(),
+            geminiSearchClient = get()
         )
     }
 

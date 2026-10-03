@@ -76,6 +76,14 @@ internal fun RoundTableSeatPanel(
     )
     val gap = state.gapPrompt
     val doneCount = state.seats.count { it.status.isTerminal }
+    // v313：检查点上的「现有几份可用材料」按**当前勾选状态**实时重算。
+    // 旧版读的是停下那一刻记下的死数字，于是用户把半截内容勾回结论后，
+    // 「用现有材料继续」按钮仍然灰着点不动 —— 用户看到的「像有堵墙、只能重跑」。
+    // 没带座位清单的旧检查点（理论上不该出现）退回快照数字，行为不变。
+    val gapUsableCount = gap?.let { g ->
+        if (g.seatIds.isEmpty()) g.usableCount
+        else state.seats.count { it.seatId in g.seatsWithResults && it.includeInSummary }
+    } ?: 0
 
     Surface(
         modifier = modifier.fillMaxWidth(),
@@ -90,7 +98,7 @@ internal fun RoundTableSeatPanel(
                     text = if (gap != null) {
                         stringResource(
                             R.string.round_table_panel_title_gap,
-                            gap.usableCount,
+                            gapUsableCount,
                             state.seats.size,
                         )
                     } else {
@@ -142,7 +150,7 @@ internal fun RoundTableSeatPanel(
 
                         RoundTableGapStage.PROPOSALS -> stringResource(
                             R.string.round_table_gap_desc,
-                            gap.usableCount,
+                            gapUsableCount,
                             gap.missingCount,
                             gap.remainingCalls,
                         )
@@ -158,7 +166,8 @@ internal fun RoundTableSeatPanel(
                     }
                     TextButton(
                         onClick = { onGapDecision(RoundTableGapDecision.CONTINUE_WITH_CURRENT) },
-                        enabled = gap.usableCount > 0,
+                        // v313：用实时重算的值。旧版读死数字，勾回结论也点不动这个按钮。
+                        enabled = gapUsableCount > 0,
                     ) {
                         Text(
                             text = stringResource(R.string.round_table_gap_action_continue),

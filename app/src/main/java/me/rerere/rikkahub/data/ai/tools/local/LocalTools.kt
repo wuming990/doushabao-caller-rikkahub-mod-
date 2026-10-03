@@ -67,6 +67,8 @@ class LocalTools(
 
     val calendarCreateTool by lazy { buildCalendarCreateTool(context) }
 
+    val chartDisplayTool by lazy { buildChartDisplayTool() }
+
     // v300：host/modelId 默认 null —— 不传参数的调用点行为与改前一字不差。
     fun getTools(
         options: List<LocalToolOption>,
@@ -96,6 +98,9 @@ class LocalTools(
         if (options.contains(LocalToolOption.Calendar)) {
             tools.add(calendarQueryTool)
             tools.add(calendarCreateTool)
+        }
+        if (options.contains(LocalToolOption.ChartDisplay)) {
+            tools.add(chartDisplayTool)
         }
         return tools
     }

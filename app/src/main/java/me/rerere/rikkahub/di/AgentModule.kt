@@ -19,6 +19,7 @@ import me.rerere.rikkahub.agent.runtime.GenerationAgentBackend
 import me.rerere.rikkahub.agent.runtime.ResumeModelCandidate
 import me.rerere.rikkahub.agent.runtime.resolveModelChain
 import me.rerere.rikkahub.data.datastore.findModelById
+import me.rerere.rikkahub.data.datastore.findProvider
 import org.koin.dsl.module
 
 /**
@@ -95,8 +96,16 @@ val agentModule = module {
             // 候选链必须与内层（GenerationAgentBackend）用同一套解析，否则事件里说的
             // 「第几个候选 / 换成谁」和实际跑起来的模型会对不上（v242 的假换模型事故同款）。
             resumeModelChain = { thread ->
-                resolveModelChain(thread, settingsStore.settingsFlow.first())
-                    .map { model -> ResumeModelCandidate(model.id.toString(), model.displayName) }
+                val settings = settingsStore.settingsFlow.first()
+                resolveModelChain(thread, settings)
+                    .map { model ->
+                        ResumeModelCandidate(
+                            id = model.id.toString(),
+                            displayName = model.displayName,
+                            // v311：供应商标识 —— 同名模型分属不同家时靠它区分「换成了谁」
+                            providerName = model.findProvider(settings.providers)?.name.orEmpty(),
+                        )
+                    }
             },
         )
         // 并发上限跟随设置（运行时生效，1~8）

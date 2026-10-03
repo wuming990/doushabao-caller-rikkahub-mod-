@@ -89,6 +89,7 @@ import me.rerere.rikkahub.data.datastore.AutoCompressModelOverride
 import me.rerere.rikkahub.data.datastore.MAX_ROUND_TABLE_MEMBERS
 import me.rerere.rikkahub.data.datastore.RoundTableSetting
 import me.rerere.rikkahub.data.datastore.Settings
+import me.rerere.rikkahub.data.datastore.displayLabel
 import me.rerere.rikkahub.data.datastore.findModelById
 import me.rerere.rikkahub.data.datastore.findProvider
 import me.rerere.rikkahub.data.datastore.getCurrentAssistant
@@ -145,6 +146,8 @@ internal fun FilesPicker(
     onRunRoundTable: () -> Unit = {},
     onRunRoundTableProposalsOnly: () -> Unit = {},
     onSummarizeRoundTable: () -> Unit = {},
+    // v313：讨论群组入口。只负责打开设置弹窗，建群与开跑都在弹窗外完成
+    onOpenGroupSettings: () -> Unit = {},
     onStartVoiceMode: (() -> Unit)? = null,
 ) {
     val settings = LocalSettings.current
@@ -351,7 +354,7 @@ internal fun FilesPicker(
 
         // Auto Compress Model
         if (assistant.enableAutoCompress) {
-            val fixedCompressModelName = settings.findModelById(settings.compressModelId)?.displayName
+            val fixedCompressModelName = settings.findModelById(settings.compressModelId)?.displayLabel(settings.providers)
                 ?: stringResource(R.string.chat_page_compress_no_model)
             ListItem(
                 headlineContent = {
@@ -362,7 +365,7 @@ internal fun FilesPicker(
                         AutoCompressionModelOption(
                             selected = assistant.autoCompressModelSource == AutoCompressModelSource.CURRENT_CHAT,
                             title = stringResource(R.string.chat_page_compress_current_model),
-                            modelName = currentChatModel?.displayName
+                            modelName = currentChatModel?.displayLabel(settings.providers)
                                 ?: stringResource(R.string.chat_page_compress_no_model),
                             onClick = {
                                 onUpdateAssistant(assistant.copy(autoCompressModelSource = AutoCompressModelSource.CURRENT_CHAT))
@@ -545,7 +548,7 @@ internal fun FilesPicker(
                     )
                     overrides.forEach { override ->
                         key(override.modelId) {
-                            val modelName = settings.findModelById(override.modelId)?.displayName
+                            val modelName = settings.findModelById(override.modelId)?.displayLabel(settings.providers)
                                 ?: stringResource(R.string.chat_page_auto_compress_special_model_missing)
                             Surface(
                                 shape = RoundedCornerShape(10.dp),
@@ -611,7 +614,7 @@ internal fun FilesPicker(
             // 点数值标签后弹出的小编辑框：数字输入 + 快捷档位，改动即时保存。
             val editingOverride = overrides.firstOrNull { it.modelId == editingOverrideId }
             if (editingOverride != null) {
-                val editingName = settings.findModelById(editingOverride.modelId)?.displayName
+                val editingName = settings.findModelById(editingOverride.modelId)?.displayLabel(settings.providers)
                     ?: stringResource(R.string.chat_page_auto_compress_special_model_missing)
                 var editingValueK by remember(editingOverride.modelId) {
                     mutableStateOf(((editingOverride.triggerTokens + 999) / 1_000).toString())
@@ -952,7 +955,7 @@ internal fun FilesPicker(
                 )
                 roundTableMembers.forEach { modelId ->
                     key(modelId) {
-                        val memberName = settings.findModelById(modelId)?.displayName
+                        val memberName = settings.findModelById(modelId)?.displayLabel(settings.providers)
                             ?: stringResource(R.string.round_table_member_missing)
                         Surface(
                             shape = RoundedCornerShape(10.dp),
@@ -1003,7 +1006,7 @@ internal fun FilesPicker(
                 RoundTableModelRow(
                     title = stringResource(R.string.round_table_main_model),
                     modelName = roundTable.mainModelId
-                        ?.let { settings.findModelById(it)?.displayName }
+                        ?.let { settings.findModelById(it)?.displayLabel(settings.providers) }
                         ?: stringResource(R.string.round_table_main_model_follow_chat),
                     showClear = roundTable.mainModelId != null,
                     onClear = { updateRoundTable { it.copy(mainModelId = null) } },
@@ -1025,7 +1028,7 @@ internal fun FilesPicker(
                     RoundTableModelRow(
                         title = stringResource(R.string.round_table_contract_model),
                         modelName = roundTable.contractModelId
-                            ?.let { settings.findModelById(it)?.displayName }
+                            ?.let { settings.findModelById(it)?.displayLabel(settings.providers) }
                             ?: stringResource(R.string.round_table_model_follow_main),
                         showClear = roundTable.contractModelId != null,
                         onClear = { updateRoundTable { it.copy(contractModelId = null) } },
@@ -1054,7 +1057,7 @@ internal fun FilesPicker(
                     RoundTableModelRow(
                         title = stringResource(R.string.round_table_rebuttal_model),
                         modelName = roundTable.rebuttalModelId
-                            ?.let { settings.findModelById(it)?.displayName }
+                            ?.let { settings.findModelById(it)?.displayLabel(settings.providers) }
                             ?: stringResource(R.string.round_table_model_follow_main),
                         showClear = roundTable.rebuttalModelId != null,
                         onClear = { updateRoundTable { it.copy(rebuttalModelId = null) } },
@@ -1090,6 +1093,36 @@ internal fun FilesPicker(
                 )
             }
         }
+
+        // v313：讨论群组入口。与圆桌并列但刻意分开：圆桌是一次性流水线，
+        // 群组是可反复继续的共享时间线。这里只打开设置弹窗，不在菜单里塞成员选择，
+        // 免得这张卡越来越长（用户提过「不要散落在外面」）。
+        ListItem(
+            leadingContent = {
+                Icon(
+                    imageVector = HugeIcons.Settings02,
+                    contentDescription = null,
+                    modifier = Modifier.size(22.dp),
+                )
+            },
+            headlineContent = { Text("讨论群组") },
+            supportingContent = {
+                Text(
+                    text = "多个模型互相接话讨论，缺条件时会问你",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            },
+            colors = ListItemDefaults.colors(
+                containerColor = MaterialTheme.colorScheme.surfaceContainer
+            ),
+            modifier = Modifier
+                .clip(MaterialTheme.shapes.large)
+                .clickable {
+                    onDismiss()
+                    onOpenGroupSettings()
+                },
+        )
 
         // v224：子代理的全部设置收进这张折叠卡（默认收起），并排在圆桌之后。
         // 用户原话：「把子代理这些东西都放到一起，不要散落在外面影响我启用圆桌模式」。
@@ -1196,7 +1229,7 @@ internal fun FilesPicker(
                 RoundTableModelRow(
                     title = stringResource(R.string.agent_tools_model_title),
                     modelName = settings.agentModelId
-                        ?.let { settings.findModelById(it)?.displayName }
+                        ?.let { settings.findModelById(it)?.displayLabel(settings.providers) }
                         ?: stringResource(R.string.agent_tools_model_follow_main),
                     showClear = settings.agentModelId != null,
                     onClear = { onUpdateSettings(settings.copy(agentModelId = null)) },
@@ -1522,7 +1555,7 @@ internal fun FilesPicker(
                     RoundTableModelRow(
                         title = stringResource(titleRes),
                         modelName = settings.agentRoleModelOverrides[role]
-                            ?.let { settings.findModelById(it)?.displayName }
+                            ?.let { settings.findModelById(it)?.displayLabel(settings.providers) }
                             ?: stringResource(R.string.agent_tools_role_follow_default),
                         showClear = settings.agentRoleModelOverrides[role] != null,
                         onClear = {
@@ -1556,7 +1589,9 @@ internal fun FilesPicker(
                 }
                 agentFallbackModelIds.forEach { fallbackId ->
                     key(fallbackId) {
-                        val fallbackName = settings.findModelById(fallbackId)?.displayName
+                        // v311：带上供应商名 —— 否则两家同名模型在列表里长得一模一样
+                        val fallbackName = settings.findModelById(fallbackId)
+                            ?.displayLabel(settings.providers)
                             ?: stringResource(R.string.agent_tools_fallback_missing)
                         Surface(
                             shape = RoundedCornerShape(10.dp),
@@ -1635,7 +1670,8 @@ internal fun FilesPicker(
                         agentChainModelIds.forEachIndexed { index, chainId ->
                             Text(
                                 text = "${index + 1}. " +
-                                    (settings.findModelById(chainId)?.displayName ?: ""),
+                                    (settings.findModelById(chainId)
+                                        ?.displayLabel(settings.providers) ?: ""),
                                 style = MaterialTheme.typography.labelLarge,
                                 color = chainTextColor,
                                 maxLines = 1,
@@ -1789,9 +1825,9 @@ internal fun FilesPicker(
         CompressContextDialog(
             currentModelName = settings.findModelById(
                 assistant.chatModelId ?: settings.chatModelId
-            )?.displayName ?: stringResource(R.string.chat_page_compress_no_model),
+            )?.displayLabel(settings.providers) ?: stringResource(R.string.chat_page_compress_no_model),
             fixedModelName = settings.findModelById(settings.compressModelId)
-                ?.displayName ?: stringResource(R.string.chat_page_compress_no_model),
+                ?.displayLabel(settings.providers) ?: stringResource(R.string.chat_page_compress_no_model),
             initialCustomPrompt = if (settings.compressPrompt == DEFAULT_COMPRESS_PROMPT) {
                 ""
             } else {

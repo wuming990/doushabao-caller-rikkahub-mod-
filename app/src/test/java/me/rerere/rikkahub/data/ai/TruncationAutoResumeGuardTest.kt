@@ -567,12 +567,20 @@ class TruncationAutoResumeGuardTest {
             handler.contains("val regenerating = resumeStrategy == ResumeStrategy.REGENERATE") &&
                 handler.contains("if (regenerating) {")
         )
-        // 主对话唯一接线
+        // 主对话接线。
+        // ⚠️ v314 起不再断言「恰好一次」：群成员发言也接了续跑（次数来自群自己的设置
+        // GroupChatConfig.resumeMax），所以 ChatService 里有两处显式传。
+        // 要守住的是**主对话那一趟必须同时传次数与方式** —— 群那处传的是 groupResumeMax，
+        // 不会被下面这条命中。
         val chat = source("app/src/main/java/me/rerere/rikkahub/service/ChatService.kt")
-        assertEquals(
-            "主对话应恰好一次显式传 resumeStrategy",
-            1,
-            Regex("resumeStrategy = settings\\.resumeStrategy").findAll(chat).count()
+        assertTrue(
+            "主对话必须显式传续跑次数（群走自己那条，不读这条滑条）",
+            chat.contains("truncationAutoResumeMax = settings.truncationAutoResumeMax,")
+        )
+        val mainTurn = chat.substringAfter("truncationAutoResumeMax = settings.truncationAutoResumeMax,")
+        assertTrue(
+            "主对话那一趟必须紧跟 resumeStrategy（主对话续跑方式的唯一来源）",
+            mainTurn.take(400).contains("resumeStrategy = settings.resumeStrategy,")
         )
         // 设置页二选一 + 双语文案
         val ui = source(settingUiPath)

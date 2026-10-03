@@ -24,6 +24,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onCompletion
@@ -78,6 +79,7 @@ import me.rerere.rikkahub.data.ai.tools.local.LocalTools
 import me.rerere.rikkahub.data.ai.tools.local.LocalToolOption
 import me.rerere.rikkahub.data.ai.tools.local.providerHostOf
 import me.rerere.rikkahub.data.ai.tools.createSearchTools
+import me.rerere.rikkahub.data.ai.tools.createSearchToolsForGeneration
 import me.rerere.rikkahub.data.ai.tools.createSkillTools
 import me.rerere.rikkahub.data.ai.tools.createRoundTableReadOnlyWorkspaceTools
 import me.rerere.rikkahub.agent.model.AgentReport
@@ -104,17 +106,22 @@ import me.rerere.rikkahub.data.datastore.AutoCompressModelOverride
 import me.rerere.rikkahub.data.datastore.MAX_ROUND_TABLE_MEMBERS
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.SettingsStore
+import me.rerere.rikkahub.data.datastore.settingsAfterFork
 import me.rerere.rikkahub.data.datastore.findModelById
 import me.rerere.rikkahub.data.datastore.findProvider
 import me.rerere.rikkahub.data.datastore.getAssistantById
 import me.rerere.rikkahub.data.datastore.getCurrentAssistant
 import me.rerere.rikkahub.data.datastore.getCurrentChatModel
+import me.rerere.rikkahub.data.gemini.GeminiSearchClient
 import me.rerere.rikkahub.data.files.FilesManager
 import me.rerere.rikkahub.data.model.Conversation
+import me.rerere.rikkahub.data.model.GroupChatConfig
+import me.rerere.rikkahub.data.model.clampResumeMax
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.AutoCompressModelSource
 import me.rerere.rikkahub.data.model.AssistantAffectScope
 import me.rerere.rikkahub.data.model.MessageNode
+import me.rerere.rikkahub.data.model.sanitizeGroupMembers
 import me.rerere.rikkahub.data.model.localFileUrls
 import me.rerere.rikkahub.data.model.replaceRegexes
 import me.rerere.rikkahub.data.model.toMessageNode
@@ -293,6 +300,18 @@ internal fun buildContextUsageInfo(
     isEstimated = reportedTokens == null,
 )
 
+private val forkTitleSuffixRegex = Regex("""\((\d+)\)$""")
+
+internal fun forkConversationTitle(sourceTitle: String, existingTitles: Set<String>): String {
+    // 源标题已带 (N) 后缀时递增序号，避免多次 fork 后叠加成 xxx(1)(1)(1)
+    val suffix = forkTitleSuffixRegex.find(sourceTitle)
+    val baseTitle = suffix?.let { sourceTitle.removeRange(it.range) } ?: sourceTitle
+    val start = suffix?.groupValues?.get(1)?.toIntOrNull()?.plus(1) ?: 1
+    return generateSequence(start) { it + 1 }
+        .map { "$baseTitle($it)" }
+        .first { it !in existingTitles }
+}
+
 internal fun createForkConversation(
     source: Conversation,
     messageNodes: List<MessageNode>,
@@ -301,9 +320,7 @@ internal fun createForkConversation(
     id = Uuid.random(),
     assistantId = source.assistantId,
     // v306 合并上游 2.5.3：分支标题按「原名(N)」自动避让同助手已有标题。
-    title = generateSequence(1) { it + 1 }
-        .map { "${source.title}($it)" }
-        .first { it !in existingTitles },
+    title = forkConversationTitle(source.title, existingTitles),
     messageNodes = messageNodes,
     customSystemPrompt = source.customSystemPrompt,
     modeInjectionIds = source.modeInjectionIds,
@@ -369,6 +386,8 @@ class ChatService(
     private val workspaceRepository: WorkspaceRepository,
     private val folderRepository: FolderRepository,
     private val agentThreadManager: me.rerere.rikkahub.agent.runtime.AgentThreadManager,
+    // v310：谷歌账号通道的独立搜索工具（google_search）用同一个客户端执行
+    private val geminiSearchClient: GeminiSearchClient,
 ) {
     // workspace 系统提示注入 (依赖 workspaceRepository, 故在类内构造)
     private val workspaceReminderTransformer = WorkspaceReminderTransformer(workspaceRepository)
@@ -602,6 +621,11 @@ class ChatService(
 
     fun sendMessage(conversationId: Uuid, content: List<UIMessagePart>, answer: Boolean = true) {
         if (content.isEmptyInputMessage()) return
+        // v314：群讨论里的「插话」——用户这句话进入讨论时间线本身，由群成员接着回应，
+        // 不再交给助手单独回一条（用户 v314 拍板「A：我说的话成为讨论的一部分」）。
+        // 判据只有一条：这个对话建过群。**没有群配置时这里什么都不做**，
+        // 下面原样走官方路径，普通对话行为一字不变（PROJECT-MANUAL §4 禁区 #13）。
+        if (answer && tryGroupInterjection(conversationId, content)) return
         val session = getOrCreateSession(conversationId)
         synchronized(session) {
             if (session.messageQueue.state.value.messages.isEmpty()) session.messageQueue.resume()
@@ -1576,12 +1600,18 @@ class ChatService(
 
     /** 顶部那一行简要状态；详细状态在控制面板里 */
     private fun buildRoundTableStatusText(state: RoundTableRunState): String {
-        if (state.phase == RoundTableRunPhase.PROPOSAL_GAP) {
+        // v313：判据从「phase == PROPOSAL_GAP」改成「有没有打开的检查点提示」。
+        // 旧写法只认出方案那一种检查点：反驳 / 最终拍板的检查点会把 phase 设回原阶段名，
+        // 于是明明在等用户点按钮，这行字却说「主模型正在综合各方案…」。
+        if (state.gapPrompt != null) {
             return context.getString(R.string.round_table_status_gap_waiting)
         }
         val now = roundTableNow()
         val running = state.seats.filter { it.status == RoundTableSeatStatus.RUNNING }
-        if (running.isEmpty()) return context.getString(R.string.round_table_status_summarizing)
+        // v313：没有座位在输出时，按**真实阶段**报，不再一律写成「正在综合各方案」。
+        // 旧行为是硬编码兜底（真机症状：看着像卡在最后一步，实际早就跑完在别处等），
+        // 用户据此无法判断是软件在等、还是中转站没挂断连接。
+        if (running.isEmpty()) return roundTablePhaseText(state.phase)
         return running.joinToString(" ｜ ") { seat ->
             val label = roundTableSeatLabel(seat)
             if (RoundTableStallPolicy.isSoftStalled(seat, now)) {
@@ -1601,6 +1631,24 @@ class ChatService(
             }
         }
     }
+
+    /**
+     * v313：没有座位在输出时，按真实阶段报状态。
+     *
+     * 旧实现这里只有一句硬编码的「主模型正在综合各方案…」，于是任务合同、出方案、
+     * 反驳三个阶段之间的空档（上一个位置刚结束、下一组还没起来）也全都被说成「正在总结」。
+     * 用户据此判断不出软件到底停在哪，也无法区分「软件在等」和「中转站没挂断连接」。
+     */
+    private fun roundTablePhaseText(phase: RoundTableRunPhase): String = context.getString(
+        when (phase) {
+            RoundTableRunPhase.CONTRACT -> R.string.round_table_status_phase_contract
+            RoundTableRunPhase.PROPOSALS -> R.string.round_table_status_phase_proposals
+            RoundTableRunPhase.PROPOSAL_GAP -> R.string.round_table_status_gap_waiting
+            RoundTableRunPhase.REBUTTAL -> R.string.round_table_status_phase_rebuttal
+            RoundTableRunPhase.SUMMARY -> R.string.round_table_status_summarizing
+            RoundTableRunPhase.FINISHED -> R.string.round_table_status_phase_finished
+        }
+    )
 
     /**
      * 建座位表。
@@ -1893,6 +1941,9 @@ class ChatService(
                     missingCount = missingCount,
                     remainingCalls = remainingCalls,
                     stage = stage,
+                    // v313：把座位清单交给界面，让它按当前勾选状态实时重算可用份数
+                    seatIds = seatIds.toSet(),
+                    seatsWithResults = coordinator.seatIdsWithResults(seatIds),
                 )
             )
             publishRoundTableState(run)
@@ -2596,6 +2647,9 @@ class ChatService(
                             usableCount = usableCount,
                             missingCount = missingCount,
                             remainingCalls = remainingCalls,
+                            // v313：方案检查点同样交给界面实时重算
+                            seatIds = proposalSeatIds.toSet(),
+                            seatsWithResults = coordinator.seatIdsWithResults(proposalSeatIds),
                         )
                     )
                     publishRoundTableState(run)
@@ -2830,6 +2884,567 @@ class ChatService(
     }
 
 
+    // ---- v313：AI 讨论群组 ----
+    //
+    // 刻意做成「新增一片、不改既有路径」：普通对话、圆桌、子代理都不看这里任何东西。
+    // 群引擎（GroupChatEngine）只负责决策，调模型与写库留在下面这个 Host 里 ——
+    // 只有 ChatService 才有 generationLoop、工具装配和带锁的原子写库。
+
+    private val groupRuns = ConcurrentHashMap<Uuid, GroupChatRun>()
+    private val groupRunFlows = ConcurrentHashMap<Uuid, MutableStateFlow<GroupRunState?>>()
+    // v318：每个 run 一条「状态 → 面板」的订阅。
+    private val groupRunSubs = ConcurrentHashMap<Uuid, Job>()
+
+    /** 界面订阅它显示「谁在说话 / 这批跑了几条 / 在等你回答」 */
+    internal fun getGroupRunFlow(conversationId: Uuid): StateFlow<GroupRunState?> =
+        groupRunFlows.getOrPut(conversationId) { MutableStateFlow(null) }.asStateFlow()
+
+    /**
+     * v318：把 run 的真实状态**持续**转发给面板。
+     *
+     * 修的是真机 bug：旧做法是在若干固定点手工 `publishGroupState`，而引擎在「成员开始说话 /
+     * 说完换人 / 答完提问继续」这些关键变化上**一个都没推**。结果是用户答完提问后，面板整批
+     * 跑完之前一直挂着「🙋 有成员在等你回答」，而成员其实早就在说话了；「🗣 xxx 正在发言」
+     * 那一行更是几乎从来没出现过。
+     *
+     * 为什么不改成「在每个改状态的地方补一行推送」：GroupChatRun 有 12 处状态变更点，
+     * 漏一处就静默退回旧毛病，而且以后新增状态还会再漏。订阅状态源是单一来源，不会漏。
+     *
+     * ⚠️ chars（当前发言已产出的字数）**刻意不参与去重判定**：流式输出时它每个分片都在变，
+     * 直通会让整页跟着高频重组。面板本来也不显示字数，所以这里只按「语义状态」变化推送。
+     */
+    private fun subscribeGroupRun(run: GroupChatRun) {
+        val conversationId = run.snapshot().conversationId
+        if (groupRunSubs[conversationId]?.isActive == true) return
+        groupRunSubs[conversationId] = appScope.launch {
+            run.state
+                .map { it.copy(chars = 0) }
+                .distinctUntilChanged()
+                .collect { publishGroupState(run) }
+        }
+    }
+
+    private fun publishGroupState(run: GroupChatRun) {
+        val snapshot = run.snapshot()
+        // v314：归属校验。解散（clearGroupRunState）会把这条 run 从 map 里摘掉，而被取消的
+        // 那个 job 收尾时仍会走到这里 —— 不加这道闸就会把刚清空的面板状态又写回去，
+        // 面板复活成一个「按钮还在、点了没反应」的空壳（审查位 v314 抓的竞态）。
+        if (groupRuns[snapshot.conversationId] !== run) return
+        groupRunFlows.getOrPut(snapshot.conversationId) { MutableStateFlow(null) }.value = snapshot
+    }
+
+    private fun groupEngine(conversationId: Uuid): Pair<GroupChatRun, GroupChatEngine> {
+        val run = groupRuns.getOrPut(conversationId) {
+            GroupChatRun(
+                conversationId = conversationId,
+                turnsBudget = me.rerere.rikkahub.data.model.GroupChatConfig.DEFAULT_TURNS_PER_RUN,
+            )
+        }
+        // v318：建 run 的同时挂上「状态 → 面板」的转发，重复调用安全（内部有 isActive 判重）
+        subscribeGroupRun(run)
+        val engine = GroupChatEngine(
+            run = run,
+            host = object : GroupChatEngine.Host {
+                override suspend fun settings(): Settings = settingsStore.settingsFlow.first()
+
+                override suspend fun conversation(): Conversation =
+                    getConversationFlow(conversationId).value
+
+                override suspend fun assistantFor(conversation: Conversation): Assistant {
+                    val settings = settingsStore.settingsFlow.first()
+                    return settings.getAssistantById(conversation.assistantId)
+                        ?: settings.getCurrentAssistant()
+                }
+
+                override suspend fun toolsFor(
+                    model: Model,
+                    assistant: Assistant,
+                    conversation: Conversation,
+                ): List<Tool> = chatToolFactory.createTools(
+                    settings = settingsStore.settingsFlow.first(),
+                    assistant = assistant,
+                    model = model,
+                    workspaceCwd = conversation.workspaceCwd,
+                )
+
+                override suspend fun speak(
+                    model: Model,
+                    assistant: Assistant,
+                    messages: List<UIMessage>,
+                    tools: List<Tool>,
+                    overwriteMessageId: Uuid?,
+                    persist: Boolean,
+                    onActivity: (Int) -> Unit,
+                ): UIMessage? = speakGroupTurn(
+                    conversationId = conversationId,
+                    model = model,
+                    assistant = assistant,
+                    messages = messages,
+                    tools = tools,
+                    overwriteMessageId = overwriteMessageId,
+                    persist = persist,
+                    onActivity = onActivity,
+                )
+
+                override fun displayName(modelId: Uuid?): String? =
+                    modelId?.let { settingsStore.settingsFlow.value.findModelById(it)?.displayName }
+
+                override fun reportError(error: Throwable, speakerName: String) {
+                    addError(
+                        error = error,
+                        conversationId = conversationId,
+                        title = "「$speakerName」这一轮失败",
+                    )
+                }
+
+                override fun setStatus(text: String?) {
+                    sessionManager.get(conversationId)?.processingStatus?.value = text
+                }
+            },
+        )
+        return run to engine
+    }
+
+    /**
+     * 让一个成员说一次话，并把这条发言写进对话。
+     *
+     * ⚠️ 刻意**不用** updateCurrentMessages：引擎给的上文里多了一条「不入库的临时指令」，
+     * 那个函数按下标整表对齐，会把指令一起写进对话，之后每个成员都会收到重复的会议规则。
+     * 这里只认「最后那条助手消息」，用 upsertGroupUtterance 原地覆盖或追加。
+     */
+    private suspend fun speakGroupTurn(
+        conversationId: Uuid,
+        model: Model,
+        assistant: Assistant,
+        messages: List<UIMessage>,
+        tools: List<Tool>,
+        overwriteMessageId: Uuid?,
+        /** false = 只取回内容、一个字都不写进对话（主持人挑人用，见 GroupChatEngine.Host.speak） */
+        persist: Boolean = true,
+        onActivity: (Int) -> Unit,
+    ): UIMessage? {
+        val settings = settingsStore.settingsFlow.first()
+        val conversation = getConversationFlow(conversationId).value
+        val session = getOrCreateSession(conversationId)
+        // v314：群成员「说一半被掐断」的续写预算 —— 用**群自己的设置**，不借主对话那个开关。
+        // 主持人那次调用（persist = false）不续写：它只要一个名字，续写没有意义、还多花钱。
+        val groupResumeMax = if (persist) {
+            clampResumeMax(
+                settings.groupChatConfigs[conversationId]?.resumeMax
+                    ?: GroupChatConfig.DEFAULT_RESUME_MAX
+            )
+        } else {
+            0
+        }
+        var utteranceId = overwriteMessageId
+        var lastAssistant: UIMessage? = null
+        var lastCheckpointAt = 0L
+
+        generationLoop.generateText(
+            settings = settings,
+            model = model,
+            processingStatus = session.processingStatus,
+            messages = messages,
+            assistant = assistant,
+            conversationId = conversationId,
+            conversationSystemPrompt = conversation.customSystemPrompt,
+            conversationModeInjectionIds = conversation.modeInjectionIds,
+            conversationLorebookIds = conversation.lorebookIds,
+            workspaceCwd = conversation.workspaceCwd,
+            memories = if (assistant.useGlobalMemory) {
+                memoryRepository.getGlobalMemories()
+            } else {
+                memoryRepository.getMemoriesOfAssistant(assistant.id.toString())
+            },
+            inputTransformers = buildList {
+                addAll(inputTransformers)
+                add(templateTransformer)
+                add(workspaceReminderTransformer)
+            },
+            outputTransformers = outputTransformers,
+            tools = tools,
+            // v314：群成员发言接上「异常掐断自动接着说」——
+            // 次数来自**群自己的设置**（GroupChatConfig.resumeMax），
+            // 接口方式跟随用户全局选的那个（发「继续」/ 重新生成最后一次输出）。
+            // 仍然刻意不传「重点标色」与「工具输出上限」那两个参数（它们只在主对话与子代理
+            // 各自的路径上生效），隔离规矩不变（PROJECT-MANUAL §4 禁区 #13）。
+            // ⚠️ 注释里刻意不写那两个参数的字面量：ChatService 有一条钉了多年的反向断言
+            // （AgentV247ReadSliceTest「主对话与圆桌绝对不许被这个设置牵连」）要求整份文件
+            // 里不许出现「工具输出上限」那个参数名，注释也算 —— v314 为此真红过一次。
+            truncationAutoResumeMax = groupResumeMax,
+            resumeStrategy = settings.resumeStrategy,
+        ).collect { chunk ->
+            if (chunk !is GenerationChunk.Messages) return@collect
+            val last = chunk.messages.lastOrNull { it.role == MessageRole.ASSISTANT } ?: return@collect
+            val id = utteranceId ?: last.id.also { utteranceId = it }
+            val utterance = last.copy(id = id, modelId = model.id)
+            lastAssistant = utterance
+            onActivity(utterance.toText().length)
+            // 主持人挑人这类「只要内容、不进对话」的调用走 else 分支：
+            // 一个字都不写库。审查位抓的 P0 —— 把「乙模型」当正式发言存进讨论记录，
+            // 后面每个成员都会在上文里读到它。
+            if (!persist) return@collect
+            // 内存刷新（界面逐字看得到）
+            updateConversation(
+                conversationId,
+                upsertGroupUtterance(
+                    conversation = getConversationFlow(conversationId).value,
+                    utterance = utterance,
+                    targetMessageId = id,
+                ),
+            )
+            // 低频落库
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastCheckpointAt >= GENERATION_CHECKPOINT_INTERVAL_MS) {
+                lastCheckpointAt = now
+                runCatching {
+                    saveConversation(conversationId, getConversationFlow(conversationId).value)
+                }.onFailure {
+                    Log.e(TAG, "group checkpoint failed: $conversationId", it)
+                }
+            }
+        }
+
+        // 收尾：无论正常、异常还是取消，都把已收到的内容落库，别让用户白等
+        val finished = lastAssistant?.finishReasoning()
+        if (finished != null && persist) {
+            withContext(NonCancellable) {
+                runCatching {
+                    saveConversation(
+                        conversationId,
+                        upsertGroupUtterance(
+                            conversation = getConversationFlow(conversationId).value,
+                            utterance = finished,
+                            targetMessageId = finished.id,
+                        ),
+                    )
+                }.onFailure {
+                    Log.e(TAG, "group final save failed: $conversationId", it)
+                }
+            }
+        }
+        return finished
+    }
+
+    /**
+     * v314：群讨论插话。
+     *
+     * 用户口径（v314 拍板 A）：我说的话**成为讨论的一部分** —— 当前这位说完后轮到成员
+     * 接着讨论，大家都能看到并回应我这句话；而不是由助手单独回我一条。
+     *
+     * 实现要点（别改歪）：
+     * - 判据只有一条：`groupChatConfigs` 里有这个对话。没有 → 立刻返回 false，
+     *   `sendMessage` 原样走官方路径（**普通对话一字不变**，禁区 #13）。
+     * - 消息**立即入库**，这样下一位开口的成员在上文里就能看到
+     *   （`buildGroupTranscript` 对 USER 消息是原样保留的）。刻意不走消息队列：
+     *   排队要等这一批整批跑完才有反应，用户会以为自己的话根本没发出去。
+     * - 讨论没在跑时顺手开一批（`shouldAutoContinueAfterInterjection`），
+     *   把「我插一句 → 大家接着说」变成自动的；正在说话 / 正在等你回答时不插手。
+     * - **绝不触发助手的普通回复**：那条路会把群讨论悄悄变回一对一聊天。
+     *
+     * @return true 表示这条消息已按群插话处理，调用方必须直接返回
+     */
+    private fun tryGroupInterjection(conversationId: Uuid, content: List<UIMessagePart>): Boolean {
+        val settings = settingsStore.settingsFlow.value
+        // v315：暂停状态（enabled = false）的群不再拦截用户输入 —— 这个对话回到普通聊天
+        val config = settings.groupChatConfigs[conversationId]?.takeIf { it.enabled } ?: return false
+        val assistant = settings.getAssistantById(
+            getConversationFlow(conversationId).value.assistantId
+        ) ?: settings.getCurrentAssistant()
+        appScope.launch {
+            val parts = preprocessUserInputParts(content, assistant)
+            mutateAndSaveConversation(conversationId) { current ->
+                current.copy(
+                    messageNodes = current.messageNodes + UIMessage(
+                        role = MessageRole.USER,
+                        parts = parts,
+                    ).toMessageNode(),
+                    // v314：顺手清掉「猜你想问」—— 插话是进讨论，不该留着上一轮的助手建议
+                    // （审查位 v314 抓的 P3：旧建议点一下会塞进输入框，语境不符）
+                    chatSuggestions = emptyList(),
+                )
+            }
+            val status = groupRuns[conversationId]?.snapshot()?.status
+            // v314：用与面板同一个口径判断「成员还够不够」—— `hasEnoughMembers` 只数 id，
+            // 模型被删掉时它会说够、面板却说不够，于是插话开出一批必然空转（审查位 v314 抓的
+            // 口径不一致）。这里按「模型是否真的还在」过滤。
+            val existingModelIds = settings.providers
+                .flatMap { provider -> provider.models }
+                .map { it.id }
+                .toSet()
+            val aliveMembers = sanitizeGroupMembers(config.memberModelIds, existingModelIds)
+            if (shouldAutoContinueAfterInterjection(status) &&
+                aliveMembers.size >= GroupChatConfig.MIN_MEMBERS
+            ) {
+                startGroupDiscussion(conversationId)
+            }
+        }
+        return true
+    }
+
+    /**
+     * v315：把用户在「开始讨论」弹框里写下的题目，作为**他自己的一条发言**入库。
+     *
+     * 为什么必须入库：成员的上文来自对话本身，题目只有真的进了对话，成员才能围绕它讨论
+     * （用户口径：「第一次使用容易不知道怎么先发表最想说的话」）。
+     */
+    private suspend fun saveGroupTopic(conversationId: Uuid, topic: String, settings: Settings) {
+        val assistant = settings.getAssistantById(
+            getConversationFlow(conversationId).value.assistantId
+        ) ?: settings.getCurrentAssistant()
+        mutateAndSaveConversation(conversationId) { current ->
+            current.copy(
+                messageNodes = current.messageNodes + UIMessage(
+                    role = MessageRole.USER,
+                    parts = preprocessUserInputParts(listOf(UIMessagePart.Text(topic)), assistant),
+                ).toMessageNode(),
+                chatSuggestions = emptyList(),
+            )
+        }
+    }
+
+    /**
+     * v315：开始一批讨论 —— 先把用户写下的题目作为他的发言入库，再开一批。
+     *
+     * @param topic 用户在「开始讨论」弹框里写的、这次想问什么。为空表示直接开跑（不强制填表）；
+     *   插话那条路径不传（插话内容本身就是发言）。
+     */
+    fun startGroupDiscussion(conversationId: Uuid, topic: String? = null) {
+        val settings = settingsStore.settingsFlow.value
+        // v315：只有「启用」状态的群才开跑（暂停 = 配置留着但不用）
+        val config = settings.groupChatConfigs[conversationId]?.takeIf { it.enabled } ?: return
+        val session = getOrCreateSession(conversationId)
+        val (run, engine) = groupEngine(conversationId)
+        val budget = me.rerere.rikkahub.data.model.clampGroupTurns(config.turnsPerRun)
+        val trimmedTopic = topic?.trim().orEmpty()
+        if (!run.beginRun(budget)) {
+            // 正在说话 / 正在等用户回答时不该重复开跑（会双份花钱、会互相插话）。
+            // v315：这种时候**先把用户写的题目落下来**，别让它无声消失 ——
+            // 弹框已经关掉了，丢了他就白写一遍（复审位 v315 抓的窄口）。
+            if (trimmedTopic.isNotEmpty()) {
+                appScope.launch { runCatching { saveGroupTopic(conversationId, trimmedTopic, settings) } }
+            }
+            publishGroupState(run)
+            return
+        }
+        publishGroupState(run)
+
+        val previousJob = session.getJob()
+        previousJob?.cancel()
+        val job = launchGenerationJob(conversationId) {
+            try {
+                runCatching { previousJob?.join() }
+                if (trimmedTopic.isNotEmpty()) {
+                    saveGroupTopic(conversationId, trimmedTopic, settings)
+                }
+                engine.advanceTurns()
+            } catch (e: CancellationException) {
+                run.markStopped()
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "group discussion failed", e)
+                addError(e, conversationId, title = "群讨论出错")
+                run.markStopped()
+            } finally {
+                withContext(NonCancellable) {
+                    runCatching { saveConversation(conversationId, getConversationFlow(conversationId).value) }
+                    session.processingStatus.value = null
+                    publishGroupState(run)
+                }
+            }
+        }
+        session.setJob(job)
+    }
+
+    /**
+     * 用户不想回答这次提问：照 v300「跳过」的既有做法把「未作答」如实回传给提问的成员，
+     * 由 TA 基于现有信息接着说下去。
+     *
+     * 为什么不直接清掉等待状态就完事：那样会留下一条**永远没执行**的提问工具调用。
+     * 带着它发下一轮请求，服务商可能因为「有工具调用没有对应结果」直接拒收
+     * （商汤网关对表外字段是拒收不是忽略，手册里记过）。
+     *
+     * 审查位抓的 P0 场景（提问后点停止 → 工具被标成已取消 → 判据永远不再成立 →
+     * 群卡在「等你回答」）由 answerGroupQuestion 里的兜底分支处理。
+     */
+    fun skipGroupQuestion(conversationId: Uuid) {
+        val run = groupRuns[conversationId] ?: return
+        // v314：同样要倒着找 —— 用户插话之后，最后一条已经不是那位成员的提问消息了
+        val pending = findPendingGroupAsk(getConversationFlow(conversationId).value)
+        if (pending == null) {
+            // 提问已经被作废（例如用户点了停止，工具被标成已取消）：
+            // 判据永远不会再成立，只能就地落回可继续状态，否则整场焊死
+            run.markQuestionAbandoned()
+            publishGroupState(run)
+            sessionManager.get(conversationId)?.processingStatus?.value = null
+            return
+        }
+        val wasAnswered = answerGroupQuestion(
+            conversationId = conversationId,
+            toolCallId = pending.second.toolCallId,
+            answer = GROUP_SKIP_ANSWER,
+        )
+        // v314：兜底。answerGroupQuestion 在「那条提问已经不是 Pending」（例如被拒/已作废）
+        // 时会诚实返回 false —— 但用户点了「跳过」就必须看到效果，否则面板会一直挂着
+        // 「有成员在等你回答」。这里落回可继续状态，与上面那条兜底同一个道理。
+        if (!wasAnswered) {
+            run.markQuestionAbandoned()
+            publishGroupState(run)
+            sessionManager.get(conversationId)?.processingStatus?.value = null
+        }
+    }
+
+    /** 停止这场讨论（保留已经说过的内容） */
+    suspend fun stopGroupDiscussion(conversationId: Uuid) {
+        groupRuns[conversationId]?.markStopped()
+        groupRuns[conversationId]?.let { publishGroupState(it) }
+        val session = sessionManager.get(conversationId) ?: return
+        session.setJob(null)
+        session.processingStatus.value = null
+    }
+
+    /**
+     * v314：从后往前找「那条还挂着未执行提问工具的助手消息」。
+     *
+     * ⚠️ 不能只看 `currentMessages.lastOrNull()`（v313 的写法）—— 用户在成员提问期间插话之后，
+     * 最后一条会变成用户消息，这个判据就再也匹配不上：回答会掉回主对话路径（变成 A 提问、
+     * B 回答），面板还会一直卡在「有成员在等你回答」。审查位 v314 抓的 P1。
+     *
+     * @param toolCallId 指定时只认这一个工具调用；为空时取最近的一条提问
+     */
+    private fun findPendingGroupAsk(
+        conversation: Conversation,
+        toolCallId: String? = null,
+    ): Pair<UIMessage, UIMessagePart.Tool>? {
+        for (message in conversation.currentMessages.asReversed()) {
+            val tool = message.getTools().firstOrNull { candidate ->
+                candidate.toolName == GROUP_ASK_USER_TOOL_NAME &&
+                    !candidate.isExecuted &&
+                    (toolCallId == null || candidate.toolCallId == toolCallId)
+            }
+            if (tool != null) return message to tool
+        }
+        return null
+    }
+
+    /**
+     * 成员向用户提问后，用户给出回答。
+     *
+     * 返回 true 表示「这是群里的提问，我已经接手」；false 表示不是群对话，
+     * 调用方（ChatVM）应当照原路走主对话的 handleToolApproval。
+     *
+     * 这个分岔是**必须**的：主对话那条路会把续跑交给助手默认模型，
+     * 群里会变成「A 提问、B 回答」。判据用群引擎自己的状态，
+     * 不用「消息里有 pending 工具」—— 后者在普通对话也成立，会把主对话一起改掉。
+     */
+    fun answerGroupQuestion(
+        conversationId: Uuid,
+        toolCallId: String,
+        answer: String,
+    ): Boolean {
+        val run = groupRuns[conversationId] ?: return false
+        if (!run.isWaitingForUserAnswer()) return false
+        // v314：从后往前找那条挂着提问的助手消息（用户中途插话会让「最后一条」变成
+        // 用户消息，只认最后一条的话这里会失配 → 掉回主对话路径，A 提问 B 回答）。
+        val (lastMessage, pendingAsk) = findPendingGroupAsk(
+            getConversationFlow(conversationId).value,
+            toolCallId,
+        )?.takeIf { (_, tool) -> tool.approvalState is ToolApprovalState.Pending }
+            ?: return false
+
+        val session = getOrCreateSession(conversationId)
+        val (_, engine) = groupEngine(conversationId)
+        val previousJob = session.getJob()
+        previousJob?.cancel()
+        // 写答案与续跑都放进同一个协程：这里**不能**用 runBlocking —— 本函数由界面线程调用，
+        // 阻塞等待落库会卡住界面（手册 §7.1 那类「界面卡在…」事故的同一个根因）。
+        val job = launchGenerationJob(conversationId) {
+            try {
+                runCatching { previousJob?.join() }
+                // 1) 先把答案写进那条工具调用（成员续写时靠它认出自己的问题已被回答）
+                mutateAndSaveConversation(conversationId) { current ->
+                    current.copy(
+                        messageNodes = current.messageNodes.map { node ->
+                            if (node.messages.none { msg -> msg.id == lastMessage.id }) node
+                            else node.copy(
+                                messages = node.messages.map { msg ->
+                                    if (msg.id != lastMessage.id) msg
+                                    else msg.copy(
+                                        parts = msg.parts.map { part ->
+                                            if (part is UIMessagePart.Tool &&
+                                                part.toolCallId == pendingAsk.toolCallId
+                                            ) {
+                                                part.copy(approvalState = ToolApprovalState.Answered(answer))
+                                            } else {
+                                                part
+                                            }
+                                        },
+                                    )
+                                },
+                            )
+                        },
+                    )
+                }
+                // 2) 再由**提问的那位成员**接着说
+                engine.resumeAfterUserAnswer()
+            } catch (e: CancellationException) {
+                run.markStopped()
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "group resume failed", e)
+                addError(e, conversationId, title = "群讨论出错")
+                run.markStopped()
+            } finally {
+                withContext(NonCancellable) {
+                    runCatching { saveConversation(conversationId, getConversationFlow(conversationId).value) }
+                    session.processingStatus.value = null
+                    publishGroupState(run)
+                }
+            }
+        }
+        session.setJob(job)
+        return true
+    }
+
+    /** 建群 / 改群设置后调用，让界面立刻反映新的批次与成员 */
+    internal fun refreshGroupState(conversationId: Uuid) {
+        groupRuns[conversationId]?.let { publishGroupState(it) }
+    }
+
+    /**
+     * v314：解散群之后把面板状态一并清掉。
+     *
+     * 只删配置不清状态的话，面板会残留成一个空壳：主按钮写着「继续讨论」，点下去因为
+     * 配置没了直接 return（点了没反应）—— 正是这一版要消灭的那类体验（审查位 v314 抓的 P1）。
+     *
+     * ⚠️ 只把值置空、**不要** remove 这条 flow：界面订阅的是同一个 flow 对象，
+     * remove 掉的话订阅方永远收不到「变成 null」这件事，面板就下不去了。
+     */
+    internal fun clearGroupRunState(conversationId: Uuid) {
+        groupRuns.remove(conversationId)
+        // v318：解除状态转发订阅。run.state 是无限流，不取消的话这个协程会一直挂着（泄漏），
+        // 而且下次给同一对话建群时会被 isActive 判成「还活着」而拒绝重新订阅。
+        groupRunSubs.remove(conversationId)?.cancel()
+        groupRunFlows[conversationId]?.value = null
+    }
+
+    /**
+     * v318：对话被删除时释放群相关的内存态。
+     *
+     * 审查位 v318 抓的 P2：删除对话原本不碰 clearGroupRunState。在 v317 之前那只是
+     * 两张表里留个无用条目；但 v318 加了「状态 → 面板」的转发订阅之后，不取消就是
+     * **一个永远挂着的协程**（run.state 是无限流），所以这条从"洁癖"升级成必修。
+     *
+     * 顺序照 v314 的解散口径：先停（可能正在说话）→ 再清状态与订阅。
+     *
+     * ⚠️ 只清内存态，**不动 DataStore 里的群配置条目** —— 那是既有行为，
+     * 用户没有要求本轮改，且删设置属于不可逆动作（见手册 §9 第 2 条）。
+     */
+    suspend fun releaseGroupStateOnDelete(conversationId: Uuid) {
+        stopGroupDiscussion(conversationId)
+        clearGroupRunState(conversationId)
+    }
+
     // ---- 处理工具调用审批 ----
 
     fun handleToolApproval(
@@ -3010,9 +3625,9 @@ class ChatService(
                 },
                 outputTransformers = outputTransformers,
                 tools = buildList {
-                    if (useExternalWebSearch) {
-                        addAll(createSearchTools(settings))
-                    }
+                    // v310：搜索装配统一走共享决策（谷歌账号通道 → 独立搜索工具；其它通道 → Exa），
+                    // 与 ChatToolFactory 同一口径，避免两处漂移。
+                    addAll(createSearchToolsForGeneration(settings, assistant, model, geminiSearchClient))
                     // v300：商汤 + kimi 不提供 ask_user（选项会被网关吃掉）
                     addAll(
                         localTools.getTools(
@@ -3293,8 +3908,9 @@ class ChatService(
         runCatching {
             val settings = settingsStore.settingsFlow.first()
             val model = settings.findModelById(settings.fastModelId)
-                ?: return@runCatching
-            val provider = model.findProvider(settings.providers) ?: return@runCatching
+                ?: throw IllegalStateException(context.getString(R.string.error_fast_model_not_found))
+            val provider = model.findProvider(settings.providers)
+                ?: throw IllegalStateException(context.getString(R.string.error_fast_model_provider_not_found))
 
             val providerHandler = providerManager.getProviderByType(provider)
             val result = providerHandler.generateText(
@@ -3941,7 +4557,36 @@ class ChatService(
         val forkConversation = createForkConversation(currentConversation, copiedNodes, existingTitles)
 
         saveConversation(forkConversation.id, forkConversation)
+        // v318：把挂在原对话 id 上的设置带一份过来（讨论群组配置 + 对话级模型记忆）。
+        // 不带的话新分支上查不到条目，群面板会按「没建过群就不渲染」直接隐藏 ——
+        // 用户看到的就是「创建分支后讨论群组凭空消失/解散」（真机报告）。
+        // 源对话的设置一律不动：分支是复制，不是搬家。
+        carryOverForkSettings(conversationId, forkConversation.id)
         return forkConversation
+    }
+
+    /**
+     * v318：分支创建后搬运「按对话 id 存」的设置。
+     *
+     * 只在真有东西要搬时落盘（纯函数没变化时会返回同一个 Settings 对象），
+     * 避免每次分支都触发一次全量写盘。搬失败不影响分支本身 —— 对话已经建好了，
+     * 顶多是群面板这次不出现，所以这里 catch 住并如实写日志，绝不上抛。
+     */
+    private suspend fun carryOverForkSettings(sourceConversationId: Uuid, newConversationId: Uuid) {
+        val current = settingsStore.settingsFlow.first()
+        val updated = settingsAfterFork(current, sourceConversationId, newConversationId)
+        if (updated === current) return
+        // 刻意用显式 try/catch 而不是那个「一把兜住所有异常」的写法：它会连 CancellationException
+        // 一起吞掉，用户点停止时就不能立刻生效（手册 §7.1 记过这条）。
+        try {
+            settingsStore.update(updated)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // 搬失败不影响分支本身 —— 对话已经建好了，顶多是群面板这次不出现。
+            // 但必须如实留痕，不能静默。
+            Log.e(TAG, "fork: 搬运对话级设置失败 $sourceConversationId -> $newConversationId", e)
+        }
     }
 
     suspend fun selectMessageNode(

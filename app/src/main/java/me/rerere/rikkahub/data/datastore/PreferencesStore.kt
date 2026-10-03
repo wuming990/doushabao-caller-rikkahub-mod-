@@ -5,22 +5,25 @@ import android.util.Log
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.decodeFromJsonElement
+import androidx.datastore.core.CorruptionException
 import androidx.datastore.core.DataStore
 import androidx.datastore.core.IOException
+import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
+import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.core.Preferences
-import androidx.datastore.preferences.SharedPreferencesMigration
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
-import androidx.datastore.preferences.preferencesDataStore
+import androidx.datastore.preferences.preferencesDataStoreFile
 import io.pebbletemplates.pebble.PebbleEngine
-import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.retryWhen
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.Transient
@@ -47,6 +50,8 @@ import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV2Migration
 import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV3Migration
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.Avatar
+import me.rerere.rikkahub.data.model.GroupChatConfig
+import me.rerere.rikkahub.data.model.GroupChatPreset
 import me.rerere.rikkahub.data.model.InjectionPosition
 import me.rerere.rikkahub.data.model.Lorebook
 import me.rerere.rikkahub.data.model.PromptInjection
@@ -62,6 +67,8 @@ import me.rerere.search.SearchServiceOptions
 import me.rerere.tts.provider.TTSProviderSetting
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.get
+import java.io.File
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.uuid.Uuid
 
 private const val TAG = "PreferencesStore"
@@ -90,6 +97,27 @@ private fun decodeProvidersTolerant(raw: String): List<ProviderSetting> {
 }
 
 /**
+ * v316：群方案列表的**逐条**容错解码（复审位抓的 P2：原本整表 decodeFromString，
+ * 一条坏数据会让 8 个方案全部读不出来 = 用户以为方案全丢了）。
+ *
+ * 写法照上面的 [decodeProvidersTolerant]，是本项目 v274 定下的同一套做法。
+ */
+private fun decodeGroupPresetsTolerant(raw: String): List<GroupChatPreset> {
+    if (raw.isBlank()) return emptyList()
+    val array = runCatching {
+        JsonInstant.parseToJsonElement(raw) as? JsonArray
+    }.getOrNull() ?: return emptyList()
+    return array.mapNotNull { element ->
+        try {
+            JsonInstant.decodeFromJsonElement<GroupChatPreset>(element)
+        } catch (e: SerializationException) {
+            Log.w(TAG, "Skipping unrecognised group preset entry during decode: ${e.message}")
+            null
+        }
+    }.take(GroupChatPreset.MAX_PRESETS)
+}
+
+/**
  * v274：GeminiOAuth 归一化分支的 models 变换（照搬 ExTV）：按 id 去重，
  * 再剔除 modelId 命中 [DENIED_MODEL_IDS] 的条目。
  *
@@ -99,16 +127,41 @@ private fun decodeProvidersTolerant(raw: String): List<ProviderSetting> {
 private fun dropDeniedGeminiOAuthModels(models: List<Model>): List<Model> =
     models.distinctBy { model -> model.id }.filterNot { model -> model.modelId in DENIED_MODEL_IDS }
 
-private val Context.settingsStore by preferencesDataStore(
-    name = "settings",
-    produceMigrations = { context ->
-        listOf(
+private const val SETTINGS_STORE_NAME = "settings"
+
+// v311：跟随上游 2.5.5 —— 读取失败时的最大重试次数
+private const val READ_MAX_RETRIES = 3
+
+@Volatile
+private var settingsDataStore: DataStore<Preferences>? = null
+
+// 进程内单例, 同一文件只能存在一个 DataStore 实例
+private val Context.settingsStore: DataStore<Preferences>
+    get() = settingsDataStore ?: synchronized(SettingsStore::class) {
+        settingsDataStore ?: createSettingsDataStore(applicationContext).also { settingsDataStore = it }
+    }
+
+private fun createSettingsDataStore(context: Context): DataStore<Preferences> {
+    val file = context.preferencesDataStoreFile(SETTINGS_STORE_NAME)
+    return PreferenceDataStoreFactory.create(
+        corruptionHandler = ReplaceFileCorruptionHandler { exception ->
+            // 文件已损坏无法解析, 先留一份原文件用于排查/抢救, 再重建为空
+            Log.e(TAG, "Settings datastore corrupted, resetting", exception)
+            runCatching {
+                file.copyTo(File(file.parentFile, "${file.name}.corrupt-${System.currentTimeMillis()}"))
+            }.onFailure {
+                Log.e(TAG, "Failed to backup corrupted settings file", it)
+            }
+            emptyPreferences()
+        },
+        migrations = listOf(
             PreferenceStoreV1Migration(),
             PreferenceStoreV2Migration(),
             PreferenceStoreV3Migration()
-        )
-    }
-)
+        ),
+        produceFile = { file },
+    )
+}
 
 class SettingsStore(
     context: Context,
@@ -231,6 +284,25 @@ class SettingsStore(
 
         /** v268：对话 → 最后使用模型 的映射（JSON: Map<conversationId, modelId>，均为 Uuid 字符串）。 */
         val CONVERSATION_MODEL_IDS = stringPreferencesKey("conversation_model_ids")
+
+        /**
+         * v313：对话 → 群组设置 的映射（JSON: Map<conversationId, GroupChatConfig>）。
+         *
+         * 刻意存 DataStore 而不是给 Conversation 加列：AppDatabase 必须停在 25，
+         * 加列＝升版本＋迁移，风险落在用户全部聊天记录上（禁区 #1）。
+         * 与 v268 那份映射同一套取舍：已删除对话的残留条目无害，不主动清理。
+         */
+        val GROUP_CHAT_CONFIGS = stringPreferencesKey("group_chat_configs")
+
+        /**
+         * v316：用户自己存的讨论群**方案**列表（全局共享，不按对话隔离）。
+         *
+         * 与 GROUP_CHAT_CONFIGS 的区别必须分清：那份是「某个对话当前的群配置」，
+         * 这份是「用户攒好的、可以反复套用的整套配置」。存成 JSON 数组而不是 map，
+         * 因为方案要保序（用户说的「选择方案几」就是按顺序数出来的）。
+         * 同样刻意存 DataStore —— AppDatabase 必须停在 25（禁区 #1）。
+         */
+        val GROUP_CHAT_PRESETS = stringPreferencesKey("group_chat_presets")
 
         /** v268：手动压缩上次选择的模式（true = 经典压缩）。 */
         val COMPRESS_USE_CLASSIC_MODE = booleanPreferencesKey("compress_use_classic_mode")
@@ -357,7 +429,15 @@ class SettingsStore(
                 preferences[CONVERSATION_MODEL_IDS] = JsonInstant.encodeToString(
                     settings.conversationModelIds.mapKeys { it.key.toString() }.mapValues { it.value.toString() }
                 )
+                // v313：群组设置。键手工转成字符串 —— 与上面 conversationModelIds 同一套写法，
+                // 不依赖 Uuid 当 JSON map 键的序列化能力（值本身是 @Serializable，直接整份序列化）。
+                preferences[GROUP_CHAT_CONFIGS] = JsonInstant.encodeToString(
+                    settings.groupChatConfigs.mapKeys { it.key.toString() }
+                )
                 preferences[COMPRESS_USE_CLASSIC_MODE] = settings.compressUseClassicMode
+                // v316：用户方案列表（数组保序，无需转键）。空列表也照写 ——
+                // 只在「一条都没有」时删掉这个键会让 DataStore 里残留旧数据，反而更糟。
+                preferences[GROUP_CHAT_PRESETS] = JsonInstant.encodeToString(settings.groupChatPresets)
                 preferences[AGENT_CONVERSATION_SEARCH] = settings.allowAgentConversationSearch
                 preferences[AGENT_MAX_STEPS] = settings.agentMaxSteps.coerceIn(16, 96)
                 // v220 修复：子代理开关与默认模型必须落盘，否则下一次 DataStore 发射会恢复默认
@@ -417,13 +497,16 @@ class SettingsStore(
 
     private val dataStore = context.settingsStore
 
+    // 读取失败时绝不能回退为空配置, 否则默认值会被当成用户数据写回, 覆盖全部设置
+    // 偶发 IO 错误重试, 仍失败则向上抛出 (文件损坏由 corruptionHandler 处理)
     val settingsFlowRaw = dataStore.data
-        .catch { exception ->
-            if (exception is IOException) {
-                emit(emptyPreferences())
-            } else {
-                throw exception
+        .retryWhen { cause, attempt ->
+            val shouldRetry = cause is IOException && cause !is CorruptionException && attempt < READ_MAX_RETRIES
+            if (shouldRetry) {
+                Log.w(TAG, "Failed to read settings, retrying (${attempt + 1}/$READ_MAX_RETRIES)", cause)
+                delay((100L shl attempt.toInt()).milliseconds)
             }
+            shouldRetry
         }.map { preferences ->
             Settings(
                 favoriteModels = preferences[FAVORITE_MODELS]?.let {
@@ -465,7 +548,25 @@ class SettingsStore(
                             .mapValues { Uuid.parse(it.value) }
                     }.getOrDefault(emptyMap())
                 } ?: emptyMap(),
+                // v313：群组设置。解不出来的坏 JSON 一律退回空表 ——
+                // 这份设置坏了不能连带把整个 Settings 读崩（手册里「设置读取失败被重置」
+                // 就是官方真踩过的同类事故），所以这里必须 runCatching。
+                groupChatConfigs = preferences[GROUP_CHAT_CONFIGS]?.let { raw ->
+                    runCatching {
+                        JsonInstant.decodeFromString<Map<String, GroupChatConfig>>(raw)
+                            .mapNotNull { (key, value) ->
+                                runCatching { Uuid.parse(key) }.getOrNull()?.let { it to value }
+                            }
+                            .toMap()
+                    }.getOrDefault(emptyMap())
+                } ?: emptyMap(),
                 compressUseClassicMode = preferences[COMPRESS_USE_CLASSIC_MODE] == true,
+                // v316：方案列表。坏 JSON / 坏结构一律退回空表 —— 与 groupChatConfigs 同一理由：
+                // 这份设置坏了绝不能连带把整个 Settings 读崩。条数在读取时夹住上限，
+                // 免得手改或旧版本残留把界面撑爆。
+                groupChatPresets = preferences[GROUP_CHAT_PRESETS]?.let { raw ->
+                    decodeGroupPresetsTolerant(raw)
+                } ?: emptyList(),
                 // v280：默认必须是关 —— 缺 key 时要得到 false，所以用 `== true` 而不是 `!= false`
                 allowAgentConversationSearch = preferences[AGENT_CONVERSATION_SEARCH] == true,
                 agentMaxSteps = (preferences[AGENT_MAX_STEPS] ?: 32).coerceIn(16, 96),
@@ -585,8 +686,19 @@ class SettingsStore(
             // v305（用户拍板「一并清掉」）：清掉语音合成表里预置的 AiHubMix 广告位，
             // 同口径 —— 填过密钥的保留不动。
             ttsProviders = ttsProviders.filterNot { it.shouldDropRemovedAdTtsProvider() }.toMutableList()
+            // v311：消除跨供应商的重复模型编号（用户真机反馈「同名模型换了供应商的
+            // 那个，实际还是在跑旧的；候选链里的同名替补被直接跳过」）。
+            // 口径是「保留第一个持有者的编号、只给后面撞号的重发」，因此所有既有引用
+            // 的实际指向不变（编号重复时 findModelById 本来就只会返回第一个持有者）。
+            // 刻意不回写 DataStore：这段在读设置的 map 里，往里写会自触发重算；
+            // 重发是确定性的（同一份脏数据每次算出同一批新号），而用户任何一次改设置
+            // 都会把修好的列表落盘，自然收敛。
+            val deduped = dedupeModelIds(providers)
+            if (deduped.reissued > 0) {
+                Log.w(TAG, "v311: reissued ${deduped.reissued} duplicated model ids")
+            }
             it.copy(
-                providers = providers,
+                providers = deduped.providers,
                 assistants = assistants,
                 ttsProviders = ttsProviders,
             )
@@ -732,6 +844,16 @@ class SettingsStore(
 
     suspend fun update(fn: (Settings) -> Settings) {
         update(fn(settingsFlow.value))
+    }
+
+    // 只原子地修改单个 key, 不能用 update() 写回整份快照
+    suspend fun incrementLaunchCount(): Int {
+        var count = 0
+        dataStore.edit { preferences ->
+            count = (preferences[LAUNCH_COUNT] ?: 0) + 1
+            preferences[LAUNCH_COUNT] = count
+        }
+        return count
     }
 
     suspend fun updateAssistant(assistantId: Uuid) {
@@ -1044,6 +1166,16 @@ data class Settings(
      * 不做主动清理。
      */
     val conversationModelIds: Map<Uuid, Uuid> = emptyMap(),
+    /**
+     * v313：对话 → 群组设置。只有被显式建过群的对话才有 entry，
+     * 没有 entry 的对话与改前完全一致（群功能不会牵连普通聊天）。
+     */
+    val groupChatConfigs: Map<Uuid, GroupChatConfig> = emptyMap(),
+    /**
+     * v316：用户自己存的讨论群方案（全局共享，可在任意对话套用）。
+     * 默认空表 —— 没有方案的对话与改前完全一致（群功能不牵连普通聊天）。
+     */
+    val groupChatPresets: List<GroupChatPreset> = emptyList(),
     /** v268：手动压缩上次选择的模式（true = 经典压缩，默认智能压缩）。 */
     val compressUseClassicMode: Boolean = false,
     /**
@@ -1207,6 +1339,18 @@ data class DisplaySetting(
      * DisplaySetting 整体 JSON 序列化，带默认值的新字段对旧数据向下兼容，无需迁移。
      */
     val showConversationTokenStats: Boolean = true,
+    /**
+     * v317：讨论群组面板是否收起（用户口径：「这个太占空间了，给我做一个可以折叠起来的」）。
+     *
+     * 存这里而不是 rememberSaveable：用户要的是「收一次之后就一直收着、新对话也默认收」，
+     * 页面级状态做不到（换对话就重置）。DisplaySetting 整块 JSON 序列化，
+     * **带默认值的新字段对旧数据向下兼容、不需要 DataStore key、更不动数据库版本**。
+     *
+     * 默认 false = 首次是展开的（用户拍板「默认展开，你手动收一次之后就一直记住是收着的」）。
+     * ⚠️ 字段名就是「是否收起」，别把默认值写成 true —— 那等于一装上就收着，
+     * 用户根本不知道有这块内容（主模型 v317 自查时抓到过这个自相矛盾）。
+     */
+    val groupPanelCollapsed: Boolean = false,
     val showThinkingContent: Boolean = true,
     val autoCloseThinking: Boolean = true,
     val updateCheckDisabledUntilEpochMillis: Long = 0L,

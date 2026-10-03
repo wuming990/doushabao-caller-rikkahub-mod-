@@ -76,8 +76,11 @@ data class TextGenerationParams(
     val customBody: List<CustomBody> = emptyList(),
     // v306 合并上游 2.5.3：官方把默认值从 null 改成随机 id。实际影响面已核清 ——
     // sessionId 只在两处生效（opencode.ai 的请求头、OpenRouter 请求体的 session_id），
-    // 不会给商汤这类「表外字段拒收」的网关多加字段；util/Request.kt 的
-    // configureSessionHeaders 是零调用的死函数，不受影响。
+    // 不会给商汤这类「表外字段拒收」的网关多加字段。
+    // v312 更正：util/Request.kt 的 configureSessionHeaders 在 v306 时确实零调用，
+    // 但官方 2.5.6 起 InteractionsAPI 会调用它 —— 不要当死函数删掉。
+    // 我方 GoogleProvider 的两处生成请求仍不带它（v255 起自有一套换 key 请求构建），
+    // 只有官方 InteractionsAPI 这条路在用。
     val sessionId: String? = Uuid.random().toString(),
 )
 
