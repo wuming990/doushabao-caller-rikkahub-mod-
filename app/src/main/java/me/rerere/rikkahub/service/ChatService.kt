@@ -2894,6 +2894,39 @@ class ChatService(
     private val groupRunFlows = ConcurrentHashMap<Uuid, MutableStateFlow<GroupRunState?>>()
     // v318：每个 run 一条「状态 → 面板」的订阅。
     private val groupRunSubs = ConcurrentHashMap<Uuid, Job>()
+    // v320：每个对话**当前正在开口的那位**的把手（点名换人时靠它当场撤掉还没出声的发言）
+    private val groupSpeaking = ConcurrentHashMap<Uuid, GroupSpeakingHandle>()
+
+    /**
+     * v320：正在开口成员的「可撤销把手」。
+     *
+     * 为什么要它：用户点名换人时，界面线程必须能
+     * ① 看到这位**到目前为止写了什么**（判断能不能撤），
+     * ② 只撤掉他这一位的生成（不是整批讨论）。
+     * 发言协程每收到一次流式刷新就把最新内容放进 [lastUtterance]；
+     * [abortRequestedFor] 由点名那条路**先记下目标 job、再 cancel**，用来把「用户点名换人」
+     * 与「用户点停止」分开 —— 两者都以 CancellationException 的形式冒出来，
+     * 认错就会把整批讨论误判成用户主动停止。
+     *
+     * 三个字段全是跨线程读写（界面线程写、发言协程读），一律 @Volatile。
+     */
+    private class GroupSpeakingHandle(val modelId: Uuid) {
+        @Volatile
+        var job: Job? = null
+
+        @Volatile
+        var lastUtterance: UIMessage? = null
+
+        /**
+         * v320：记下「用户撤的是**哪一个** job」。
+         *
+         * 原本是个布尔旗，判断时要靠「读旗子」+「读本协程还活着吗」两个瞬时值凑结论；
+         * 换成 job 引用后目标是唯一确定的（`===` 一比就知道是不是自己那一次），
+         * 不再依赖两次读的一致性。审查位 v320 的建议，已核实为改进。
+         */
+        @Volatile
+        var abortRequestedFor: Job? = null
+    }
 
     /** 界面订阅它显示「谁在说话 / 这批跑了几条 / 在等你回答」 */
     internal fun getGroupRunFlow(conversationId: Uuid): StateFlow<GroupRunState?> =
@@ -3040,69 +3073,136 @@ class ChatService(
         var lastAssistant: UIMessage? = null
         var lastCheckpointAt = 0L
 
-        generationLoop.generateText(
-            settings = settings,
-            model = model,
-            processingStatus = session.processingStatus,
-            messages = messages,
-            assistant = assistant,
-            conversationId = conversationId,
-            conversationSystemPrompt = conversation.customSystemPrompt,
-            conversationModeInjectionIds = conversation.modeInjectionIds,
-            conversationLorebookIds = conversation.lorebookIds,
-            workspaceCwd = conversation.workspaceCwd,
-            memories = if (assistant.useGlobalMemory) {
-                memoryRepository.getGlobalMemories()
-            } else {
-                memoryRepository.getMemoriesOfAssistant(assistant.id.toString())
-            },
-            inputTransformers = buildList {
-                addAll(inputTransformers)
-                add(templateTransformer)
-                add(workspaceReminderTransformer)
-            },
-            outputTransformers = outputTransformers,
-            tools = tools,
-            // v314：群成员发言接上「异常掐断自动接着说」——
-            // 次数来自**群自己的设置**（GroupChatConfig.resumeMax），
-            // 接口方式跟随用户全局选的那个（发「继续」/ 重新生成最后一次输出）。
-            // 仍然刻意不传「重点标色」与「工具输出上限」那两个参数（它们只在主对话与子代理
-            // 各自的路径上生效），隔离规矩不变（PROJECT-MANUAL §4 禁区 #13）。
-            // ⚠️ 注释里刻意不写那两个参数的字面量：ChatService 有一条钉了多年的反向断言
-            // （AgentV247ReadSliceTest「主对话与圆桌绝对不许被这个设置牵连」）要求整份文件
-            // 里不许出现「工具输出上限」那个参数名，注释也算 —— v314 为此真红过一次。
-            truncationAutoResumeMax = groupResumeMax,
-            resumeStrategy = settings.resumeStrategy,
-        ).collect { chunk ->
-            if (chunk !is GenerationChunk.Messages) return@collect
-            val last = chunk.messages.lastOrNull { it.role == MessageRole.ASSISTANT } ?: return@collect
-            val id = utteranceId ?: last.id.also { utteranceId = it }
-            val utterance = last.copy(id = id, modelId = model.id)
-            lastAssistant = utterance
-            onActivity(utterance.toText().length)
-            // 主持人挑人这类「只要内容、不进对话」的调用走 else 分支：
-            // 一个字都不写库。审查位抓的 P0 —— 把「乙模型」当正式发言存进讨论记录，
-            // 后面每个成员都会在上文里读到它。
-            if (!persist) return@collect
-            // 内存刷新（界面逐字看得到）
-            updateConversation(
-                conversationId,
-                upsertGroupUtterance(
-                    conversation = getConversationFlow(conversationId).value,
-                    utterance = utterance,
-                    targetMessageId = id,
-                ),
-            )
-            // 低频落库
-            val now = SystemClock.elapsedRealtime()
-            if (now - lastCheckpointAt >= GENERATION_CHECKPOINT_INTERVAL_MS) {
-                lastCheckpointAt = now
-                runCatching {
-                    saveConversation(conversationId, getConversationFlow(conversationId).value)
-                }.onFailure {
-                    Log.e(TAG, "group checkpoint failed: $conversationId", it)
+        // v320：这一次成员发言放进**可以单独取消的子协程**里跑，并把「把手」登记下来。
+        //
+        // 修的是用户真机反馈：「下一个模型只是准备开始说话，思考都没开始思考，就被锁在
+        // 这个模型了，还得强制等待这个模型说完话才能换到我选择的模型」。
+        // 旧口径是「只要有人正在说话就不许打断」，而状态从**选中他那一刻**就置成 SPEAKING
+        // （还没发请求、一个字都没吐也算正在说话），所以用户几乎永远撞在锁里。
+        // 现在：还没出声的发言可以当场撤掉（判据说 groupUtteranceHasKeptContent）。
+        //
+        // ⚠️ 只给「新发言、且要写进对话」的这一路交把手：
+        //   - 主持人挑人（persist = false）此刻状态还不是 SPEAKING，撤它没有意义；
+        //   - 答完提问的续写（overwriteMessageId != null）那条消息里带着**用户写下的答案**，
+        //     撤掉会连答案一起没掉 —— 绝不交把手（手册 v318「丢用户数据」同一族事故）。
+        val abortable = persist && overwriteMessageId == null
+        var speakerAbort: GroupSpeakerAbortedException? = null
+
+        coroutineScope {
+            val handle = if (abortable) GroupSpeakingHandle(model.id) else null
+            val speakerJob = async {
+            generationLoop.generateText(
+                settings = settings,
+                model = model,
+                processingStatus = session.processingStatus,
+                messages = messages,
+                assistant = assistant,
+                conversationId = conversationId,
+                conversationSystemPrompt = conversation.customSystemPrompt,
+                conversationModeInjectionIds = conversation.modeInjectionIds,
+                conversationLorebookIds = conversation.lorebookIds,
+                workspaceCwd = conversation.workspaceCwd,
+                memories = if (assistant.useGlobalMemory) {
+                    memoryRepository.getGlobalMemories()
+                } else {
+                    memoryRepository.getMemoriesOfAssistant(assistant.id.toString())
+                },
+                inputTransformers = buildList {
+                    addAll(inputTransformers)
+                    add(templateTransformer)
+                    add(workspaceReminderTransformer)
+                },
+                outputTransformers = outputTransformers,
+                tools = tools,
+                // v314：群成员发言接上「异常掐断自动接着说」——
+                // 次数来自**群自己的设置**（GroupChatConfig.resumeMax），
+                // 接口方式跟随用户全局选的那个（发「继续」/ 重新生成最后一次输出）。
+                // 仍然刻意不传「重点标色」与「工具输出上限」那两个参数（它们只在主对话与子代理
+                // 各自的路径上生效），隔离规矩不变（PROJECT-MANUAL §4 禁区 #13）。
+                // ⚠️ 注释里刻意不写那两个参数的字面量：ChatService 有一条钉了多年的反向断言
+                // （AgentV247ReadSliceTest「主对话与圆桌绝对不许被这个设置牵连」）要求整份文件
+                // 里不许出现「工具输出上限」那个参数名，注释也算 —— v314 为此真红过一次。
+                truncationAutoResumeMax = groupResumeMax,
+                resumeStrategy = settings.resumeStrategy,
+            ).collect { chunk ->
+                if (chunk !is GenerationChunk.Messages) return@collect
+                val last = chunk.messages.lastOrNull { it.role == MessageRole.ASSISTANT } ?: return@collect
+                val id = utteranceId ?: last.id.also { utteranceId = it }
+                // v319：打上「群组发言」标记。解散/暂停群之后，主对话拼上文时会据此把群里
+                // 为讨论做的搜索与工具调用剥掉（只留方案与对话内容），但**记录本身留在对话里不删**。
+                // 用户口径：「解散群聊后也是不把群聊里的搜索/调用工具上文带出去，只带方案和聊天记录」。
+                // 为什么在这里（写库前）打，而不是界面层现算：成员模型可能和主对话当前模型是同一个、
+                // 时间戳也连续，只有落库的标记能在重启后仍然认得出来。
+                val utterance = last.copy(id = id, modelId = model.id, fromGroupChat = true)
+                lastAssistant = utterance
+                // v320：同步给把手，点名那条路要用它判断「这位出声了没」
+                handle?.lastUtterance = utterance
+                onActivity(utterance.toText().length)
+                // 主持人挑人这类「只要内容、不进对话」的调用走 else 分支：
+                // 一个字都不写库。审查位抓的 P0 —— 把「乙模型」当正式发言存进讨论记录，
+                // 后面每个成员都会在上文里读到它。
+                if (!persist) return@collect
+                // 内存刷新（界面逐字看得到）
+                updateConversation(
+                    conversationId,
+                    upsertGroupUtterance(
+                        conversation = getConversationFlow(conversationId).value,
+                        utterance = utterance,
+                        targetMessageId = id,
+                    ),
+                )
+                // 低频落库
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastCheckpointAt >= GENERATION_CHECKPOINT_INTERVAL_MS) {
+                    lastCheckpointAt = now
+                    runCatching {
+                        saveConversation(conversationId, getConversationFlow(conversationId).value)
+                    }.onFailure {
+                        Log.e(TAG, "group checkpoint failed: $conversationId", it)
+                    }
+                }
                 }
             }
+            handle?.job = speakerJob
+            // 登记把手：点名那条路靠它读「这位到目前为止写了什么」，并只撤掉他这一位
+            if (handle != null) groupSpeaking[conversationId] = handle
+            try {
+                speakerJob.await()
+            } catch (e: CancellationException) {
+                // 两种取消必须分开，认错会把整批讨论当成用户主动停止：
+                // ① 用户点名换人 → 只有这个子 job 被 cancel，本协程还活着 → 走「插队换人」
+                // ② 用户点停止 / 整场被取消 → 本协程也在取消中 → 原样上抛（不许吞取消异常）
+                // v320：判据改成「旗子里记的就是我这个 job」的引用比对（原来是布尔旗，
+                // 要靠两次瞬时读凑结论；引用比对不需要那个运气）。
+                if (handle?.abortRequestedFor === speakerJob && coroutineContext[Job]?.isActive == true) {
+                    speakerAbort = GroupSpeakerAbortedException(model.id, model.displayName)
+                } else {
+                    throw e
+                }
+            } finally {
+                if (handle != null) groupSpeaking.remove(conversationId, handle)
+            }
+        }
+
+        val pendingAbort = speakerAbort
+        if (pendingAbort != null) {
+            // 撤场清理：这条发言什么都没留下（正文 / 已执行工具 / 图片文件全无）就把它删掉，
+            // 别在用户的讨论记录里留一个空白气泡；有任何值得留下的东西时
+            // removeEmptyGroupUtterance 自己会拒绝删除（宁可留半截也不丢内容）。
+            //
+            // ⚠️ 必须走 mutateAndSaveConversation（每个对话一把写锁），**不许**退回
+            // 「读快照 → 改 → 整份写回」：那是 v229 真机事故的写法，本仓库在它的 KDoc 里
+            // 明文禁止，而本轮新代码差一点成为唯一绕开护栏的写路径（v320 审查位抓的 P2，已核实为真）。
+            // 顺带一条已核实的安全事实：这个删除不碰 conversation.files，
+            // 所以 mutateAndSaveConversation 里的 checkFilesDelete 不会误删用户附件。
+            withContext(NonCancellable) {
+                runCatching {
+                    mutateAndSaveConversation(conversationId) { current ->
+                        removeEmptyGroupUtterance(current, utteranceId)
+                    }
+                }.onFailure { Log.e(TAG, "group abort cleanup failed: $conversationId", it) }
+            }
+            throw pendingAbort
         }
 
         // 收尾：无论正常、异常还是取消，都把已收到的内容落库，别让用户白等
@@ -3231,6 +3331,10 @@ class ChatService(
 
         val previousJob = session.getJob()
         previousJob?.cancel()
+        // v320：beginRun 已经把场次编号 +1 了，这里记下它。
+        // 被下一批顶掉的旧协程收尾时不许再把状态写成 STOPPED（否则新一批一睁眼就是「已停止」，
+        // 用户得到的现象是「点了『你来说』，全场安静」）。
+        val epoch = run.runEpoch
         val job = launchGenerationJob(conversationId) {
             try {
                 runCatching { previousJob?.join() }
@@ -3239,21 +3343,135 @@ class ChatService(
                 }
                 engine.advanceTurns()
             } catch (e: CancellationException) {
-                run.markStopped()
+                run.markStoppedIfCurrent(epoch)
                 throw e
             } catch (e: Exception) {
                 Log.e(TAG, "group discussion failed", e)
                 addError(e, conversationId, title = "群讨论出错")
-                run.markStopped()
+                run.markStoppedIfCurrent(epoch)
             } finally {
                 withContext(NonCancellable) {
                     runCatching { saveConversation(conversationId, getConversationFlow(conversationId).value) }
                     session.processingStatus.value = null
                     publishGroupState(run)
+                    // v320：这一批确实停下来了才通知（每批最多一次，见 notifyGroupAwaitingUser）
+                    notifyGroupAwaitingUser(run.snapshot())
                 }
             }
         }
         session.setJob(job)
+    }
+
+    /**
+     * v319：用户点名 —— 让指定成员下一个说话（跳过中间排队的其他成员）。
+     *
+     * 用户口径：「新增一个途中切换成员模型和直接跳过中间 ai 指定某个 ai 来回答的功能」。
+     * 两种情况都要照顾到，且都不许静默：
+     * ① **正有人在说话**：只把名字交给引擎，绝不打断当前那位 —— 打断会丢他半截内容，
+     *    也会让「重新生成最后一次输出」那套账错乱。他说完的下一轮就轮到被点名的人。
+     * ② **讨论停着**（IDLE / PAUSED）：光记个名字界面毫无反应，用户会以为按钮坏了，
+     *    所以顺手开一批，让点名当场有回应。
+     */
+    fun requestGroupSpeakerNow(conversationId: Uuid, modelId: Uuid): GroupPickOutcome {
+        val settings = settingsStore.settingsFlow.value
+        val config = settings.groupChatConfigs[conversationId]
+        if (config == null || !config.enabled) {
+            addError(
+                IllegalStateException("这个对话当前没有启用中的讨论群，先在「群设置」里启用或重建。"),
+                conversationId,
+                title = "点名没生效",
+            )
+            return GroupPickOutcome.NO_GROUP
+        }
+        val (run, _) = groupEngine(conversationId)
+
+        // v320：正有人在说话、但**他到现在一个字都还没出声** → 当场撤掉他，点名的这位立刻接话。
+        // 用户口径（原话）：「下一个模型只是准备开始说话，思考都没开始思考，就被锁在这个模型了，
+        // 还得强制等待这个模型说完话才能换到我选择的模型」。
+        // 旧写法只看「状态是不是 SPEAKING」，而这个状态从**选中他那一刻**就置起来了
+        //（还没发请求、连思考都没开始也算 SPEAKING），所以用户几乎永远撞在锁里。
+        //
+        // 已经出声（有正文 / 有执行完带回结果的工具 / 有图片文件）时仍然只记名、不打断：
+        // 撤掉会丢他写下的内容，还会留下「有工具调用却没有结果」的形状，下一句可能被服务商拒收。
+        val before = run.snapshot()
+        if (before.status == GroupRunStatus.SPEAKING
+            && before.currentSpeakerModelId != null
+            && before.currentSpeakerModelId != modelId
+        ) {
+            val handle = groupSpeaking[conversationId]
+            val speakerJob = handle?.job
+            if (handle != null && speakerJob != null && speakerJob.isActive
+                && handle.modelId == before.currentSpeakerModelId
+                && !groupUtteranceHasKeptContent(handle.lastUtterance)
+            ) {
+                // 顺序是命门：**先记名 → 再记下要撤的是哪一个 job → 最后取消**。
+                // 旗子必须在 cancel 之前立好，否则发言协程收到的取消会被当成「用户点了停止」，
+                // 整批讨论直接结束（GroupSpeakerAbortedException 与 CancellationException 的分工）。
+                //
+                // ⚠️ 这里对「刚读到的状态」再核一次（v320 审查位抓的 P2）：
+                // 从界面按钮被按下到这一步之间可能已经换了人（那位的发言刚好收尾），
+                // 拿着旧把手去 cancel 一个不属于本场的 job，就会给用户一个假的「已换人」提示。
+                // 判据不确定时**宁可退回 QUEUED**（等他说完），也不要给假提示。
+                val now = run.snapshot()
+                if (now.status == GroupRunStatus.SPEAKING
+                    && now.currentSpeakerModelId == handle.modelId
+                    && run.requestSpeaker(modelId)
+                ) {
+                    handle.abortRequestedFor = speakerJob
+                    speakerJob.cancel()
+                    publishGroupState(run)
+                    // ⚠️ 极端情况：上游卡在一个不可取消的读取上时，cancel 只能等它自己返回
+                    //（与用户点「停止」遇到的是同一件事，不是本功能新引入的）。那种时候
+                    // 被点名的这位仍然会在它一吐完就接上，不会轮到别人。
+                    return GroupPickOutcome.INTERRUPTED
+                }
+            }
+        }
+
+        val accepted = run.requestSpeaker(modelId)
+        publishGroupState(run)
+        if (!accepted) {
+            // 场次已停 / 已结束：直接开一批，点名会在这一批的第一轮生效
+            startGroupDiscussion(conversationId)
+            return GroupPickOutcome.STARTED
+        }
+        if (run.snapshot().status.canAdvance) {
+            // 停着等用户：顺手开一批，用户当场就能看到「谁在说话」
+            startGroupDiscussion(conversationId)
+            return GroupPickOutcome.STARTED
+        }
+        // 正有人在说话（**他已经出声了**）/ 正等用户回答提问：只记下名字，不打断。
+        // 必须把这件事告诉用户，否则他只会以为按钮坏了（审查位 v319 抓的 P1）。
+        return GroupPickOutcome.QUEUED
+    }
+
+    /**
+     * v320：这一批停下来等用户时，往事件总线发一条通知信号。
+     *
+     * 症状（用户原话）：「弹出提问工具时，已经没有在继续生成了，但我处于后台不会弹出通知」。
+     * 根因：系统通知由 [ChatNotificationManager] 订阅事件总线产生，而群讨论这条路
+     * **从来不往总线上发任何信号** —— 主对话能收到通知、群里收不到，差的就是这一段。
+     *
+     * 调用点刻意放在「批次协程的收尾」而不是状态变更点：轮流推进时 markTurnDone 会短暂
+     * 落到 PAUSED 再立刻换下一个人，若在状态变化点通知，每说一句话都响一次，比不发还糟。
+     * 「该不该通知、通知说成什么」收在纯函数 [groupWaitReasonOf] 里（可真单测）。
+     */
+    private fun notifyGroupAwaitingUser(snapshot: GroupRunState) {
+        val reason = groupWaitReasonOf(snapshot.status, snapshot.error) ?: return
+        val settings = settingsStore.settingsFlow.value
+        // 谁在等：优先用状态里现成的署名，取不到再按 id 查一次（面板与通知口径一致）
+        val speaker = snapshot.currentSpeakerName.ifBlank {
+            snapshot.askedByModelId?.let { id -> settings.findModelById(id)?.displayName }
+        }.orEmpty()
+        // tryEmit 不挂起：事件丢失只影响一次通知，绝不能反压生成链（与主对话同一口径）
+        appEventBus.tryEmit(
+            AppEvent.GroupChatWaitingForUser(
+                conversationId = snapshot.conversationId,
+                senderName = speaker,
+                reason = reason,
+                errorText = snapshot.error?.take(120),
+            )
+        )
     }
 
     /**
@@ -3356,6 +3574,8 @@ class ChatService(
         val (_, engine) = groupEngine(conversationId)
         val previousJob = session.getJob()
         previousJob?.cancel()
+        // v320：记下场次，被新一批顶掉时收尾不许把状态写成 STOPPED（与 startGroupDiscussion 同一口径）
+        val epoch = run.runEpoch
         // 写答案与续跑都放进同一个协程：这里**不能**用 runBlocking —— 本函数由界面线程调用，
         // 阻塞等待落库会卡住界面（手册 §7.1 那类「界面卡在…」事故的同一个根因）。
         val job = launchGenerationJob(conversationId) {
@@ -3388,17 +3608,20 @@ class ChatService(
                 // 2) 再由**提问的那位成员**接着说
                 engine.resumeAfterUserAnswer()
             } catch (e: CancellationException) {
-                run.markStopped()
+                // v320：用户点停止 → 落 STOPPED 并原样上抛（这条 throw 是命门，见手册 §8 续跑铁律）
+                run.markStoppedIfCurrent(epoch)
                 throw e
             } catch (e: Exception) {
                 Log.e(TAG, "group resume failed", e)
                 addError(e, conversationId, title = "群讨论出错")
-                run.markStopped()
+                run.markStoppedIfCurrent(epoch)
             } finally {
                 withContext(NonCancellable) {
                     runCatching { saveConversation(conversationId, getConversationFlow(conversationId).value) }
                     session.processingStatus.value = null
                     publishGroupState(run)
+                    // v320：这一批停下来等用户了（答完又问 / 说完 / 出错）→ 发一条通知信号
+                    notifyGroupAwaitingUser(run.snapshot())
                 }
             }
         }
@@ -3425,6 +3648,9 @@ class ChatService(
         // v318：解除状态转发订阅。run.state 是无限流，不取消的话这个协程会一直挂着（泄漏），
         // 而且下次给同一对话建群时会被 isActive 判成「还活着」而拒绝重新订阅。
         groupRunSubs.remove(conversationId)?.cancel()
+        // v320：把手一并摘掉。解散之后不该再有「能撤掉某位成员发言」的入口存在，
+        // 留着的话下一次点名会去 cancel 一个已经不属于本群的协程（真正的取消由 session 负责）。
+        groupSpeaking.remove(conversationId)
         groupRunFlows[conversationId]?.value = null
     }
 
@@ -3613,6 +3839,15 @@ class ChatService(
                 // v270：重点标色插件也只在主对话生效（默认关；打开才在系统提示词末尾
                 // 注入一段中性说明，关闭时零注入、模型不知道该功能存在）
                 highlightKeyPoints = settings.displaySetting.highlightKeyPoints,
+                // v319：主对话拼上下文时剥掉「群组期间发言」的工具与搜索结果，只留方案与对话文字。
+                // 用户口径：解散群之后「不把群聊里的搜索/调用工具上文带出去」。
+                // 只影响这次发给模型的请求，对话记录本身一个字都不删（群里查过什么仍可回看）。
+                // 群成员自己那条路（speakGroupTurn）刻意不传，保持 false —— 它要看得见自己搜到的东西。
+                stripGroupToolParts = true,
+                // v321：用户打开「群讨论只保留发言正文」时，连群成员发言里的**思考过程**
+                // 一起剥掉再发请求。关掉时传 false = 与 v320 逐字节一致。
+                // 只改这次发出去的请求；库里的记录一个字都不动（用户仍可回看）。
+                stripGroupReasoningParts = settings.groupChatCleanContext,
                 memories = if (assistant.useGlobalMemory) {
                     memoryRepository.getGlobalMemories()
                 } else {

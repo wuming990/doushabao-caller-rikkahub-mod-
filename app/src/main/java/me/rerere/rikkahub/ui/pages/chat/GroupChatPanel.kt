@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
@@ -19,6 +20,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -37,6 +39,7 @@ import me.rerere.rikkahub.data.model.GroupSpeakerMode
 import me.rerere.rikkahub.data.model.GroupChatPreset
 import me.rerere.rikkahub.data.model.applyGroupPreset
 import me.rerere.rikkahub.data.model.applySavedPreset
+import me.rerere.rikkahub.data.model.clampGroupTranscriptLimit
 import me.rerere.rikkahub.data.model.clampPresetName
 import me.rerere.rikkahub.data.model.label
 import me.rerere.rikkahub.data.model.presetApplyMessage
@@ -97,6 +100,10 @@ internal fun GroupChatPanel(
     onInterject: () -> Unit,
     /** v315：暂停态下重新启用 */
     onResumeGroup: () -> Unit,
+    /** v319：成员名单（id + 显示名）—— 面板上那条「让他说」用 */
+    memberNames: List<Pair<Uuid, String>>,
+    /** v319：点名 —— 让这位下一个说话（跳过中间排队的成员） */
+    onPickSpeaker: (Uuid) -> Unit,
     onOpenSettings: () -> Unit,
     /**
      * v317：整块是否收起（用户口径：「这个太占空间了，给我做一个可以折叠起来的」）。
@@ -339,6 +346,30 @@ internal fun GroupChatPanel(
                     )
                 }
             }
+
+            // v319：点名条 —— 用户口径「直接跳过中间 ai 指定某个 ai 来回答」。
+            // 刻意摆在面板上、而不是只放进设置对话框：讨论进行中想插一句「你来说」，
+            // 还要先开设置、再翻成员、再关窗，多点两层就没人会用这个功能。
+            if (memberNames.isNotEmpty()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text(
+                        text = "让他说：",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    memberNames.forEach { (id, name) ->
+                        OutlinedButton(onClick = { onPickSpeaker(id) }) {
+                            Text(name, style = MaterialTheme.typography.labelMedium)
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -356,6 +387,16 @@ internal fun GroupChatPanel(
 internal fun GroupChatSettingsDialog(
     initial: GroupChatConfig,
     providers: List<ProviderSetting>,
+    /**
+     * v321：「讨论只保留发言正文」—— 注意这是**全局**设置的真值，不是这个群自己的配置。
+     *
+     * 为什么不塞进 GroupChatConfig：这条设置要在「解散群之后主对话拼上下文」那条路上
+     * 也读得到，而群配置可能被用户「彻底删除」（v315 就有这个动作），存在群配置里会静默失效。
+     * 弹窗里这一栏只是把全局值露出来给用户拨，绝不另存一份，避免两处状态漂移。
+     */
+    cleanContext: Boolean,
+    /** v321：切换全局设置 —— 当场写盘生效，不等本弹窗的「保存」按钮 */
+    onCleanContextChange: (Boolean) -> Unit,
     /** v315：暂停 / 重新启用（配置一个字节都不动） */
     onPauseToggle: (Boolean) -> Unit,
     /** v315：彻底删除群设置（不可撤销，界面已二次确认） */
@@ -373,15 +414,24 @@ internal fun GroupChatSettingsDialog(
     onRenamePreset: (presetId: Uuid, name: String) -> Unit,
     /** v316：提交删方案（只动方案表，不影响任何对话现有的群配置） */
     onDeletePreset: (presetId: Uuid) -> Unit,
+    /** v319：点名让这位下一个说话（跳过中间排队的成员）。当场生效，不需要先点保存 */
+    onPickSpeaker: (Uuid) -> Unit,
     /** v316：即时反馈（只用于「填入草稿」这类当场生效的事；落库成败走回执） */
     onNotify: (message: String, isError: Boolean) -> Unit,
     onDismiss: () -> Unit,
     onSave: (GroupChatConfig) -> Unit,
 ) {
     var members by remember { mutableStateOf(initial.memberModelIds) }
+    // v319：「换」按下的那一行下标 —— 选择器选完就替换这个位置，然后清空。
+    // 与「添加成员」共用同一个选择器：两套弹层的选中态与滚动位置会各记各的，
+    // 用户连点两次就分不清自己是在加人还是在换人。
+    var swapIndex by remember { mutableStateOf<Int?>(null) }
     var mode by remember { mutableStateOf(initial.speakerMode) }
     var turns by remember { mutableStateOf(initial.turnsPerRun) }
     var resumeMax by remember { mutableStateOf(initial.resumeMax) }
+    // v319：群讨论上文上限（0 = 不限，默认）。做成「填数字」而不是滑条：
+    // 这个值跨度从 0 到百万级，滑条既拉不准也没法精确自救。
+    var transcriptCharLimit by remember { mutableStateOf(initial.transcriptCharLimit) }
     var allowAskUser by remember { mutableStateOf(initial.allowAskUser) }
     var allowTools by remember { mutableStateOf(initial.allowTools) }
     var moderator by remember { mutableStateOf(initial.moderatorModelId) }
@@ -428,6 +478,14 @@ internal fun GroupChatSettingsDialog(
     val picker = rememberModelListState(modelId = null, providers = providers, type = ModelType.CHAT)
     // 主持人单独一个选择器：它的 onSelect 写的是 moderator，不能和「加成员」共用一个
     val moderatorPicker = rememberModelListState(modelId = null, providers = providers, type = ModelType.CHAT)
+    // v322：成员选择弹层一关上就把「待替换位置」清掉。
+    // 不清的下场：用户点了「换」又直接退出弹层，之后点「添加成员」，那次选择会被
+    // 当成换人 —— 新加的成员被塞到旧位置、名单顺序静默错乱（v319 的注释担心过这件事，
+    // 但当时只担心「连点两次」，没处理「点了又取消」）。这里跟着弹层的可见状态收口，
+    // 「换」和「添加成员」两条路都走同一个弹层，所以一处清理两处都干净。
+    LaunchedEffect(picker.visible) {
+        if (!picker.visible) swapIndex = null
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -578,13 +636,42 @@ internal fun GroupChatSettingsDialog(
                             style = MaterialTheme.typography.bodyMedium,
                             modifier = Modifier.weight(1f),
                         )
+                        // v319：点名 —— 跳过中间排队的成员，直接让这位说。
+                        // 刻意做成「当场生效、不必先点保存」：用户要的就是现在听他说，
+                        // 还要先保存再关对话框再点继续，等于没做这个功能。
+                        TextButton(onClick = { onPickSpeaker(id) }) {
+                            Text("你来说", style = MaterialTheme.typography.labelMedium)
+                        }
+                        // v319：原地换人 —— 位置不变，只换模型。
+                        // 不做成「先移除再添加」：那样新成员会跑到名单末尾，
+                        // 而发言顺序正是用户自己排出来的（上面那行字写着「顺序就是发言顺序」）。
+                        // v322：这里原先只有 `swapIndex = index`，**没有打开选择弹层** ——
+                        // 而 ModelListSheet 第一行就是 `if (!state.visible) return`（ModelList.kt:272），
+                        // visible 只由 picker.open() 打开。所以「换」按下去什么都不会发生
+                        // （用户真机反馈「点了没反应」），下面 onSelect 里那套原地替换逻辑
+                        // 永远等不到被触发。修法即补上 picker.open()，与圆桌座位「换模型」
+                        // （RoundTableSeatPanel.kt 的 onReplace：设标记 + picker.open() 两行都写）
+                        // 保持同一写法。
+                        TextButton(
+                            onClick = {
+                                swapIndex = index
+                                picker.open()
+                            }
+                        ) {
+                            Text("换", style = MaterialTheme.typography.labelMedium)
+                        }
                         TextButton(onClick = { members = members - id }) {
                             Text("移除", style = MaterialTheme.typography.labelMedium)
                         }
                     }
                 }
                 OutlinedButton(
-                    onClick = { picker.open() },
+                    onClick = {
+                        // v322：显式写成「加人」语义 —— 双保险，不依赖上面那个 LaunchedEffect
+                        // 一定先跑到（用户点了「换」又取消、紧接着点这里时最危险）
+                        swapIndex = null
+                        picker.open()
+                    },
                     enabled = members.size < GroupChatConfig.MAX_MEMBERS,
                 ) {
                     Text("添加成员")
@@ -665,6 +752,34 @@ internal fun GroupChatSettingsDialog(
                 )
 
                 HorizontalDivider()
+                // v319：群讨论上文上限。默认 0 = 不限（用户口径「我要的是打开时候获取全部上文」），
+                // 这一栏是留给「某个模型窗口装不下、服务商直接报错」时的自救阀，
+                // 有了它用户填一个数就能继续跑，不必等开发者改代码发新版。
+                Text(
+                    text = "讨论上文长度上限（字数）",
+                    style = MaterialTheme.typography.labelLarge,
+                )
+                OutlinedTextField(
+                    value = transcriptCharLimit.toString(),
+                    onValueChange = { raw ->
+                        // 只收数字；清空或填进怪东西一律退回 0（不限）。
+                        // 不给负数：负数传进截断逻辑会算成「一条都不留」，等于把讨论废掉。
+                        transcriptCharLimit = raw.filter { it.isDigit() }
+                            .toIntOrNull()
+                            ?.let { clampGroupTranscriptLimit(it) } ?: 0
+                    },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    text = "0 = 不限（默认）：开群时把之前的上文整份带进去，" +
+                        "连之前查过的资料、子代理产出一起带。" +
+                        "填一个正数则从最旧的发言开始丢，只在某个模型报「上下文过长」时才需要填。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+
+                HorizontalDivider()
                 SwitchRow(
                     label = "允许成员向你提问",
                     desc = "缺关键条件时会停下来等你回答，答完接着讨论。",
@@ -676,6 +791,21 @@ internal fun GroupChatSettingsDialog(
                     desc = "给成员挂上与主对话同一套工具（搜索、工作区等）。",
                     checked = allowTools,
                     onChange = { allowTools = it },
+                )
+                // v321：全局设置，刻意**不**进本弹窗的「保存」流程 —— 拨一下就立刻写盘生效。
+                // 用户口径（v321 原话）：「出一个开关，只获取模型自身输出与其他模型对话输出，
+                // 不获取思考过程/工具调用/搜索结果等上文」；
+                // 补充口径：「我说的这个上文是群聊过程中产生的上文，不是打开群聊之前的上文」
+                // —— 所以下面那句「开群之前原对话的上文照旧整份带」是用户的硬要求，不能写成也受这个开关管。
+                SwitchRow(
+                    label = "讨论只保留发言正文",
+                    desc = "打开后，成员之间只看得到对方说过的正文：自己想的过程、查资料拿回的" +
+                        "原文、搜索结果都不再塞进讨论上文（解散后发给主模型的也一并干净）。" +
+                        "开群之前原对话的上文照旧整份带进来，成员向你提的问题和你的回答照旧保留，" +
+                        "生成的图片和文件照旧保留。关掉 = 与现在完全一样。" +
+                        "这是全局选项，对所有讨论群生效，改动立刻生效不用点保存。",
+                    checked = cleanContext,
+                    onChange = { onCleanContextChange(it) },
                 )
 
                 HorizontalDivider()
@@ -724,6 +854,7 @@ internal fun GroupChatSettingsDialog(
                             moderatorModelId = moderator,
                             turnsPerRun = turns,
                             resumeMax = resumeMax,
+                            transcriptCharLimit = transcriptCharLimit,
                             enabled = initial.enabled,
                             allowAskUser = allowAskUser,
                             allowTools = allowTools,
@@ -786,6 +917,7 @@ internal fun GroupChatSettingsDialog(
                         moderator = moderator,
                         turns = turns,
                         resumeMax = resumeMax,
+                        transcriptCharLimit = transcriptCharLimit,
                         enabledKeep = initial.enabled,
                         allowAskUser = allowAskUser,
                         allowTools = allowTools,
@@ -834,6 +966,7 @@ internal fun GroupChatSettingsDialog(
                                     moderator = moderator,
                                     turns = turns,
                                     resumeMax = resumeMax,
+                                    transcriptCharLimit = transcriptCharLimit,
                                     enabledKeep = initial.enabled,
                                     allowAskUser = allowAskUser,
                                     allowTools = allowTools,
@@ -885,7 +1018,24 @@ internal fun GroupChatSettingsDialog(
     ModelListSheet(
         state = picker,
         onSelect = { model: Model ->
-            if (!members.contains(model.id) && members.size < GroupChatConfig.MAX_MEMBERS) {
+            val at = swapIndex
+            if (at != null) {
+                // v319：「换」——原地替换，位置不动（换完就把这个待替换标记清掉，
+                // 否则下一次点「添加成员」会被误当成换人）
+                swapIndex = null
+                val next = members.toMutableList()
+                if (at in next.indices) {
+                    if (next.contains(model.id)) {
+                        // 选中的模型本来就在名单里：把它挪到这个位置，
+                        // 而不是塞出两个重复成员（重复成员会让轮流顺序凭空多一轮）
+                        next.remove(model.id)
+                        next.add(at.coerceAtMost(next.size), model.id)
+                    } else {
+                        next[at] = model.id
+                    }
+                    members = next
+                }
+            } else if (!members.contains(model.id) && members.size < GroupChatConfig.MAX_MEMBERS) {
                 members = members + model.id
             }
         },
@@ -955,6 +1105,7 @@ private fun currentDraftConfig(
     moderator: Uuid?,
     turns: Int,
     resumeMax: Int,
+    transcriptCharLimit: Int,
     enabledKeep: Boolean,
     allowAskUser: Boolean,
     allowTools: Boolean,
@@ -964,6 +1115,10 @@ private fun currentDraftConfig(
     moderatorModelId = moderator,
     turnsPerRun = turns,
     resumeMax = resumeMax,
+    // v319：上限跟着草稿走，但**不会进「方案」存档**（GroupChatPreset 没这个字段）——
+    // 它是「这台设备 / 这个模型窗口装不装得下」的问题，与「用哪几个成员」无关，
+    // 套方案时不该顺手改掉用户自己填过的数。
+    transcriptCharLimit = transcriptCharLimit,
     enabled = enabledKeep,
     allowAskUser = allowAskUser,
     allowTools = allowTools,

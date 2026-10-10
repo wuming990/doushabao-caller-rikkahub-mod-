@@ -3,8 +3,11 @@ package me.rerere.rikkahub.service
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.ui.ToolApprovalState
 import me.rerere.ai.ui.UIMessage
+import me.rerere.ai.ui.ServerToolStatus
 import me.rerere.ai.ui.UIMessagePart
+import me.rerere.rikkahub.data.event.AppEvent
 import me.rerere.rikkahub.data.ai.prompts.buildGroupTranscript
+import me.rerere.rikkahub.data.ai.prompts.withoutGroupChatToolParts
 import me.rerere.rikkahub.data.ai.prompts.moveGroupMessageToEnd
 import me.rerere.rikkahub.data.ai.prompts.resolveModeratedSpeaker
 import me.rerere.rikkahub.data.model.Conversation
@@ -17,6 +20,7 @@ import me.rerere.rikkahub.data.model.applyGroupPreset
 import me.rerere.rikkahub.data.model.applySavedPreset
 import me.rerere.rikkahub.data.model.clampPresetName
 import me.rerere.rikkahub.data.model.presetApplyMessage
+import me.rerere.rikkahub.data.model.resolveRequestedSpeaker
 import me.rerere.rikkahub.data.model.suggestPresetName
 import me.rerere.rikkahub.data.model.GroupPresetOpKind
 import me.rerere.rikkahub.data.model.GroupPresetOpResult
@@ -107,7 +111,7 @@ class GroupChatTest {
     }
 
     @Test
-    fun `工具结果与空发言不进上文`() {
+    fun `群里别人的工具结果与空发言不进上文`() {
         val toolish = UIMessage(
             role = MessageRole.ASSISTANT,
             parts = listOf(
@@ -119,6 +123,10 @@ class GroupChatTest {
                 )
             ),
             modelId = modelB,
+            // v319：这条测的是「**群讨论期间**别人的工具不外泄」，所以标成群组发言。
+            // 开群之前的历史（fromGroupChat = false）现在按用户要求要整份带进来，
+            // 那条口径由「开群之前的历史，工具产出要带进上文」单独覆盖，两条必须都有人守。
+            fromGroupChat = true,
         )
         val blank = assistant("   ", modelB)
         val result = buildGroupTranscript(listOf(user("任务"), toolish, blank), modelA, ::nameOf)
@@ -233,6 +241,8 @@ class GroupChatTest {
                 )
             ),
             modelId = modelB,
+            // v319：同上，这条守的是「群讨论期间」那一半口径
+            fromGroupChat = true,
         )
         assertTrue(buildGroupTranscript(listOf(other), modelC, ::nameOf).isEmpty())
     }
@@ -935,5 +945,747 @@ class GroupChatTest {
         )
         val text = buildGroupTranscript(listOf(asked), modelC, ::nameOf)[0].toText()
         assertEquals("同一段答案只应出现一次", 1, Regex("我其实更在意稳定性").findAll(text).count())
+    }
+
+    // ---- v319：开群带全部上文 / 解散后不把群组工具带进主对话 ----
+
+    @Test
+    fun `开群之前的历史，工具产出要带进上文`() {
+        // 用户口径（v319 原话）：「我要的是打开时候获取全部上文」。
+        // 真机现象：十几万字的原对话开群后只剩 3 万，缺的正是这些「之前干活查到的资料」。
+        val historyTool = UIMessage(
+            role = MessageRole.ASSISTANT,
+            parts = listOf(
+                UIMessagePart.Tool(
+                    toolCallId = "h1",
+                    toolName = "search_web",
+                    input = """{"query":"北京展览"}""",
+                    output = listOf(UIMessagePart.Text("查到 5 条结果")),
+                )
+            ),
+            modelId = modelB,
+            fromGroupChat = false,
+        )
+        val result = buildGroupTranscript(listOf(historyTool), modelA, ::nameOf)
+        assertEquals("带上了工具产出的历史不该再被当成空发言丢掉", 1, result.size)
+        val text = result[0].toText()
+        assertTrue(
+            "要写成第三人称，别让成员误以为是自己调过的工具",
+            text.contains("它当时调用了工具"),
+        )
+        assertTrue("要带工具名", text.contains("search_web"))
+        assertTrue("要带参数", text.contains("北京展览"))
+        assertTrue("要带结果", text.contains("查到 5 条结果"))
+    }
+
+    @Test
+    fun `群讨论期间别人调的工具仍然不进共享上文`() {
+        // 与上一条成对：用户同时要求「群组聊天过程中每个 ai 的搜索和工具上文
+        // 不会参杂进群组聊天中，只有给出的方案/对话内容」。两条口径靠 fromGroupChat 分开。
+        val peerTool = UIMessage(
+            role = MessageRole.ASSISTANT,
+            parts = listOf(
+                UIMessagePart.Tool(
+                    toolCallId = "g1",
+                    toolName = "search_web",
+                    input = "{}",
+                    output = listOf(UIMessagePart.Text("别人为讨论搜的东西")),
+                )
+            ),
+            modelId = modelB,
+            fromGroupChat = true,
+        )
+        assertTrue(
+            "群讨论期间别人的搜索不许掺杂进共享上文",
+            buildGroupTranscript(listOf(peerTool), modelA, ::nameOf).isEmpty(),
+        )
+    }
+
+    @Test
+    fun `上文上限 0 与负数都是不限，正数才从最旧的丢`() {
+        val many = (1..50).map {
+            user("第${it}条消息，内容要足够长才看得出截断效果：" + "字".repeat(200))
+        }
+        assertEquals("默认（0）整份原样", many.size, buildGroupTranscript(many, modelA, ::nameOf).size)
+        assertEquals("0 显式传也是整份", many.size, buildGroupTranscript(many, modelA, ::nameOf, charLimit = 0).size)
+        assertEquals("负数按不限处理，不许把讨论废掉", many.size, buildGroupTranscript(many, modelA, ::nameOf, charLimit = -1).size)
+
+        val trimmed = buildGroupTranscript(many, modelA, ::nameOf, charLimit = 2_000)
+        assertTrue("超预算必须丢东西", trimmed.size < many.size)
+        assertEquals("丢的是最旧的，用户最新那条必须在", many.last().toText(), trimmed.last().toText())
+    }
+
+    @Test
+    fun `主对话剥离群组工具：只动群组发言、ask_user 保留、原列表不改`() {
+        val groupPlain = UIMessage(
+            role = MessageRole.ASSISTANT,
+            parts = listOf(
+                UIMessagePart.Text("群里的结论"),
+                UIMessagePart.Tool(
+                    toolCallId = "s1",
+                    toolName = "search_web",
+                    input = "{}",
+                    output = listOf(UIMessagePart.Text("群里为讨论搜的东西")),
+                ),
+            ),
+            modelId = modelA,
+            fromGroupChat = true,
+        )
+        val groupAsk = UIMessage(
+            role = MessageRole.ASSISTANT,
+            parts = listOf(
+                UIMessagePart.Tool(
+                    toolCallId = "s2",
+                    toolName = "ask_user",
+                    input = "{}",
+                    output = listOf(UIMessagePart.Text("用户回答")),
+                    approvalState = ToolApprovalState.Answered("用户回答"),
+                ),
+            ),
+            modelId = modelA,
+            fromGroupChat = true,
+        )
+        val historyTool = groupPlain.copy(id = Uuid.random(), fromGroupChat = false)
+
+        val before = listOf(groupPlain, groupAsk, historyTool)
+        val after = before.withoutGroupChatToolParts()
+
+        assertEquals("群组发言只留正文", listOf("群里的结论"), after[0].parts.filterIsInstance<UIMessagePart.Text>().map { it.text })
+        assertTrue("群组那条不能再有工具", after[0].getTools().isEmpty())
+        assertEquals("ask_user 是用户本人说的话，不许被摘掉", 1, after[1].getTools().size)
+        assertEquals("开群之前的历史一个字都不动（那是主对话自己经历的）", historyTool, after[2])
+        // 用户选的是「不删数据」：传入的原始列表必须保持原样，剥离只发生在请求视图上
+        assertEquals("原列表不能被改坏", 2, before[0].parts.size)
+        assertTrue("原列表里工具必须还在", before[0].getTools().isNotEmpty())
+    }
+
+    @Test
+    fun `群组发言只剩工具时剥离后留占位，不发空消息给模型`() {
+        val onlyTool = UIMessage(
+            role = MessageRole.ASSISTANT,
+            parts = listOf(
+                UIMessagePart.Tool(
+                    toolCallId = "s3",
+                    toolName = "search_web",
+                    input = "{}",
+                    output = listOf(UIMessagePart.Text("x")),
+                )
+            ),
+            modelId = modelA,
+            fromGroupChat = true,
+        )
+        val stripped = listOf(onlyTool).withoutGroupChatToolParts().single()
+        assertTrue("不能留成空 parts（空助手消息会被部分服务商直接拒掉）", stripped.parts.isNotEmpty())
+        assertTrue("要有一句人能看懂的占位", stripped.toText().contains("未纳入主对话上下文"))
+    }
+
+    // ---- v319：点名（跳过中间排队的成员，指定某位说话） ----
+
+    @Test
+    fun `点名取用一次就清空，不会一直插队`() {
+        val run = GroupChatRun(conversationId = Uuid.random(), turnsBudget = 3)
+        assertNull("没点过名时是空的", run.takeRequestedSpeaker())
+        assertTrue("讨论进行中接受点名", run.requestSpeaker(modelA))
+        assertEquals(modelA, run.takeRequestedSpeaker())
+        assertNull("取走之后必须清空，否则他会一直插队、轮流顺序就废了", run.takeRequestedSpeaker())
+    }
+
+    @Test
+    fun `已停或已结束的场次不接受点名`() {
+        // 那时该走「继续讨论」，让点名悄悄把状态改回可跑，用户会以为讨论自己在动
+        val stopped = GroupChatRun(conversationId = Uuid.random(), turnsBudget = 3)
+        stopped.markStopped()
+        assertFalse("停了的场次不许被点名改回可跑", stopped.requestSpeaker(modelA))
+        val finished = GroupChatRun(conversationId = Uuid.random(), turnsBudget = 3)
+        finished.markFinished()
+        assertFalse("已结束的场次同理", finished.requestSpeaker(modelA))
+    }
+
+    @Test
+    fun `点名不改动轮流游标`() {
+        // 轮流游标 lastSpeakerModelId 是 markTurnDone 写的（markSpeaking 只写「当前正在说的」），
+        // 第一版我把断言写在 markSpeaking 之后，拿一个从没被写过的字段去比，测试自己就是错的。
+        // 这里先把游标真的推进起来，再验证「点名 + 取用」这一趟不会把它写歪。
+        val run = GroupChatRun(conversationId = Uuid.random(), turnsBudget = 3)
+        run.markSpeaking(modelA, "甲模型")
+        run.markTurnDone(modelA)
+        assertEquals("前置条件：游标已落到甲身上", modelA, run.snapshot().lastSpeakerModelId)
+
+        run.requestSpeaker(modelC)
+        assertEquals("点名要被取到", modelC, run.takeRequestedSpeaker())
+        assertEquals(
+            "点名取走后，轮流游标仍是刚才说完的那位 —— 插一次队不该把顺序写歪",
+            modelA,
+            run.snapshot().lastSpeakerModelId,
+        )
+    }
+
+    @Test
+    fun `点名的那位已被移出成员时不采用，退回正常顺序`() {
+        val members = setOf(modelA, modelB)
+        assertEquals("还在成员里就采用他", modelB, resolveRequestedSpeaker(modelB, members))
+        assertNull(
+            "已被移出成员时不采用 —— 否则用户会听见一个已经不在群里的人被点名说话",
+            resolveRequestedSpeaker(modelC, members),
+        )
+        assertNull("没人被点名时返回 null，走轮流/主持人", resolveRequestedSpeaker(null, members))
+        assertNull("空成员表里谁都不该被采用", resolveRequestedSpeaker(modelA, emptySet()))
+    }
+
+    // ---- v320：点名换人「还没出声就当场撤」的判据 ----
+    //
+    // 用户真机反馈（原话）：「下一个模型只是准备开始说话，思考都没开始思考，就被锁在这个
+    // 模型了，还得强制等待这个模型说完话才能换到我选择的模型」。
+    // 能不能撤、撤完要不要删、什么时候该发通知，全是**纯函数**，所以这里真跑，不做字符串比对。
+
+    private fun assistantOf(vararg parts: UIMessagePart, id: Uuid = Uuid.random()) = UIMessage(
+        id = id,
+        role = MessageRole.ASSISTANT,
+        parts = parts.toList(),
+        modelId = modelA,
+    )
+
+    @Test
+    fun `只有思考或只挂着没执行的工具，都算还没出声`() {
+        assertFalse("一个字都没写 = 可以撤", groupUtteranceHasKeptContent(null))
+        assertFalse(
+            "只有思考不算出声：用户要的就是「思考都没开始/没说出话」时不必等他",
+            groupUtteranceHasKeptContent(assistantOf(UIMessagePart.Reasoning("我在想"))),
+        )
+        assertFalse("空白正文不算出声", groupUtteranceHasKeptContent(assistantOf(UIMessagePart.Text("   "))))
+        assertFalse(
+            "只挂着**正在执行、还没结果**的工具调用 = 可以撤（整条会被删掉，不会留下有调用没结果的形状）",
+            groupUtteranceHasKeptContent(
+                assistantOf(
+                    UIMessagePart.Tool(
+                        toolCallId = "c1",
+                        toolName = "workspace_read_file",
+                        input = "{}",
+                        approvalState = ToolApprovalState.Auto,
+                    )
+                )
+            ),
+        )
+        assertFalse(
+            "服务端工具还在跑（没有结果）= 还没出声",
+            groupUtteranceHasKeptContent(
+                assistantOf(
+                    UIMessagePart.ServerTool(
+                        toolCallId = "s1",
+                        toolName = "web_search",
+                        status = ServerToolStatus.IN_PROGRESS,
+                    )
+                )
+            ),
+        )
+    }
+
+    @Test
+    fun `写过正文、跑完工具、或用户答过问，就不许撤`() {
+        assertTrue("有正文 = 已经出声", groupUtteranceHasKeptContent(assistantOf(UIMessagePart.Text("我的观点"))))
+        assertTrue(
+            "工具已经跑完带回结果 = 讨论记录里有真东西，撤掉就是丢内容",
+            groupUtteranceHasKeptContent(
+                assistantOf(
+                    UIMessagePart.Tool(
+                        toolCallId = "c2",
+                        toolName = "workspace_read_file",
+                        input = "{}",
+                        output = listOf(UIMessagePart.Text("文件内容")),
+                    )
+                )
+            ),
+        )
+        assertTrue(
+            "提问卡片已被用户答过 —— 那是用户写下的答案，绝不允许被撤掉（v318 同族事故）",
+            groupUtteranceHasKeptContent(
+                assistantOf(
+                    UIMessagePart.Tool(
+                        toolCallId = "c3",
+                        toolName = "ask_user",
+                        input = "{}",
+                        approvalState = ToolApprovalState.Answered("我的答案"),
+                    )
+                )
+            ),
+        )
+        assertTrue("有图片也算出声", groupUtteranceHasKeptContent(assistantOf(UIMessagePart.Image("file:///a.png"))))
+        // v320 审查位抓的真窗口：卡片刚在流式内容里出现、还没走到「批次收尾、把手摘除」那一瞬间，
+        // 用户恰好点了「你来说」—— 这时候撤掉等于把 TA 问的话连同卡片一起删掉，用户白看一眼。
+        assertTrue(
+            "等用户批准的**提问卡片**不许撤（那是 TA 正要回答的东西）",
+            groupUtteranceHasKeptContent(
+                assistantOf(
+                    UIMessagePart.Tool(
+                        toolCallId = "c4",
+                        toolName = GROUP_ASK_USER_TOOL_NAME,
+                        input = "{}",
+                        approvalState = ToolApprovalState.Pending,
+                    )
+                )
+            ),
+        )
+        assertTrue(
+            "等用户批准的任何工具都不许撤（撤了审批按钮就凭空消失）",
+            groupUtteranceHasKeptContent(
+                assistantOf(
+                    UIMessagePart.Tool(
+                        toolCallId = "c5",
+                        toolName = "workspace_shell",
+                        input = "{}",
+                        approvalState = ToolApprovalState.Pending,
+                    )
+                )
+            ),
+        )
+        assertTrue(
+            "服务端工具已完成 = 有结果留在消息里",
+            groupUtteranceHasKeptContent(
+                assistantOf(
+                    UIMessagePart.ServerTool(
+                        toolCallId = "s2",
+                        toolName = "web_search",
+                        output = kotlinx.serialization.json.JsonPrimitive("搜索结果"),
+                        status = ServerToolStatus.COMPLETED,
+                    )
+                )
+            ),
+        )
+    }
+
+    @Test
+    fun `撤场清理只删什么都没留下的那条`() {
+        val silentId = Uuid.random()
+        val silent = assistantOf(
+            UIMessagePart.Reasoning("想过一会儿"),
+            UIMessagePart.Tool(toolCallId = "c1", toolName = "workspace_read_file", input = "{}"),
+            id = silentId,
+        )
+        val kept = assistantOf(UIMessagePart.Text("甲：我认为应该先做门禁"))
+        val conv = emptyConversation().copy(
+            messageNodes = listOf(MessageNode(messages = listOf(kept, silent), selectIndex = 1))
+        )
+
+        val out = removeEmptyGroupUtterance(conv, silentId)
+
+        assertEquals("只删掉那条没出声的", 1, out.messageNodes.single().messages.size)
+        assertEquals("留下的那条没被碰", kept.id, out.messageNodes.single().messages.single().id)
+    }
+
+    @Test
+    fun `撤场清理的三种不删情况`() {
+        // ① 本次根本没写过消息（一个分片都没收到就被撤）
+        val conv = emptyConversation().copy(messageNodes = nodesWith(assistant("已有内容", modelA)))
+        assertSame("没写过就不该乱动", conv, removeEmptyGroupUtterance(conv, null))
+
+        // ② 那条消息已经出声了（有正文）—— 宁可留半截，也绝不删内容
+        val spoken = assistantOf(UIMessagePart.Text("我说了一半"))
+        val spokenConv = emptyConversation().copy(messageNodes = nodesWith(spoken))
+        assertSame("有正文不删", spokenConv, removeEmptyGroupUtterance(spokenConv, spoken.id))
+
+        // ③ 那条消息已经被用户删掉了（找不到 = 原样返回）
+        assertSame("找不到目标就原样返回", conv, removeEmptyGroupUtterance(conv, Uuid.random()))
+    }
+
+    @Test
+    fun `撤场清理绝不删掉带着待批准提问卡片的那条`() {
+        // 与上面那条判据配对的**第二道闸**：就算点名那条路误判了，删除函数自己也要拒绝。
+        val id = Uuid.random()
+        val asking = assistantOf(
+            UIMessagePart.Tool(
+                toolCallId = "c6",
+                toolName = GROUP_ASK_USER_TOOL_NAME,
+                input = "{}",
+                approvalState = ToolApprovalState.Pending,
+            ),
+            id = id,
+        )
+        val conv = emptyConversation().copy(messageNodes = nodesWith(asking))
+        assertSame("有待批准的提问卡片 = 一个字都不许删", conv, removeEmptyGroupUtterance(conv, id))
+    }
+
+    @Test
+    fun `整条没出声时连节点一起删掉，不留空节点`() {
+        val only = assistantOf(UIMessagePart.Reasoning("只有思考"), id = Uuid.random())
+        val conv = emptyConversation().copy(messageNodes = nodesWith(only))
+        val out = removeEmptyGroupUtterance(conv, only.id)
+        assertTrue("整条消息没了，节点也该一起清掉", out.messageNodes.isEmpty())
+    }
+
+    @Test
+    fun `通知只在停下来等用户时发`() {
+        assertEquals(
+            "有人用提问卡片等你回话",
+            AppEvent.GroupWaitReason.QUESTION,
+            groupWaitReasonOf(GroupRunStatus.WAITING_FOR_USER, null),
+        )
+        assertEquals(
+            "这批说完，等你点继续讨论",
+            AppEvent.GroupWaitReason.TURN_DONE,
+            groupWaitReasonOf(GroupRunStatus.PAUSED, null),
+        )
+        assertEquals(
+            "这一轮出错了 —— 手册铁律：报错必须让用户看见",
+            AppEvent.GroupWaitReason.FAILED,
+            groupWaitReasonOf(GroupRunStatus.PAUSED, "甲模型：余额不足"),
+        )
+        assertEquals(
+            "整场结束了：不能说成「等你点继续讨论」（那种场合点了也不会跑，文案不许说谎）",
+            AppEvent.GroupWaitReason.ENDED,
+            groupWaitReasonOf(GroupRunStatus.FINISHED, null),
+        )
+        assertNull("还有人正在说话，不该打扰用户", groupWaitReasonOf(GroupRunStatus.SPEAKING, null))
+        assertNull("刚开跑，不该打扰用户", groupWaitReasonOf(GroupRunStatus.IDLE, null))
+        assertNull("用户自己点的停止，不该再吵他", groupWaitReasonOf(GroupRunStatus.STOPPED, null))
+    }
+
+    @Test
+    fun `被新一批顶掉的旧场次不许再把状态写成已停止`() {
+        // 症状：点「你来说」/「继续讨论」之后全场安静 —— 旧协程临死前把新一批盖成 STOPPED。
+        val run = newRun(budget = 3)
+        val staleEpoch = run.runEpoch
+        assertTrue(run.beginRun(3))
+        val currentEpoch = run.runEpoch
+        assertTrue("开一批必须换场次编号", currentEpoch > staleEpoch)
+
+        run.markSpeaking(modelA, "甲模型")
+        assertFalse("旧场次的收尾不该被接受", run.markStoppedIfCurrent(staleEpoch))
+        assertEquals("状态必须还是正在说话", GroupRunStatus.SPEAKING, run.snapshot().status)
+
+        assertTrue("本场次的收尾照旧落 STOPPED", run.markStoppedIfCurrent(currentEpoch))
+        assertEquals(GroupRunStatus.STOPPED, run.snapshot().status)
+    }
+
+    // ---- v321：「群讨论只保留发言正文」开关 ----
+    //
+    // 开关打开后，**群聊过程中产生的**思考 / 工具调用与结果 / 服务商侧搜索
+    // 不再进任何成员的上文；开群之前那份原对话上文照旧整份带（v319 硬红线）。
+    // 全部真跑函数，不做源码字符串比对。
+
+    /** 一条「成员在群里说过的话」：正文 + 思考 + 一个已经跑完带回结果的搜索工具 */
+    private fun groupUtteranceOf(
+        modelId: Uuid,
+        text: String? = "我主张先做门禁",
+        reasoning: String = "先想想该不该查资料",
+        toolOutput: String = "查到的原始网页正文",
+    ): UIMessage {
+        val parts = mutableListOf<UIMessagePart>()
+        if (text != null) parts.add(UIMessagePart.Text(text))
+        parts.add(UIMessagePart.Reasoning(reasoning))
+        parts.add(
+            UIMessagePart.Tool(
+                toolCallId = "g1",
+                toolName = "search_web",
+                input = """{"query":"门禁 流程"}""",
+                output = listOf(UIMessagePart.Text(toolOutput)),
+            )
+        )
+        return UIMessage(
+            role = MessageRole.ASSISTANT,
+            parts = parts,
+            modelId = modelId,
+            fromGroupChat = true,
+        )
+    }
+
+    @Test
+    fun `开关打开时，群发言只留正文，思考与工具原文都不进上文`() {
+        val own = groupUtteranceOf(modelA)
+        val result = buildGroupTranscript(
+            messages = listOf(own),
+            speakingModelId = modelA,
+            nameOf = ::nameOf,
+            cleanGroupUtterances = true,
+        )
+
+        assertEquals("自己那条仍是一条助手消息", 1, result.size)
+        assertEquals(
+            "角色不许变（变了模型会以为自己没说过）",
+            MessageRole.ASSISTANT,
+            result[0].role,
+        )
+        assertEquals(
+            "只留正文那一片",
+            listOf("我主张先做门禁"),
+            result[0].parts.filterIsInstance<UIMessagePart.Text>().map { it.text },
+        )
+        assertTrue("思考过程必须被摘掉", result[0].parts.none { it is UIMessagePart.Reasoning })
+        assertTrue("工具调用整片摘掉（含它查回的原文）", result[0].parts.none { it is UIMessagePart.Tool })
+        assertFalse(
+            "思考原文一个字都不许出现在上文里",
+            result[0].toText().contains("先想想该不该查资料"),
+        )
+        assertFalse("工具查回的原文也不许出现", result[0].toText().contains("查到的原始网页正文"))
+        assertTrue("正文还在", result[0].toText().contains("我主张先做门禁"))
+    }
+
+    @Test
+    fun `开关打开时，服务商侧搜索结果（ServerTool）也不进成员上文`() {
+        // 用户原话点名要清的三类里就有「搜索结果」。谷歌 / OpenAI 自带搜索的结果
+        // 是以 ServerTool 承载的（与 search_web 那种 Tool 是两个类型），
+        // 少钉这一条就等于「搜索结果」那一路没人守 —— 而它常常是最占字的那块。
+        val own = UIMessage(
+            role = MessageRole.ASSISTANT,
+            parts = listOf(
+                UIMessagePart.Text("结论：走 B 方案"),
+                UIMessagePart.Reasoning("我先搜一下再说"),
+                UIMessagePart.ServerTool(
+                    toolCallId = "s1",
+                    toolName = "web_search",
+                    output = kotlinx.serialization.json.JsonPrimitive("整段服务商侧搜索结果原文"),
+                    status = ServerToolStatus.COMPLETED,
+                ),
+            ),
+            modelId = modelA,
+            fromGroupChat = true,
+        )
+        val result = buildGroupTranscript(
+            messages = listOf(own),
+            speakingModelId = modelA,
+            nameOf = ::nameOf,
+            cleanGroupUtterances = true,
+        )
+        val kept = result.single()
+        assertEquals("正文必须还在", "结论：走 B 方案", kept.toText().trim())
+        assertTrue("服务商侧搜索分片必须被摘掉", kept.parts.none { it is UIMessagePart.ServerTool })
+        assertTrue("思考分片必须被摘掉", kept.parts.none { it is UIMessagePart.Reasoning })
+        assertFalse(
+            "搜索结果原文一个字都不许出现在上文里",
+            kept.toText().contains("整段服务商侧搜索结果原文"),
+        )
+        assertFalse("思考原文不许出现在上文里", kept.toText().contains("我先搜一下再说"))
+    }
+
+    @Test
+    fun `开关打开时，开群之前的历史照旧整份带，一个字都不许摘`() {
+        // 用户 v319 原话「我要的是打开时候获取全部上文」；v321 补充口径又把范围钉死成
+        // 「群聊过程中产生的上文，不是打开群聊之前的上文」。这条是最容易误伤的地方。
+        val history = UIMessage(
+            role = MessageRole.ASSISTANT,
+            parts = listOf(
+                UIMessagePart.Text("开群前我查过的东西"),
+                UIMessagePart.Reasoning("当时是这么想的"),
+                UIMessagePart.Tool(
+                    toolCallId = "h1",
+                    toolName = "search_web",
+                    input = """{"query":"北京展览"}""",
+                    output = listOf(UIMessagePart.Text("查到 5 条结果")),
+                ),
+            ),
+            modelId = modelA,
+            // 关键：开群之前 → false。modelId 故意等于发言者（成员模型与主对话当前模型
+            // 常常是同一个，v319 注释里写死过这个坑），只按 modelId 判就会误伤这条。
+            fromGroupChat = false,
+        )
+        val result = buildGroupTranscript(
+            messages = listOf(history),
+            speakingModelId = modelA,
+            nameOf = ::nameOf,
+            cleanGroupUtterances = true,
+        )
+
+        assertEquals(1, result.size)
+        assertSame("开群前的历史必须原样返回（同一条对象）", history, result[0])
+        assertEquals("逐字段相等", history, result[0])
+        assertEquals(
+            "思考不许被摘",
+            1,
+            result[0].parts.count { it is UIMessagePart.Reasoning },
+        )
+        assertEquals("工具不许被摘", 1, result[0].parts.count { it is UIMessagePart.Tool })
+        assertEquals(
+            "工具产出的原文要原样带得到",
+            listOf("查到 5 条结果"),
+            result[0].parts.filterIsInstance<UIMessagePart.Tool>()
+                .single().output.filterIsInstance<UIMessagePart.Text>().map { it.text },
+        )
+    }
+
+    @Test
+    fun `开关打开时，成员问过的问题与用户的回答仍要带进上文`() {
+        // v318 真机坑：摘掉会让下一个成员当场否认用户答过的条件。
+        // ask_user 是「用户本人说的话」，不属于「杂乱的调查过程」。
+        val asked = askMessage(
+            modelId = modelA,
+            text = "先确认一个条件",
+            answer = """{"answers":{"q0":"公开"}}""",
+        ).copy(fromGroupChat = true)
+
+        val result = buildGroupTranscript(
+            messages = listOf(asked),
+            speakingModelId = modelA,
+            nameOf = ::nameOf,
+            cleanGroupUtterances = true,
+        )
+
+        assertEquals(1, result.size)
+        val ask = result[0].getTools().single()
+        assertEquals("提问卡片必须留着", "ask_user", ask.toolName)
+        assertTrue("问的题还在", ask.input.contains("你是想公开评估还是先私下谈？"))
+        assertEquals(
+            "用户的回答必须还在卡片里",
+            """{"answers":{"q0":"公开"}}""",
+            (ask.approvalState as? ToolApprovalState.Answered)?.answer,
+        )
+        assertEquals(
+            "正文照旧留着",
+            listOf("先确认一个条件"),
+            result[0].parts.filterIsInstance<UIMessagePart.Text>().map { it.text },
+        )
+    }
+
+    @Test
+    fun `开关打开时，成员生成的图片与文件照旧保留`() {
+        // 那是「模型的输出」，不属于「杂乱的调查过程」；库里存的是路径不是原文。
+        val withMedia = UIMessage(
+            role = MessageRole.ASSISTANT,
+            parts = listOf(
+                UIMessagePart.Text("这是效果图"),
+                UIMessagePart.Reasoning("先画一张"),
+                UIMessagePart.Image("file:///tmp/effect.png"),
+                UIMessagePart.Document(
+                    url = "file:///tmp/plan.md",
+                    fileName = "plan.md",
+                    mime = "text/markdown",
+                ),
+            ),
+            modelId = modelA,
+            fromGroupChat = true,
+        )
+        val result = buildGroupTranscript(
+            messages = listOf(withMedia),
+            speakingModelId = modelA,
+            nameOf = ::nameOf,
+            cleanGroupUtterances = true,
+        )
+
+        val parts = result.single().parts
+        assertEquals(
+            "只剩正文 + 图片 + 文件，顺序不变",
+            listOf(
+                UIMessagePart.Text("这是效果图"),
+                UIMessagePart.Image("file:///tmp/effect.png"),
+                UIMessagePart.Document(
+                    url = "file:///tmp/plan.md",
+                    fileName = "plan.md",
+                    mime = "text/markdown",
+                ),
+            ),
+            parts,
+        )
+        assertEquals("图片那一片还在", 1, parts.count { it is UIMessagePart.Image })
+        assertEquals("文件那一片还在", 1, parts.count { it is UIMessagePart.Document })
+        assertTrue("思考照旧摘掉", parts.none { it is UIMessagePart.Reasoning })
+    }
+
+    @Test
+    fun `开关打开时，只剩思考与工具的群发言要留一句占位，不能发空消息`() {
+        val silent = groupUtteranceOf(modelA, text = null)
+        val result = buildGroupTranscript(
+            messages = listOf(silent),
+            speakingModelId = modelA,
+            nameOf = ::nameOf,
+            cleanGroupUtterances = true,
+        )
+
+        val parts = result.single().parts
+        assertTrue(
+            "不许出现 parts 为空的消息（空助手消息会被部分服务商直接拒掉）",
+            parts.isNotEmpty(),
+        )
+        assertEquals(
+            "要有一句人能看懂的占位",
+            listOf("（这条群讨论发言只有思考过程与工具调用，正文为空）"),
+            parts.filterIsInstance<UIMessagePart.Text>().map { it.text },
+        )
+    }
+
+    @Test
+    fun `开关关着（默认）时，群发言一个字段都不许动`() {
+        // 回归钉：不传 cleanGroupUtterances = 与 v320 逐字节一致。
+        val own = groupUtteranceOf(modelA)
+        val result = buildGroupTranscript(
+            messages = listOf(own),
+            speakingModelId = modelA,
+            nameOf = ::nameOf,
+        )
+
+        assertSame("必须原样返回同一条对象", own, result.single())
+        assertEquals("逐字段相等", own, result.single())
+        assertEquals("正文、思考、工具三片都在", 3, result.single().parts.size)
+        assertTrue(result.single().parts.any { it is UIMessagePart.Reasoning })
+        assertTrue(result.single().parts.any { it is UIMessagePart.Tool })
+    }
+
+    @Test
+    fun `主对话剥离：默认保留思考，打开开关才连思考一起摘`() {
+        val groupMsg = UIMessage(
+            role = MessageRole.ASSISTANT,
+            parts = listOf(
+                UIMessagePart.Text("群里的结论"),
+                UIMessagePart.Reasoning("当时想的过程"),
+                UIMessagePart.Tool(
+                    toolCallId = "s1",
+                    toolName = "search_web",
+                    input = "{}",
+                    output = listOf(UIMessagePart.Text("群里为讨论搜的东西")),
+                ),
+                UIMessagePart.ServerTool(
+                    toolCallId = "s2",
+                    toolName = "web_search",
+                    output = kotlinx.serialization.json.JsonPrimitive("服务商侧搜索结果"),
+                    status = ServerToolStatus.COMPLETED,
+                ),
+                UIMessagePart.Tool(
+                    toolCallId = "s3",
+                    toolName = "ask_user",
+                    input = "{}",
+                    output = listOf(UIMessagePart.Text("用户回答")),
+                    approvalState = ToolApprovalState.Answered("用户回答"),
+                ),
+            ),
+            modelId = modelA,
+            fromGroupChat = true,
+        )
+
+        fun shapeOf(parts: List<UIMessagePart>): List<String> = parts.map {
+            when (it) {
+                is UIMessagePart.Text -> "text:${it.text}"
+                is UIMessagePart.Reasoning -> "reasoning"
+                is UIMessagePart.Tool -> "tool:${it.toolName}"
+                is UIMessagePart.ServerTool -> "servertool"
+                else -> "other"
+            }
+        }
+
+        // ① 默认（dropReasoning = false）= v320 老口径：思考留着，工具与 ServerTool 摘掉
+        val legacy = listOf(groupMsg).withoutGroupChatToolParts().single()
+        assertEquals(
+            "默认口径：正文 + 思考 + 提问卡片；工具与服务商侧搜索摘掉",
+            listOf("text:群里的结论", "reasoning", "tool:ask_user"),
+            shapeOf(legacy.parts),
+        )
+        assertFalse("群里搜到的原文不许留下", legacy.toText().contains("群里为讨论搜的东西"))
+        assertFalse("服务商侧搜索结果不许留下", legacy.toText().contains("服务商侧搜索结果"))
+
+        // ② dropReasoning = true（用户在设置里打开开关）：思考也摘，正文与提问卡片照旧
+        val clean = listOf(groupMsg).withoutGroupChatToolParts(dropReasoning = true).single()
+        assertEquals(
+            "开关打开：正文 + 提问卡片，思考也摘掉",
+            listOf("text:群里的结论", "tool:ask_user"),
+            shapeOf(clean.parts),
+        )
+        assertEquals(
+            "提问卡片仍带用户答过的话（v318 红线）",
+            "用户回答",
+            (clean.getTools().single().approvalState as? ToolApprovalState.Answered)?.answer,
+        )
+        // 用户选的是「不删数据」：剥离只发生在请求视图上，原消息一个字段都不动
+        assertEquals("原消息不许被改坏", 5, groupMsg.parts.size)
+        assertEquals(
+            "原消息里思考必须还在",
+            1,
+            groupMsg.parts.count { it is UIMessagePart.Reasoning },
+        )
     }
 }

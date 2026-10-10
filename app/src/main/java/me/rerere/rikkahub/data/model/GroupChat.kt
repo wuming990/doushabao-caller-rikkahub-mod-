@@ -80,6 +80,17 @@ data class GroupChatConfig(
     val allowAskUser: Boolean = true,
     /** 每个成员开口前，允许它先查工作区/搜索（工具与主对话同一套装配） */
     val allowTools: Boolean = true,
+    /**
+     * v319：群讨论上文的字符上限，**0 = 不限**（默认）。
+     *
+     * 用户口径（v319 原话）：「我要的是打开时候获取全部上文」—— 所以默认不设上限，
+     * 十几万字的原对话（含之前的工具调用与子代理产出）整份带进群。
+     *
+     * 但这个可调项是**自救入口**，不是摆设：整份上文一旦超过某个模型的上下文窗口，
+     * 服务商那边会直接报错、讨论一步都跑不动。用户自己在设置里填一个数就能降级，
+     * 不必等开发者改代码发新版。
+     */
+    val transcriptCharLimit: Int = DEFAULT_TRANSCRIPT_CHAR_LIMIT,
 ) {
     // v313 曾加过 firstRoundBlind（首轮各自独立想）开关，**已删除**：
     // 引擎没有实现它，留着就是一个骗人的界面开关（审查位抓的同类问题）。
@@ -103,6 +114,17 @@ data class GroupChatConfig(
 
         /** v315：一键预设最多填几个成员（3 个够讨论，也够省） */
         const val MAX_PRESET_MEMBERS = 3
+
+        /**
+         * v319：群讨论上文的默认字符上限 = **0（不限）**。
+         *
+         * 用户口径：「我要的是打开时候获取全部上文」，所以默认不砍。
+         * >0 时才从最旧的发言开始丢（保住最新内容），那是留给「模型窗口装不下」时的自救档。
+         */
+        const val DEFAULT_TRANSCRIPT_CHAR_LIMIT = 0
+
+        /** v319：上限档位能填到的最大值（挡住误填的天文数字，够用即可） */
+        const val MAX_TRANSCRIPT_CHAR_LIMIT = 2_000_000
     }
 }
 
@@ -155,6 +177,27 @@ fun clampGroupTurns(turnsPerRun: Int): Int =
  */
 fun clampResumeMax(resumeMax: Int): Int =
     resumeMax.coerceIn(0, GroupChatConfig.MAX_RESUME_MAX)
+
+/**
+ * v319：把「群讨论上文上限」夹进合法区间。
+ *
+ * 允许 0 = 不限（默认，用户要的「打开时候获取全部上文」）。负数按 0 处理：
+ * 负数传进截断逻辑会算成「一条都不留」，等于把讨论直接废掉，那不是用户要的。
+ */
+fun clampGroupTranscriptLimit(limit: Int): Int =
+    limit.coerceIn(0, GroupChatConfig.MAX_TRANSCRIPT_CHAR_LIMIT)
+
+/**
+ * v319：解析点名 —— 用户点名的那位还在成员里就采用他，否则返回 null（退回正常顺序）。
+ *
+ * 为什么抽成顶层纯函数：引擎里的 pickSpeaker 要造 host / conversation / settings 才跑得动，
+ * 真单测代价过高；而「点了一个已经被移出群的人」恰恰是最容易写歪、又最容易咬人的分支，
+ * 必须有人守。所以把判定本身摘出来测，引擎只负责「取名字 + 报告退回原因」。
+ */
+fun resolveRequestedSpeaker(
+    requested: Uuid?,
+    members: Set<Uuid>,
+): Uuid? = requested?.takeIf { it in members }
 
 /**
  * v315：成员组合预设（用户口径：「没有预设方案选择 —— 现成的成员组合，比如三个不同长处的模型，

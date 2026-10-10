@@ -62,6 +62,7 @@ class ChatNotificationManager(
                 when (event) {
                     is AppEvent.ChatGenerationUpdate -> Unit // 二改：不再显示生成中常驻通知（上游 2.4.13 改由前台服务通知承载）
                     is AppEvent.ChatGenerationEnded -> handleGenerationEnded(event)
+                    is AppEvent.GroupChatWaitingForUser -> handleGroupChatWaiting(event)
                     else -> {}
                 }
             }
@@ -98,6 +99,53 @@ class ChatNotificationManager(
             AppEvent.GenerationEndReason.STOPPED -> context.getString(R.string.notification_generation_stopped)
         }
         sendGenerationDoneNotification(event.conversationId, event.senderName, content)
+    }
+
+    /**
+     * v320：AI 讨论群组停下来等用户 → 应用在后台时发一条系统通知。
+     *
+     * 症状（用户原话）：「弹出提问工具时，已经没有在继续生成了，但我处于后台不会弹出通知」。
+     * 根因不在通知设施本身：群讨论那条路从来不往事件总线发信号，所以这里从来没被叫醒过。
+     *
+     * 用**独立开关** `displaySetting.notifyGroupChatWaiting`（默认开），不去蹭主对话那条
+     * 「AI 停止运行就通知我」：两件事含义不同，用户要能单独关掉群通知，也不能因为改主对话
+     * 那个开关就连带把群通知改掉（同一份隔离口径）。
+     *
+     * 文案刻意写清「要你做什么」，不是笼统的「已完成」——用户点开就知道该回话还是该点继续。
+     */
+    private fun handleGroupChatWaiting(event: AppEvent.GroupChatWaitingForUser) {
+        if (isForeground.value) return
+        if (!settingsStore.settingsFlow.value.displaySetting.notifyGroupChatWaiting) return
+
+        val who = event.senderName.takeIf { it.isNotBlank() }
+        val headline = if (who != null) "讨论群 · $who" else "讨论群在等你"
+        val body = when (event.reason) {
+            AppEvent.GroupWaitReason.QUESTION ->
+                (who?.let { "$it 在等你回答问题" } ?: "有成员在等你回答问题") + "，回一句讨论就继续"
+
+            AppEvent.GroupWaitReason.TURN_DONE ->
+                "这一批说完了，等你点「继续讨论」"
+
+            // v320：整场结束不能糊成「等你点继续讨论」—— 那种场合点了也不会跑，文案不许说谎
+            AppEvent.GroupWaitReason.ENDED ->
+                "讨论已经停下（成员不足两个，或群已停用/解散），要改群设置才能继续"
+
+            AppEvent.GroupWaitReason.FAILED ->
+                "这一轮出错了" + (event.errorText?.takeIf { it.isNotBlank() }?.let { "：$it" } ?: "")
+        }
+
+        context.sendNotification(
+            channelId = CHAT_COMPLETED_NOTIFICATION_CHANNEL_ID,
+            // 与主对话用同一个通知 id：同一个对话只留最新一条，不堆一串
+            notificationId = event.conversationId.hashCode() + 20000
+        ) {
+            title = headline
+            content = body
+            autoCancel = true
+            useDefaults = true
+            category = NotificationCompat.CATEGORY_MESSAGE
+            contentIntent = getPendingIntent(context, event.conversationId)
+        }
     }
 
     private fun sendGenerationDoneNotification(

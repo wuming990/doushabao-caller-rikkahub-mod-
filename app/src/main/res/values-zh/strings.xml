@@ -858,6 +858,8 @@
   <string name="setting_display_page_message_jumper_position_title">消息导航按钮位置</string>
   <string name="setting_display_page_notification_message_generated">AI 结束运行时通知</string>
   <string name="setting_display_page_notification_message_generated_desc">应用在后台时，仅在 AI 正常完成、异常或取消后通知；生成过程中不常驻通知栏</string>
+  <string name="setting_display_page_notification_group_waiting">讨论群停下来等你时通知</string>
+  <string name="setting_display_page_notification_group_waiting_desc">只管讨论群，与上面那条互不影响：有成员在用提问卡片等你回话、这一批说完需要你点「继续讨论」、或某一位这一轮出错时提醒</string>
   <string name="setting_display_page_paste_long_text_as_file_desc">当粘贴的文本超过阈值时，自动将其保存为文件附件</string>
   <string name="setting_display_page_paste_long_text_as_file_title">粘贴长文本为文件</string>
   <string name="setting_display_page_paste_long_text_threshold_title">文本长度阈值</string>

@@ -17,7 +17,9 @@ import me.rerere.rikkahub.agent.model.AgentPipelineStage
 import me.rerere.rikkahub.agent.model.AgentRole
 import me.rerere.rikkahub.agent.model.AgentSpawnRequest
 import me.rerere.rikkahub.agent.model.AgentVerdict
-import me.rerere.rikkahub.agent.runtime.AGENT_RESUME_TOTAL_MAX
+// v321：这里不再引用裸常量 AGENT_RESUME_TOTAL_MAX —— 上限只有一个算法
+// （AgentThreadManager.effectiveResumeTotalMax），工具层一律通过 manager.resumeTotalMax() 取，
+// 所以这个 import 是多余的，留着就是「还有第二把尺子」的旧痕。
 import me.rerere.rikkahub.agent.runtime.AgentLimitReachedException
 import me.rerere.rikkahub.agent.runtime.AgentThreadManager
 
@@ -290,6 +292,10 @@ private fun createWaitTool(manager: AgentThreadManager) = Tool(
         val timeoutSeconds = params["timeout_seconds"]?.jsonPrimitive?.contentOrNull
             ?.toLongOrNull()?.coerceIn(1, 3600) ?: 600L
         val threads = manager.awaitTerminal(threadIds, timeoutSeconds * 1000)
+        // v321：真实生效的续跑上限。必须在 buildJsonObject **之前**取好 ——
+        // 那是个非挂起 lambda，挂起函数进不去；而且只有这里取对了，主模型看到的
+        // 才是真数（回传裸常量的话永远是 8，会误判「快烧穿了」而提前接手）。
+        val resumeLimit = manager.resumeTotalMax()
         listOf(
             UIMessagePart.Text(
                 buildJsonObject {
@@ -331,7 +337,8 @@ private fun createWaitTool(manager: AgentThreadManager) = Tool(
                             // error_kind=RECOVERABLE 时后台可能已经在自动续跑（上限 2 次）；
                             // FATAL 表示再试也没用（Key 无效 / 模型不存在 / 参数非法）。
                             put("resume_count", t.resumeCount)
-                            put("resume_limit", AGENT_RESUME_TOTAL_MAX)
+                            // v321：回传**生效值**而不是常量（见 AgentThreadManager.effectiveResumeTotalMax）
+                            put("resume_limit", resumeLimit)
                             put("error_kind", AgentErrorKind.classify(t.error).name)
                             // v245：「多久没有新内容」是区分「还在稳定产出」和「已经卡住」的
                             // 唯一硬指标。此前主模型只能看到 status=RUNNING，于是要么白等到
@@ -450,6 +457,10 @@ private fun createResumeTool(
             return@Tool listOf(UIMessagePart.Text("{\"error\":\"thread_id is required\"}"))
         }
         val target = manager.list(conversationId).firstOrNull { t -> t.id == threadId }
+        // v321：手动「继续输出」与自动续跑必须同一把尺子。此前手动这条路拿裸常量 8 判，
+        // 自动那条走 max(8, 次数×2) —— 用户设 10 次时自动还能续、按钮却回他
+        // 「resume limit reached (8/8)」，明明有额度却不给点。
+        val resumeLimit = manager.resumeTotalMax()
         val failure = when {
             target == null -> "thread not found in this conversation"
             // v243：换模型时先确认这个模型真的存在，并把原因说清楚。
@@ -464,8 +475,8 @@ private fun createResumeTool(
             !switching && !target.canResume ->
                 "thread is not resumable (status=${target.status.name}, truncated=${target.truncated})"
 
-            target.resumeCount >= AGENT_RESUME_TOTAL_MAX ->
-                "resume limit reached (${target.resumeCount}/$AGENT_RESUME_TOTAL_MAX)"
+            target.resumeCount >= resumeLimit ->
+                "resume limit reached (${target.resumeCount}/$resumeLimit)"
 
             else -> null
         }

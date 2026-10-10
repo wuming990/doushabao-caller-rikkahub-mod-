@@ -304,6 +304,18 @@ class SettingsStore(
          */
         val GROUP_CHAT_PRESETS = stringPreferencesKey("group_chat_presets")
 
+        /**
+         * v321：「群讨论只保留发言正文」——**全局**开关，默认关。
+         *
+         * 为什么存全局而不塞进 GroupChatConfig：这条设置要在「解散群之后主对话拼上下文」
+         * 那条路上也读得到，而那份群配置可能被用户「彻底删除」（v315 就有这个动作）。
+         * 存在群配置里一旦配置被删就静默失效，那是最难查的一类毛病。
+         * 群组设置面板里那一栏只是把这个全局值露出来给用户拨，不另存一份。
+         *
+         * 读取一律用 `== true`（不是 `!= false`）：缺 key 时必须拿到 false = 行为与 v320 一致。
+         */
+        val GROUP_CHAT_CLEAN_CONTEXT = booleanPreferencesKey("group_chat_clean_context")
+
         /** v268：手动压缩上次选择的模式（true = 经典压缩）。 */
         val COMPRESS_USE_CLASSIC_MODE = booleanPreferencesKey("compress_use_classic_mode")
 
@@ -438,6 +450,8 @@ class SettingsStore(
                 // v316：用户方案列表（数组保序，无需转键）。空列表也照写 ——
                 // 只在「一条都没有」时删掉这个键会让 DataStore 里残留旧数据，反而更糟。
                 preferences[GROUP_CHAT_PRESETS] = JsonInstant.encodeToString(settings.groupChatPresets)
+                // v321：「群讨论只保留发言正文」全局开关
+                preferences[GROUP_CHAT_CLEAN_CONTEXT] = settings.groupChatCleanContext
                 preferences[AGENT_CONVERSATION_SEARCH] = settings.allowAgentConversationSearch
                 preferences[AGENT_MAX_STEPS] = settings.agentMaxSteps.coerceIn(16, 96)
                 // v220 修复：子代理开关与默认模型必须落盘，否则下一次 DataStore 发射会恢复默认
@@ -567,6 +581,8 @@ class SettingsStore(
                 groupChatPresets = preferences[GROUP_CHAT_PRESETS]?.let { raw ->
                     decodeGroupPresetsTolerant(raw)
                 } ?: emptyList(),
+                // v321：必须是 false 当缺 key（老存档没有这个键）—— 用 `== true`，不用 `!= false`
+                groupChatCleanContext = preferences[GROUP_CHAT_CLEAN_CONTEXT] == true,
                 // v280：默认必须是关 —— 缺 key 时要得到 false，所以用 `== true` 而不是 `!= false`
                 allowAgentConversationSearch = preferences[AGENT_CONVERSATION_SEARCH] == true,
                 agentMaxSteps = (preferences[AGENT_MAX_STEPS] ?: 32).coerceIn(16, 96),
@@ -1176,6 +1192,18 @@ data class Settings(
      * 默认空表 —— 没有方案的对话与改前完全一致（群功能不牵连普通聊天）。
      */
     val groupChatPresets: List<GroupChatPreset> = emptyList(),
+    /**
+     * v321：「群讨论只保留发言正文」。默认 false = 与 v320 逐字节一致。
+     *
+     * 打开后，**群讨论期间产生的**思考过程、工具调用与结果、搜索结果
+     * ① 不再进任何成员的上文（每位成员只看大家说过的正文）
+     * ② 解散/暂停群之后，主对话拼上下文时也不再带上这些内容
+     *
+     * 三条不动的东西（用户 v321 明确过）：开群前原对话的上文照旧整份带；
+     * 成员向用户提的问题与用户的回答照旧保留；图片/文件/音视频照旧保留。
+     * 界面上的讨论记录**一个字都不删**，用户仍能回看当时查过什么。
+     */
+    val groupChatCleanContext: Boolean = false,
     /** v268：手动压缩上次选择的模式（true = 经典压缩，默认智能压缩）。 */
     val compressUseClassicMode: Boolean = false,
     /**
@@ -1360,6 +1388,19 @@ data class DisplaySetting(
     val enableMessageGenerationHapticEffect: Boolean = false,
     val skipCropImage: Boolean = true,
     val enableNotificationOnMessageGeneration: Boolean = false,
+    /**
+     * v320：AI 讨论群组**停下来等你**时在后台发一条系统通知（默认开）。
+     *
+     * 用户反馈的原始症状：「弹出提问工具时，已经没有在继续生成了，但我处于后台不会弹出通知」。
+     *
+     * 刻意**不复用**上面那条 `enableNotificationOnMessageGeneration`：
+     * ① 那条默认关，蹭它的话这次「修好」在多数装机上根本看不见效果，等于白修；
+     * ② 含义也不同 —— 主对话那条讲「AI 跑完了」，这条讲「有人等你回话/等你点继续」；
+     * ③ 用户要能单独关掉群通知而不影响主对话（也反过来）。
+     *
+     * 带默认值 → DisplaySetting 整块 JSON 序列化，旧设置自动兼容，**不动数据库版本**。
+     */
+    val notifyGroupChatWaiting: Boolean = true,
     val enableLiveUpdateNotification: Boolean = false,
     val codeBlockAutoWrap: Boolean = false,
     val codeBlockAutoCollapse: Boolean = false,

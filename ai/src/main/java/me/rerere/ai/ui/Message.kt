@@ -89,6 +89,19 @@ data class UIMessage(
      * 新字段带默认值，旧聊天 JSON/数据库记录仍可正常反序列化，无需迁移。
      */
     val resumeCount: Int = 0,
+    /**
+     * v319：这条发言是「AI 讨论群组」里产生的成员发言。
+     *
+     * 为什么必须有：群成员为了讨论去搜资料、调工具，这些记录留在对话里（用户能回看），
+     * 但**不该在解散群之后被当成主对话的上下文带出去** —— 那是「为讨论做的临时调查」，
+     * 不是主对话经历过的东西，硬塞给主对话模型只会让它以为「我调过一个我没调的工具」。
+     * 用户口径（v319 原话）：解散后「只带方案和聊天记录，不带群里的搜索/工具上文」。
+     *
+     * 为什么不能靠 modelId 区分：成员模型完全可能和主对话当前模型是同一个，
+     * 那样两条路径产生的消息在数据上一模一样，只能显式标记。
+     * 新字段带默认值，旧聊天 JSON / 数据库记录仍可正常反序列化，无需迁移。
+     */
+    val fromGroupChat: Boolean = false,
 ) {
     fun summaryAsText(maxLength: Int = Int.MAX_VALUE): String {
         val text = "[${role.name}]: " + parts.joinToString(separator = "\n") { part ->

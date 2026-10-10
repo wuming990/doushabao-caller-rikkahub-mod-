@@ -71,6 +71,7 @@ import me.rerere.rikkahub.data.repository.FavoriteRepository
 import me.rerere.rikkahub.service.ChatError
 import me.rerere.rikkahub.service.CompressionModelSource
 import me.rerere.rikkahub.service.ChatService
+import me.rerere.rikkahub.service.GroupPickOutcome
 import me.rerere.rikkahub.service.GroupRunState
 import me.rerere.rikkahub.service.RoundTableGapDecision
 import me.rerere.rikkahub.service.RoundTableRunState
@@ -623,6 +624,14 @@ class ChatVM(
     }
 
     /** 这个对话的群设置；没建过群返回 null */
+    /**
+     * v319：点名 —— 让指定成员下一个说话（跳过中间排队的其他成员）。
+     *
+     * 同步调用即可：ChatService 那一层只改状态、必要时开一批，本身不是 suspend。
+     */
+    fun requestGroupSpeaker(modelId: Uuid): GroupPickOutcome =
+        chatService.requestGroupSpeakerNow(_conversationId, modelId)
+
     fun groupConfig(): GroupChatConfig? =
         settingsStore.settingsFlow.value.groupChatConfigs[_conversationId]
 

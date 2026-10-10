@@ -21,6 +21,7 @@ import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.data.model.GroupChatConfig
 import me.rerere.rikkahub.data.model.GroupSpeakerMode
 import me.rerere.rikkahub.data.model.nextRoundRobinSpeaker
+import me.rerere.rikkahub.data.model.resolveRequestedSpeaker
 import me.rerere.rikkahub.data.model.sanitizeGroupMembers
 import kotlin.uuid.Uuid
 
@@ -104,6 +105,9 @@ internal class GroupChatEngine(
      * 圆桌 v239 那次「点停止没反应」的根因就是协程卡在不可取消的上游上。
      */
     suspend fun advanceTurns() {
+        // v320：记下自己是哪一场。被更新的场次顶掉时，收尾不许再把状态写成 STOPPED
+        //（否则用户点「你来说」/「继续讨论」会撞上「新一批一睁眼发现已停止」→ 全场安静）。
+        val epoch = run.runEpoch
         while (true) {
             val state = run.snapshot()
             if (state.status == GroupRunStatus.STOPPED || state.status == GroupRunStatus.FINISHED) return
@@ -154,12 +158,29 @@ internal class GroupChatEngine(
             host.setStatus("🗣 $speakerName 正在发言")
 
             val outcome = try {
-                speakOnce(speaker, speakerName, config, members, assistant, conversation)
+                speakOnce(
+                    speaker,
+                    speakerName,
+                    config,
+                    members,
+                    assistant,
+                    conversation,
+                    // v321：全局设置，每次开新批次都现读（用户中途改了立刻生效，不缓存进 run）
+                    settings.groupChatCleanContext,
+                )
             } catch (e: CancellationException) {
                 // 用户主动停止：原样上抛，绝不当成「这个成员失败了，换下一个」
-                run.markStopped()
+                // v320：只有还在自己这一场才落 STOPPED（被新一批顶掉的旧协程不许盖状态）
+                run.markStoppedIfCurrent(epoch)
                 host.setStatus(null)
                 throw e
+            } catch (e: GroupSpeakerAbortedException) {
+                // v320：用户点名，当场撤掉了**还没出声**的那位成员。
+                // 这一轮既没说出话、也没产出内容 → **不占批次额度、不算失败、不推进轮流游标**，
+                // 直接进下一轮；下一轮开头 pickSpeaker 会先取走被点名的那个名字。
+                // 必须排在 catch (Exception) 之前 —— 它是 Exception 的子类，排后面会被当成失败成员。
+                host.setStatus(null)
+                continue
             } catch (e: Exception) {
                 val canContinue = run.markTurnFailed(
                     modelId = speakerId,
@@ -211,8 +232,15 @@ internal class GroupChatEngine(
         members: List<Uuid>,
         assistant: Assistant,
         conversation: Conversation,
+        /** v321：「群讨论只保留发言正文」全局设置，由 advanceTurns 传下来 */
+        cleanContext: Boolean,
     ): TurnOutcome {
-        val messages = transcriptFor(speaker.id, conversation) + turnInstruction(
+        val messages = transcriptFor(
+            speaker.id,
+            conversation,
+            config.transcriptCharLimit,
+            cleanContext,
+        ) + turnInstruction(
             speakerId = speaker.id,
             speakerName = speakerName,
             config = config,
@@ -262,10 +290,22 @@ internal class GroupChatEngine(
     private fun transcriptFor(
         speakerId: Uuid,
         conversation: Conversation,
+        /** v319：上限来自群自己的设置（0 = 不限，默认） */
+        charLimit: Int,
+        /**
+         * v321：「群讨论只保留发言正文」（全局设置）。
+         *
+         * 打开后只影响**群里聊出来的**那部分上文（思考 / 工具 / 搜索）；
+         * 开群前原对话的上文照旧整份带 —— 用户 v319 与 v321 两条口径的交界，
+         * 判定本身在 buildGroupTranscript 里，这里只负责把设置传下去。
+         */
+        cleanGroupUtterances: Boolean,
     ): List<UIMessage> = buildGroupTranscript(
         messages = conversation.currentMessages,
         speakingModelId = speakerId,
         nameOf = { id -> host.displayName(id) },
+        charLimit = charLimit,
+        cleanGroupUtterances = cleanGroupUtterances,
     )
 
     /**
@@ -281,6 +321,18 @@ internal class GroupChatEngine(
         conversation: Conversation,
     ): Uuid? {
         val existing = members.toSet()
+        // v319：用户点名**优先于**轮流与主持人 —— 他说了「你来回」，就不该再被顺序安排成别人。
+        // 点名的那位已被移出成员时不静默吞掉：退回正常顺序，并把原因摆到用户面前
+        // （否则他点了「你来说」却听见别人说话，只会以为按钮坏了）。
+        val requested = run.takeRequestedSpeaker()
+        resolveRequestedSpeaker(requested, existing)?.let { return it }
+        if (requested != null) {
+            // 点名的那位已被移出成员：不静默吞掉，退回正常顺序并把原因摆到用户面前
+            host.reportError(
+                IllegalStateException("点名的那位已经不在成员里了，这一轮按原顺序继续。"),
+                "点名",
+            )
+        }
         val last = run.snapshot().lastSpeakerModelId
         val roundRobin = nextRoundRobinSpeaker(members, existing, last)
         if (config.speakerMode != GroupSpeakerMode.MODERATED) return roundRobin
@@ -295,7 +347,14 @@ internal class GroupChatEngine(
             host.speak(
                 model = moderator,
                 assistant = host.assistantFor(conversation),
-                messages = transcriptFor(moderator.id, conversation) + UIMessage(
+                messages = transcriptFor(
+                    moderator.id,
+                    conversation,
+                    config.transcriptCharLimit,
+                    // v321：主持人挑人同样只看正文（开着「只保留发言正文」时）。
+                    // 它只需要知道谁说过什么就够挑人了，多塞工具原文反而更容易撞窗口上限。
+                    settings.groupChatCleanContext,
+                ) + UIMessage(
                     role = MessageRole.USER,
                     parts = listOf(
                         UIMessagePart.Text(
@@ -336,6 +395,8 @@ internal class GroupChatEngine(
      * 与主对话唯一必须分岔的地方：见类注释。
      */
     suspend fun resumeAfterUserAnswer() {
+        // v320：记下场次（与 advanceTurns 同一口径：被新一批顶掉时不许再改写状态）
+        val epoch = run.runEpoch
         val asked = run.resumeFromQuestion() ?: return
         val settings = host.settings()
         val conversation = host.conversation()
@@ -372,7 +433,14 @@ internal class GroupChatEngine(
         // 「末条消息里有没有待续跑的工具」——认不出就会走全新生成，再按
         // overwriteMessageId 原地覆盖这条提问消息，提问卡片与用户的答案一起被抹掉。
         val transcript = moveGroupMessageToEnd(
-            messages = transcriptFor(asked, conversation),
+            messages = transcriptFor(
+                asked,
+                conversation,
+                config.transcriptCharLimit,
+                // v321：答完提问接着说，用的也是同一份上文 —— 口径必须一致，
+                // 否则「第一次发言」和「续写」看到的干净程度会不一样（两处漂移的老毛病）。
+                settings.groupChatCleanContext,
+            ),
             messageId = continuingId,
         )
 
@@ -402,9 +470,16 @@ internal class GroupChatEngine(
             val canContinue = run.markTurnDone(speaker.id)
             if (canContinue) advanceTurns()
         } catch (e: CancellationException) {
-            run.markStopped()
+            // 用户主动停止：原样上抛，绝不当成「这个成员失败了，换下一个」
+            // v320：只有还在自己这一场才落 STOPPED（被新一批顶掉的旧协程不许盖状态）
+            run.markStoppedIfCurrent(epoch)
             host.setStatus(null)
             throw e
+        } catch (e: GroupSpeakerAbortedException) {
+            // v320：答完提问后 TA 又开口、还没出声时被用户点名换掉。
+            // 撤掉后照样把这一批跑完 —— 让被点名的那位说话（不占额度、不算失败）。
+            host.setStatus(null)
+            advanceTurns()
         } catch (e: Exception) {
             run.markTurnFailed(speaker.id, speakerName, e.message ?: e.toString())
             host.reportError(e, speakerName)

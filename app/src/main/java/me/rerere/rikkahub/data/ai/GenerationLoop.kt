@@ -42,6 +42,7 @@ import me.rerere.rikkahub.data.files.FileFolders
 import me.rerere.rikkahub.data.ai.transformers.onGenerationFinish
 import me.rerere.rikkahub.data.ai.transformers.transforms
 import me.rerere.rikkahub.data.ai.transformers.visualTransforms
+import me.rerere.rikkahub.data.ai.prompts.withoutGroupChatToolParts
 import me.rerere.rikkahub.agent.model.AgentFinishReason
 import me.rerere.rikkahub.data.datastore.ResumeStrategy
 import me.rerere.rikkahub.data.datastore.Settings
@@ -364,6 +365,26 @@ class GenerationLoop(
          * 圆桌/子代理/压缩/翻译等其余路径不传，行为与改前逐字节一致。
          */
         highlightKeyPoints: Boolean = false,
+        /**
+         * v319：拼上下文时剥掉「AI 讨论群组期间产生的发言」里的工具调用与搜索结果。
+         *
+         * 用户口径（v319 原话）：「解散群聊后也是不把群聊里的搜索/调用工具上文带出去，
+         * 只带方案和聊天记录」。做法是**只影响发给模型的那份请求，不删任何数据** ——
+         * 群里的搜索记录仍然留在对话里、用户照样能回看，只是不再被当成主对话的亲身经历。
+         *
+         * 与 truncationAutoResumeMax / highlightKeyPoints 同一套隔离规矩：默认 false，
+         * 只有 ChatService 主对话路径显式打开。群成员自己那条路（speakGroupTurn）**必须
+         * 保持 false** —— 它要看得见自己刚搜到的东西，否则会重复搜、或忘了上一句的依据。
+         */
+        stripGroupToolParts: Boolean = false,
+        /**
+         * v321：「群讨论只保留发言正文」打开时一并剥掉群发言里的**思考过程**。
+         *
+         * 与 stripGroupToolParts 同一套隔离规矩：默认 false，只有 ChatService 主对话路径
+         * 按全局设置显式传 true。工具与搜索结果那一路（v319）本来就无条件剥，两者分开传参
+         * 是为了让「关着」时的行为与 v320 逐字节一致 —— 不许把两个条件合成一个布尔。
+         */
+        stripGroupReasoningParts: Boolean = false,
     ): Flow<GenerationChunk> = flow {
         val owningProvider = model.findProvider(settings.providers, checkOverwrite = false)
             ?: error("Provider not found")
@@ -426,6 +447,8 @@ class GenerationLoop(
                     truncationAutoResumeMax = truncationAutoResumeMax,
                     resumeStrategy = resumeStrategy,
                     highlightKeyPoints = highlightKeyPoints,
+                    stripGroupToolParts = stripGroupToolParts,
+                    stripGroupReasoningParts = stripGroupReasoningParts,
                 )
                 messages = messages.visualTransforms(
                     transformers = outputTransformers,
@@ -638,6 +661,10 @@ class GenerationLoop(
         resumeStrategy: ResumeStrategy = ResumeStrategy.CONTINUE,
         /** v270：重点标色插件（见 generateText 处 KDoc；默认 false = 零注入） */
         highlightKeyPoints: Boolean = false,
+        /** v319：见 generateText 处 KDoc（剥掉群组发言的工具部分，只影响请求、不改数据） */
+        stripGroupToolParts: Boolean = false,
+        /** v321：见 generateText 处 KDoc（「只保留发言正文」时连群发言的思考过程一起剥） */
+        stripGroupReasoningParts: Boolean = false,
     ) {
         val internalMessages = buildList {
             val system = buildString {
@@ -672,7 +699,22 @@ class GenerationLoop(
             if (system.isNotBlank()) {
                 add(UIMessage.system(prompt = system).copy(isSynthetic = true))
             }
-            addAll(messages.limitContext(assistant.contextMessageLimit))
+            // v319：主对话专用 —— 把「群组期间产生的发言」里的工具调用与搜索结果摘掉再发请求，
+            // 只留方案与对话文字。刻意做在「发给模型的请求视图」上，而不是去改 messages 本身：
+            // 对话里的原始记录一个字都不动，用户照样能回看群里当时查了什么（用户选的是不删数据）。
+            addAll(
+                messages
+                    .let {
+                        // v321：dropReasoning 只在「主对话那条路」上有意义（stripGroupToolParts
+                        // 本身就是主对话专用），所以两者共用同一个 if，不另开分支。
+                        if (stripGroupToolParts) {
+                            it.withoutGroupChatToolParts(dropReasoning = stripGroupReasoningParts)
+                        } else {
+                            it
+                        }
+                    }
+                    .limitContext(assistant.contextMessageLimit)
+            )
         }.transforms(
             transformers = transformers,
             context = context,

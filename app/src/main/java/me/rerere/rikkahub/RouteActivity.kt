@@ -312,6 +312,10 @@ class RouteActivity : ComponentActivity() {
                     is AppEvent.OpenUsageAccessSettings -> this@RouteActivity.openUsageAccessSettings()
                     is AppEvent.ChatGenerationUpdate -> Unit // 由 ChatNotificationManager 消费
                     is AppEvent.ChatGenerationEnded -> Unit // 由 ChatNotificationManager 消费
+                    // v320：群讨论停下来等用户 —— 同样由 ChatNotificationManager 消费。
+                    // 这个 when 是**穷尽匹配**（没有 else），新增事件必须来这里补一行，
+                    // 否则 RouteActivity 直接编译失败（v320 真踩过：编译器报 must be exhaustive）。
+                    is AppEvent.GroupChatWaitingForUser -> Unit
                 }
             }
         }

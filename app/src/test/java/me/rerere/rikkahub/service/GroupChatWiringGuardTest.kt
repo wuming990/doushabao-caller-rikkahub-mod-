@@ -50,8 +50,8 @@ class GroupChatWiringGuardTest {
     private val chatService = source(base + "service/ChatService.kt")
     private val panel = source(base + "ui/pages/chat/GroupChatPanel.kt")
     private val mainModel = source(base + "data/model/GroupChat.kt")
-    private val chatVM = source(base + "ui/pages/chat/ChatVM.kt")
     private val chatPage = source(base + "ui/pages/chat/ChatPage.kt")
+    private val chatVM = source(base + "ui/pages/chat/ChatVM.kt")
     private val store = source(base + "data/datastore/PreferencesStore.kt")
 
     // ---- P0-1：主持人挑人不得写进对话 ----
@@ -183,6 +183,114 @@ class GroupChatWiringGuardTest {
             "群发言仍然不许传 toolOutputCharLimit（那是子代理专用）",
             groupTurn.contains("toolOutputCharLimit ="),
         )
+    }
+
+    // ---- v321：「讨论只保留发言正文」接线守卫 ----
+
+    @Test
+    fun `v321 讨论只保留发言正文的接线必须完整（不许做成假开关）`() {
+        // 这条守的是「编译照过、门禁全绿、开关按了却没反应」那一类退化。
+        // 本仓库在 v313 就专门反对过没实现的骗人开关（GroupChatConfig 里那个
+        // firstRoundBlind 就是因为引擎没实现而被删掉，不是留着骗人）。
+        val prompts = source(base + "data/ai/prompts/GroupChat.kt")
+        val loop = source(base + "data/ai/GenerationLoop.kt")
+        // ① 引擎三处上文（成员发言 / 主持人挑人 / 答完提问续写）都必须**现读**全局设置。
+        //    任何一处被改成字面量 false，界面上那个开关就管不到那一路 —— 三处口径会漂。
+        assertEquals(
+            "引擎必须有三处把全局设置传给 transcriptFor",
+            3,
+            Regex("settings\\.groupChatCleanContext,").findAll(engine).count(),
+        )
+        // ② 主对话那条路必须按设置传，不许写死成 true 或 false
+        assertTrue(
+            "主对话必须按用户设置决定是否连思考一起剥",
+            chatService.contains("stripGroupReasoningParts = settings.groupChatCleanContext,"),
+        )
+        // ③ 群成员自己那条路**不许**传这两个剥参数：它要看得见自己刚搜到的东西
+        //    （v319 定下的口径）。传上参数编译照样通过，症状却是成员开始重复搜索、
+        //    忘了上一句的依据 —— 编译器与真跑测试都抓不到，只能靠这条反向断言钉。
+        val groupTurn = sliceSection(
+            chatService,
+            "private suspend fun speakGroupTurn(",
+            "private fun tryGroupInterjection(",
+        )
+        assertFalse(
+            "群发言不许传 stripGroupToolParts（成员要看得见自己搜到的东西）",
+            groupTurn.contains("stripGroupToolParts ="),
+        )
+        assertFalse(
+            "群发言不许传 stripGroupReasoningParts（同上）",
+            groupTurn.contains("stripGroupReasoningParts ="),
+        )
+        // ④ 设置默认必须关，且缺键时读到 false（用 `== true`，不用 `!= false`）
+        assertTrue(
+            "设置字段必须默认 false",
+            store.contains("val groupChatCleanContext: Boolean = false,"),
+        )
+        assertTrue(
+            "读取必须用 == true，缺键不能当 true",
+            store.contains("groupChatCleanContext = preferences[GROUP_CHAT_CLEAN_CONTEXT] == true,"),
+        )
+        // ⑤ 界面开关必须走**全局**回调。为什么不塞进 GroupChatConfig：那份配置会被
+        //    「彻底删除」（v315 的动作），塞进去就会在删配置后静默失效。
+        assertTrue(
+            "界面开关必须调用全局回调",
+            panel.contains("onChange = { onCleanContextChange(it) },"),
+        )
+        assertFalse(
+            "不许把这个开关塞进群配置（那条路会被彻底删除清掉）",
+            mainModel.contains("cleanContext"),
+        )
+        // ⑥ 生成层两处默认都必须是 false（禁区 #13：新能力默认关闭、显式传参才打开）
+        assertEquals(
+            "生成层 generateText 与内部函数的新参数默认都必须是 false",
+            2,
+            Regex("stripGroupReasoningParts: Boolean = false,").findAll(loop).count(),
+        )
+        // ⑦ 剥离只做在「发给模型的请求视图」上：必须返回新对象，不许改传入的消息
+        //    （用户选的是「记录一个字都不删」，界面上仍可回看群里当时查了什么）
+        assertTrue(
+            "剥完必须 copy 出新消息，不许就地改",
+            prompts.contains("return copy(parts = kept)"),
+        )
+    }
+
+    // ---- v322：群设置里「换」按钮点了没反应 ----
+
+    @Test
+    fun `v322 换人按钮必须真的打开选择弹层（点了没反应的老毛病）`() {
+        // 真机症状：群讨论设置里点「换」毫无反应。
+        // 根因：「换」的 onClick 只写了 `swapIndex = index`，**没有 picker.open()**；
+        // 而 ModelListSheet 第一行是 `if (!state.visible) return`（ModelList.kt:272），
+        // visible 只由 open() 打开 —— 弹层永远不渲染，下面 onSelect 里那套
+        // 「原地替换、重复成员自动挪位」的逻辑写得再对也永远触发不到。
+        // 这类退化编译器抓不到（少一行调用照样编译），只能靠这条接线守卫钉住。
+        val dialog = sliceSection(
+            panel,
+            "internal fun GroupChatSettingsDialog(",
+            "private fun currentDraftConfig(",
+        )
+        assertTrue(
+            "「换」必须同时做两件事：记下待替换位置 + 打开选择弹层",
+            Regex("swapIndex = index\\s*\\n\\s*picker\\.open\\(\\)").containsMatchIn(dialog),
+        )
+        assertTrue(
+            "「添加成员」必须显式清掉待替换标记（否则加人会被当成换人）",
+            Regex("swapIndex = null\\s*\\n\\s*picker\\.open\\(\\)").containsMatchIn(dialog),
+        )
+        assertTrue(
+            "弹层关闭后必须清掉待替换标记（点了「换」又取消的场景）",
+            // 连 effect 体一起钉住：只钉 `LaunchedEffect(picker.visible)` 这串文本的话，
+            // 将来把条件写成 `if (picker.visible)`（语义反了 —— 弹层一打开就把标记清掉，
+            // 换人退化成加人）守卫仍然全绿，那就是假守卫（v322 审查位抓的 P2）。
+            Regex(
+                "LaunchedEffect\\(picker\\.visible\\)\\s*\\{\\s*\\n\\s*" +
+                    "if \\(!picker\\.visible\\) swapIndex = null"
+            ).containsMatchIn(dialog),
+        )
+        // 这两条正则要求「两行紧邻」（中间只允许空白）。将来若把它们提取成 helper、
+        // 或只是插入一行注释而变红，请先说明理由再改判据 —— 不要当成假红直接放宽，
+        // 因为漏掉的正是「少写一行调用」这种编译器抓不到的退化（本次真机 bug 就是这一类）。
     }
 
     // ---- v314：插话（我说的话进入讨论，由成员接着回应） ----
@@ -478,7 +586,11 @@ class GroupChatWiringGuardTest {
             "引擎里每个 catch(Exception) 之前都要有 CancellationException 分支",
             catchBlocks >= 2,
         )
-        assertTrue(engine.contains("run.markStopped()"))
+        // v320：落 STOPPED 之前必须先对场次编号 —— 被新一批顶掉的旧协程收尾时不许盖状态
+        //（旧断言钉的是「有 markStopped() 这一行」这个字面写法；本轮把它换成了带场次校验的版本，
+        //  按手册口径是**更新判据并写明理由**，不是把代码改回去迎合断言。）
+        assertEquals("两处取消收尾都要走场次校验", 2, Regex("run\\.markStoppedIfCurrent\\(epoch\\)").findAll(engine).count())
+        assertFalse("引擎里不许再有无条件的 markStopped()", engine.contains("run.markStopped()"))
     }
 
     // ---- v314 审查位抓出的三条（都核实为真，别改回去） ----
@@ -762,9 +874,17 @@ class GroupChatWiringGuardTest {
             "他人发言分支必须调用它",
             prompts.contains("val askDigest = groupAskUserDigest(message)"),
         )
+        // v319：判据扩了一支。用户要求「开群带全部上文」之后，他人发言还会额外带上
+        // groupToolDigest（之前干活查到的工具产出），所以「不许丢」的条件从
+        // 「正文与问答都空」变成「正文、问答、工具产出三者都空」。
+        // 语义没变：仍然是「不许出现一条只有署名的空消息」，只是字面串跟着实现走。
+        // 真正跑数据的用例在 GroupChatTest：「开群之前的历史，工具产出要带进上文」
+        // 与「群讨论期间别人调的工具仍然不进共享上文」两条，一正一反都钉住了。
         assertTrue(
-            "空正文但有问答时不许丢消息",
-            prompts.contains("if (text.isNullOrBlank() && askDigest == null) {"),
+            "空正文但有问答或工具产出时不许丢消息",
+            prompts.contains(
+                "if (text.isNullOrBlank() && askDigest == null && toolDigest == null) {",
+            ),
         )
         // 只认 ask_user 这一个工具名，其它工具输出照旧不进上文
         assertTrue("必须只认 ask_user", prompts.contains("toolName == ASK_USER_TOOL_NAME"))
@@ -946,5 +1066,92 @@ class GroupChatWiringGuardTest {
         val clearAt = releaseFn.indexOf("clearGroupRunState(conversationId)")
         assertTrue("释放里必须既停又清", stopAt >= 0 && clearAt >= 0)
         assertTrue("顺序必须先是停后是清", stopAt < clearAt)
+    }
+
+    // ---- v320：点名当场换人 + 群通知接线 ----
+
+    @Test
+    fun `点名可以当场撤掉还没出声的发言`() {
+        val pick = sliceSection(
+            chatService,
+            "fun requestGroupSpeakerNow(",
+            "private fun notifyGroupAwaitingUser(",
+        )
+        assertTrue("必须先有「正在开口那位」的把手表", chatService.contains("private val groupSpeaking = ConcurrentHashMap<Uuid, GroupSpeakingHandle>()"))
+        assertTrue(
+            "撤之前先判「这位出声了没」——只有思考/只挂着没执行的工具才允许撤",
+            pick.contains("!groupUtteranceHasKeptContent(handle.lastUtterance)"),
+        )
+        // v320：判据字面量跟着代码改过 —— 采纳审查位意见后，「布尔旗」换成了「我撤的是哪一个 job」的
+        // 引用比对（两次瞬时读凑结论不可靠）。按手册口径：更新判据并写明理由，不把代码改回去迎合断言。
+        val namedAt = pick.indexOf("run.requestSpeaker(modelId)")
+        val flaggedAt = pick.indexOf("handle.abortRequestedFor = speakerJob")
+        assertTrue("两个锚点都必须存在，否则顺序比较会静默失效", namedAt >= 0 && flaggedAt >= 0)
+        assertTrue("顺序：先记名，再记旗（反了会被当成用户点停止，整批讨论直接结束）", namedAt < flaggedAt)
+        assertTrue("必须只 cancel 这一位的发言协程", pick.contains("speakerJob.cancel()"))
+        assertTrue("必须给界面一种「当场换人」的结果，不许静默", pick.contains("GroupPickOutcome.INTERRUPTED"))
+
+        val speak = sliceSection(chatService, "private suspend fun speakGroupTurn(", "// 收尾：无论正常")
+        assertTrue("发言必须跑在可单独取消的子协程里", speak.contains("val speakerJob = async {"))
+        assertTrue("只给「新发言、要写进对话」的这一路交把手", speak.contains("val abortable = persist && overwriteMessageId == null"))
+        assertTrue(
+            "取消要分得开：点名换人 vs 用户点停止（引用比对 + 本协程仍活着，两个条件都在）",
+            speak.contains("handle?.abortRequestedFor === speakerJob && coroutineContext[Job]?.isActive == true"),
+        )
+        assertTrue("撤场要删掉什么都没留下的那条发言", speak.contains("removeEmptyGroupUtterance(current, utteranceId)"))
+        assertTrue("把手用完必须摘掉，不许泄漏", speak.contains("groupSpeaking.remove(conversationId, handle)"))
+        // 以下三条 = v320 审查位采纳项，防止被人改回旧写法
+        assertTrue("撤之前必须确认那个子协程还活着（拿旧把手乱 cancel = 给用户假提示）", pick.contains("speakerJob.isActive"))
+        assertTrue("撤之前必须重新核一次当前发言者还是不是同一位", pick.contains("now.currentSpeakerModelId == handle.modelId"))
+        assertTrue(
+            "旗子必须是「我撤的是哪一个 job」的引用，不是布尔值（两次瞬时读凑结论不可靠）",
+            pick.contains("handle.abortRequestedFor = speakerJob") && speak.contains("handle?.abortRequestedFor === speakerJob"),
+        )
+        assertTrue("撤场清理必须走带锁的 mutateAndSaveConversation（v229 铁律）", speak.contains("mutateAndSaveConversation(conversationId) { current ->"))
+        assertFalse("撤场清理不许再退回「读快照→改→整份写回」", speak.contains("val cleaned = removeEmptyGroupUtterance(current, utteranceId)"))
+        assertFalse("不许退回布尔旗（要靠两次瞬时读凑结论）", chatService.contains("var abortRequested: Boolean"))
+        assertFalse("撤场清理不许再退回「读快照→改→整份写回」", speak.contains("updateConversation(conversationId, cleaned)"))
+
+        // 判据本体（GroupChatRun）：待批准的卡片必须算「已出声」
+        assertTrue(
+            "Tool 的判据必须同时认「已执行」「已被用户答过」「等批准」三种，少一种都会删错东西",
+            run.contains("part.isExecuted ||") && run.contains("is ToolApprovalState.Answered") && run.contains("part.isPending"),
+        )
+
+        val abortAt = engine.indexOf("catch (e: GroupSpeakerAbortedException)")
+        val failedAt = engine.indexOf("} catch (e: Exception) {")
+        assertTrue("两处 catch 都必须存在，否则下面的顺序比较会静默失效", abortAt >= 0 && failedAt >= 0)
+        assertTrue(
+            "引擎必须把「被撤」排在「成员失败」之前，否则换人会被记成一次失败并推进游标",
+            abortAt < failedAt,
+        )
+        assertEquals("两处推进循环都要接住被撤这一种", 2, Regex("catch \\(e: GroupSpeakerAbortedException\\)").findAll(engine).count())
+        assertEquals("界面两种新提示都要有", 2, Regex("GroupPickOutcome\\.INTERRUPTED").findAll(chatPage).count())
+    }
+
+    @Test
+    fun `群停下来等用户必须真的发出通知信号`() {
+        val manager = source(base + "service/ChatNotificationManager.kt")
+        assertTrue("事件必须被消费，否则只是发个没人听的信号", manager.contains("is AppEvent.GroupChatWaitingForUser -> handleGroupChatWaiting(event)"))
+        // v320 审查位抓到这条是**假绿**：旧代码里本来就有两处同样的判断（handleGenerationUpdate /
+        // handleGenerationEnded），整份文件 contains 它永远为真，等于没断言。改成先把新处理函数切出来再判。
+        val handler = sliceSection(manager, "private fun handleGroupChatWaiting(", "private fun sendGenerationDoneNotification(")
+        assertTrue("新处理函数自己必须挡前台（不许蹭别的函数的判断）", handler.contains("if (isForeground.value) return"))
+        assertTrue("新处理函数自己必须读那个开关", handler.contains("displaySetting.notifyGroupChatWaiting"))
+        assertTrue(
+            "整场结束的文案不许糊成「等你点继续讨论」（那种场合点了也不会跑）",
+            handler.contains("AppEvent.GroupWaitReason.ENDED"),
+        )
+
+        val notify = sliceSection(chatService, "private fun notifyGroupAwaitingUser(", "fun skipGroupQuestion(")
+        assertTrue("要不要通知收在纯函数里（可单测），不在这里各写一套", notify.contains("groupWaitReasonOf(snapshot.status, snapshot.error) ?: return"))
+        assertTrue("走事件总线，与主对话同一套设施", notify.contains("appEventBus.tryEmit("))
+        assertEquals("两个批次收尾处都必须调用（继续讨论 / 回答提问后续写）", 2, Regex("notifyGroupAwaitingUser\\(run\\.snapshot\\(\\)\\)").findAll(chatService).count())
+
+        // 手册 v313 教训：界面开关必须与底层行为**同一次落地**，否则就是骗人的开关
+        val prefs = source(base + "data/datastore/PreferencesStore.kt")
+        assertTrue("开关默认必须是开（默认关会让这次修复在多数装机上看不见效果）", prefs.contains("val notifyGroupChatWaiting: Boolean = true"))
+        val settingPage = source(base + "ui/pages/setting/SettingPreferencesNotificationPage.kt")
+        assertTrue("界面必须写回同一个字段", settingPage.contains("updateDisplaySetting(displaySetting.copy(notifyGroupChatWaiting = it))"))
     }
 }

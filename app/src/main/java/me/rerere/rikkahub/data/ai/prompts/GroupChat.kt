@@ -35,8 +35,11 @@ import kotlin.uuid.Uuid
 /** 成员发言的最大长度：超过就截断，避免整段历史把上下文挤爆（圆桌同款保护） */
 private const val GROUP_UTTERANCE_MAX_CHARS = 20_000
 
-/** 整份上文的字符预算，超出后从最旧的发言开始丢弃（保留最新内容优先） */
-private const val GROUP_TRANSCRIPT_MAX_CHARS = 120_000
+// v319：原来这里写死「整份上文 12 万字符预算」，超出就从最旧的发言开始丢。
+// 用户口径：「我要的是打开时候获取全部上文」—— 真机反馈十几万字的原对话开群后只剩 3 万，
+// 被砍掉的正是「之前干活查到的资料」（工具调用与子代理产出）。
+// 所以整份上限挪进 GroupChatConfig.transcriptCharLimit（默认 0 = 不限，界面可调，
+// 留给「某个模型窗口装不下、服务商报错」时自救），这个写死值删掉。
 
 /**
  * v318：ask_user 的工具名。
@@ -69,6 +72,34 @@ fun buildGroupTranscript(
     messages: List<UIMessage>,
     speakingModelId: Uuid,
     nameOf: (Uuid?) -> String?,
+    /**
+     * v319：整份上文的字符上限，**0 = 不限**（默认）。
+     *
+     * 用户口径：「我要的是打开时候获取全部上文」。之前默认 12 万字硬砍，
+     * 把「之前干活查到的资料」砍没了（真机：十几万字只剩 3 万）。
+     * 保留这个参数是「模型窗口装不下时」的自救档，由群组设置里那一栏填。
+     */
+    charLimit: Int = 0,
+    /**
+     * v321：「群讨论只保留发言正文」开关（用户 v321 要求新增）。
+     *
+     * 打开后，**群讨论期间产生的**思考过程、工具调用与结果、服务商侧搜索结果
+     * 都不再塞进成员的上文 —— 每位成员只看得到大家说过的正文。
+     *
+     * 三条边界，一条都不能越（用户原话为准）：
+     * ① 只管「开群之后群里聊出来的」东西。**开群时带进来的原对话上文照旧整份带**
+     *    （v319 的「我要的是打开时候获取全部上文」一个字不动）。
+     *    用户补充口径：「我说的是打开群聊进行聊天时候需要附带全部上文，
+     *    但是你打开群聊使用过程中可以不用带那么多杂乱的额外上文，
+     *    我说的这个上文是群聊过程中产生的上文，不是打开群聊之前的上文。」
+     * ② ask_user 的提问与用户回答**保留** —— 那是用户本人说的话，
+     *    摘掉会让下一个成员当场否认用户给过的条件（v318 真机坑，不踩第二遍）。
+     * ③ 成员生成的图片 / 文件 / 音视频**保留** —— 那算模型的实际输出，
+     *    不属于「杂乱的调查过程」，而且库里存的是路径不是原文。
+     *
+     * 默认 false = 行为与 v320 逐字节一致。
+     */
+    cleanGroupUtterances: Boolean = false,
 ): List<UIMessage> {
     val mapped = messages.map { message ->
         when (message.role) {
@@ -83,7 +114,17 @@ fun buildGroupTranscript(
 
             MessageRole.ASSISTANT -> when {
                 // 自己以前的发言：保持助手角色，模型才知道"我之前说过这个"
-                message.modelId == speakingModelId -> message
+                // v321：开关打开时角色不变、正文照留，但把「**在群里**说的那几次」当时想的
+                // 过程与查回的原文摘掉 —— 那才是用户要清的「群聊过程中产生的上文」。
+                // 为什么必须再加 fromGroupChat 这条线：成员模型完全可能和主对话当前模型
+                // 是同一个（v319 注释里写死过这个坑），只按 modelId 判会把**开群之前**
+                // 主对话自己的经历一起摘掉，那是用户 v319 要的「全部上文」，动不得。
+                message.modelId == speakingModelId ->
+                    if (cleanGroupUtterances && message.fromGroupChat) {
+                        message.onlyGroupUtteranceText()
+                    } else {
+                        message
+                    }
 
                 else -> {
                     val text = groupUtteranceText(message)
@@ -92,9 +133,18 @@ fun buildGroupTranscript(
                     // （approvalState），旧实现只看正文文字 → 整条被丢掉，下一位成员既不知道
                     // 有人问过、也不知道用户答过，会当场否认用户给过的条件（真机实锤）。
                     val askDigest = groupAskUserDigest(message)
-                    if (text.isNullOrBlank() && askDigest == null) {
+                    // v319：**只有「开群之前的历史」才带工具调用与结果**。
+                    // 用户口径：「打开时候获取全部上文」+「群组聊天过程中每个 ai 的搜索和工具
+                    // 上文不会参杂进群组聊天中，只有给出的方案/对话内容」——
+                    // 两句话合起来正好按 fromGroupChat 这条线分开：
+                    //   fromGroupChat = false（开群前的原对话）→ 干活产出整份带进来
+                    //   fromGroupChat = true （群里别人说的）  → 仍然只带正文，防幻觉那条设计不动
+                    val toolDigest =
+                        if (message.fromGroupChat) null else groupToolDigest(message)
+                    if (text.isNullOrBlank() && askDigest == null && toolDigest == null) {
                         // 没有正文（只有工具调用/图片）的他人发言不进上文，
                         // 否则会出现一条只有署名的空消息，模型会照着空话接。
+                        // v319：带上了工具产出的那条不再算「空发言」，所以判定里加了 toolDigest。
                         null
                     } else {
                         val speakerName = nameOf(message.modelId) ?: "其他成员"
@@ -103,6 +153,10 @@ fun buildGroupTranscript(
                             if (askDigest != null) {
                                 if (isNotEmpty()) append('\n')
                                 append(askDigest)
+                            }
+                            if (toolDigest != null) {
+                                if (isNotEmpty()) append('\n')
+                                append(toolDigest)
                             }
                         }
                         UIMessage(
@@ -117,7 +171,7 @@ fun buildGroupTranscript(
         }
     }.filterNotNull()
 
-    return trimGroupTranscript(mapped)
+    return trimGroupTranscript(mapped, charLimit)
 }
 
 /**
@@ -139,6 +193,47 @@ private fun groupUtteranceText(message: UIMessage): String? {
     } else {
         text
     }
+}
+
+/**
+ * v319：把一条**历史**发言里的工具调用与结果，翻成群成员读得懂的叙述。
+ *
+ * 只用于「开群之前的原对话」（fromGroupChat = false）—— 用户要求「打开时候获取全部上文」，
+ * 而之前干活查到的资料恰恰全藏在这些工具结果里，不带就等于让成员凭空讨论。
+ * 真机现象：十几万字的原对话开群后只剩 3 万字，缺的就是这一块。
+ *
+ * 刻意写成**第三人称叙述**（「它当时调用了…」）而不是原始协议内容：
+ * 成员模型没参与过那次调用，直接塞协议会让它误以为是自己调的 ——
+ * 这正是「群组期间别人的工具不进上文」的同一条理由，两处口径必须一致。
+ *
+ * ask_user **不在这里处理**：那是「用户本人给的信息」，由 [groupAskUserDigest] 负责，
+ * 两处都管会把同一次问答贴两遍。
+ *
+ * 刻意不做长度截断：用户选的是「全部上文」，工具结果再长也整份带上；
+ * 真嫌大就在群组设置里把「上文上限」填一个数 —— 那是唯一的降级阀。
+ */
+private fun groupToolDigest(message: UIMessage): String? {
+    val tools = message.getTools().filter { it.toolName != ASK_USER_TOOL_NAME }
+    if (tools.isEmpty()) return null
+    val lines = buildList {
+        for (t in tools) {
+            val output = t.output
+                .filterIsInstance<UIMessagePart.Text>()
+                .joinToString("\n") { it.text }
+                .trim()
+            val input = t.input.trim()
+            add(
+                if (output.isNotEmpty()) {
+                    "它当时调用了工具「${t.toolName}」，参数：$input\n结果：$output"
+                } else {
+                    "它当时调用了工具「${t.toolName}」，参数：$input（该工具没有产出结果）"
+                }
+            )
+        }
+    }
+    if (lines.isEmpty()) return null
+    return "（这段发言里还调用过工具，参数与结果一并给出，供你了解之前查到过什么）\n" +
+        lines.joinToString("\n")
 }
 
 /**
@@ -272,17 +367,103 @@ fun moveGroupMessageToEnd(messages: List<UIMessage>, messageId: Uuid?): List<UIM
  * 用户最新的要求必须保住 —— 圆桌那边是「材料过长截尾部」，这里反过来截头部，
  * 因为群讨论里越新的内容越关键，截尾会把用户刚补充的条件丢掉。
  */
-private fun trimGroupTranscript(messages: List<UIMessage>): List<UIMessage> {
+private fun trimGroupTranscript(
+    messages: List<UIMessage>,
+    charLimit: Int,
+): List<UIMessage> {
+    // v319：<= 0 = 不限，整份原样返回（默认走这条，用户要的「获取全部上文」）
+    if (charLimit <= 0) return messages
     var total = messages.sumOf { it.toText().length }
-    if (total <= GROUP_TRANSCRIPT_MAX_CHARS) return messages
+    if (total <= charLimit) return messages
     var index = 0
     while (index < messages.lastIndex &&
-        total > GROUP_TRANSCRIPT_MAX_CHARS
+        total > charLimit
     ) {
         total -= messages[index].toText().length
         index++
     }
     return messages.drop(index)
+}
+
+/**
+ * v321：群讨论期间产生的「杂乱上文」分两类判定，**两处共用同一套口径**：
+ * 成员上文（buildGroupTranscript）与主对话请求（withoutGroupChatToolParts）。
+ *
+ * 为什么拆成两个函数而不是合成一个：工具与搜索结果**一直**都要摘（v319 定的口径），
+ * 思考过程只在用户打开「只保留发言正文」时才摘 —— 两者条件不同，合并就没法表达。
+ */
+private fun isGroupToolPart(part: UIMessagePart): Boolean = when (part) {
+    is UIMessagePart.Tool -> part.toolName != ASK_USER_TOOL_NAME
+    is UIMessagePart.ServerTool -> true
+    else -> false
+}
+
+private fun isGroupReasoningPart(part: UIMessagePart): Boolean = part is UIMessagePart.Reasoning
+
+/**
+ * v321：把「这位成员**在群里**说过的话」剥到只剩正文 + 提问 + 图片/文件。
+ *
+ * 别人的发言不走这里：他人发言经 [groupUtteranceText] 取正文后重新署名，
+ * 思考本来就没被带上（只有工具摘要在开群前的历史那条线上才展开）。
+ */
+private fun UIMessage.onlyGroupUtteranceText(): UIMessage {
+    val kept = parts.filterNot { part -> isGroupToolPart(part) || isGroupReasoningPart(part) }
+    if (kept == parts) return this
+    if (kept.isEmpty()) {
+        // 整条只剩思考与工具：留一句占位，别发一条空消息给模型
+        // （空 assistant 消息会被部分服务商直接拒掉，那会让整次讨论报错，比多一行字严重得多）
+        return copy(
+            parts = listOf(
+                UIMessagePart.Text("（这条群讨论发言只有思考过程与工具调用，正文为空）")
+            )
+        )
+    }
+    return copy(parts = kept)
+}
+
+/**
+ * v319：把「群组讨论期间产生的发言」里的工具调用与搜索结果摘掉，只留正文与推理。
+ *
+ * 给**主对话**拼上下文用：群里为了讨论去搜的东西，不该在解散群之后被当成主对话的
+ * 亲身经历带出去（用户口径：「只带方案和聊天记录，不把群聊里的搜索/调用工具上文带出去」）。
+ *
+ * 三条口径，一条都不能省：
+ * ① 只动 `fromGroupChat = true` 的消息 —— 开群之前的原对话、以及普通聊天自己的工具调用，
+ *    本来就是主对话经历过的，一律不动。
+ * ② `ask_user` 的提问与用户回答**保留**：那是用户本人说的话，摘掉等于把用户的话从
+ *    记录里抹掉（v318 为这个踩过一次真机 bug，同一个坑不踩第二遍）。
+ * ③ 返回**新列表**，绝不改传入的那份 —— 对话里的原始记录必须一个字都不动，
+ *    用户仍然能在界面上回看群里当时查了什么（用户选的是「不删数据」）。
+ */
+fun List<UIMessage>.withoutGroupChatToolParts(
+    /**
+     * v321：一并摘掉思考过程 —— 用户打开「群讨论只保留发言正文」时由 ChatService 传 true。
+     *
+     * 默认 false：不传就是 v320 的老口径（只摘工具与搜索结果），思考照旧保留。
+     */
+    dropReasoning: Boolean = false,
+): List<UIMessage> = map { message ->
+    if (!message.fromGroupChat) return@map message
+    val kept = message.parts.filterNot { part ->
+        isGroupToolPart(part) || (dropReasoning && isGroupReasoningPart(part))
+    }
+    if (kept == message.parts) return@map message
+    if (kept.isEmpty()) {
+        // 整条只有工具调用：留一句占位，别发一条空消息给模型（空 assistant 消息会被
+        // 部分服务商直接拒掉，那会让整次对话报错，比多一行字严重得多）
+        return@map message.copy(
+            parts = listOf(
+                UIMessagePart.Text(
+                    if (dropReasoning) {
+                        "（这条群讨论发言只有思考过程与工具调用，内容未纳入主对话上下文）"
+                    } else {
+                        "（这条群讨论发言只有工具调用，内容未纳入主对话上下文）"
+                    }
+                )
+            )
+        )
+    }
+    message.copy(parts = kept)
 }
 
 /**

@@ -4,7 +4,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import me.rerere.ai.ui.ToolApprovalState
 import me.rerere.ai.ui.UIMessage
+import me.rerere.ai.ui.UIMessagePart
+import me.rerere.rikkahub.data.event.AppEvent
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.data.model.MessageNode
 import kotlin.uuid.Uuid
@@ -71,6 +74,14 @@ data class GroupRunState(
     val askedByModelId: Uuid? = null,
     /** 上一次推进失败的原因（null = 没有）。必须显示给用户，别只写日志 */
     val error: String? = null,
+    /**
+     * v319：用户点名「下一个就他说」的那位成员；null = 没人被点名（照轮流/主持人走）。
+     *
+     * 用户口径：「新增一个途中切换成员模型和直接跳过中间 ai 指定某个 ai 来回答的功能」。
+     * **只生效一次**（引擎取用后立刻清空）：留着的化他会一直插队，轮流顺序就废了。
+     * 新字段带默认值，不影响任何既有构造点。
+     */
+    val nextSpeakerOverride: Uuid? = null,
 ) {
     /** 这批的额度用完了 */
     val budgetExhausted: Boolean
@@ -84,6 +95,150 @@ data class GroupRunState(
  * 刚说的话（并发读到的上文是同一份），讨论质量反而更差，还会在同一对话上并发写消息。
  * 串行 + 逐字流式显示，才是"看着像实时在聊"。
  */
+/**
+ * v319：点名的四种结果。**必须是顶层类型** —— 一开始误写在 GroupChatRun 里面，
+ * 成了嵌套类型，ChatService / ChatVM / ChatPage 三处按顶层路径引用全部报
+ * Unresolved reference（:app:compileDebugKotlin 实测 14 处红）。挪回顶层。
+ *
+ * 为什么必须把结果交回界面（审查位 v319 抓的 P1）：讨论正有人在说话、或正卡在
+ * 「等用户回答提问」时点「你来说」，名字确实记下了，但界面一个字都不动 ——
+ * 用户只会以为按钮坏了，然后反复点、或者以为功能没做。
+ * 每种结果必须各有一句人话，不留静默路径。
+ */
+enum class GroupPickOutcome {
+    /** 已记下，等当前这位说完就轮到他（**这位已经出声了**，撤掉会丢他写下的内容） */
+    QUEUED,
+
+    /** 讨论本来就停着：已当场开一批，他马上就说 */
+    STARTED,
+
+    /**
+     * v320：当前这位**还没出声**（无正文、无已执行工具、无图片文件），已当场撤掉他，
+     * 点名的那位马上接话。用户口径：「下一个模型只是准备开始说话，思考都没开始思考，
+     * 就被锁在这个模型了，还得强制等待这个模型说完话才能换到我选择的模型」。
+     */
+    INTERRUPTED,
+
+    /** 这个对话没有启用中的讨论群（服务层已在对话里贴了错误卡片） */
+    NO_GROUP,
+}
+
+/**
+ * v320：用户点名时，能不能**当场撤掉**正在开口的那位。
+ *
+ * 判据刻意不是「一个字都还没吐」，而是「没有值得留下来的东西」：
+ * - 只有思考（Reasoning）→ 撤掉不心疼，思考本来就不算发言内容
+ * - 只挂着**还没执行完**的工具调用 → 可以撤；整条消息会被一起删掉，
+ *   所以不会留下「有调用没结果」的形状（那种形状服务商可能直接拒收下一句）
+ * - 已有正文 / 已有执行完带回结果的工具 / 已有图片视频文件 → **不许撤**，
+ *   撤了就是丢内容，且半截工具调用会留在对话里
+ * - 工具已经被用户答过（Answered）→ 绝不许撤，那是用户自己写下的答案
+ *
+ * 抽成顶层纯函数只为了能真单测（Compose 与协程都跑不了单测，判据必须留在能跑的地方）。
+ */
+internal fun groupUtteranceHasKeptContent(message: UIMessage?): Boolean {
+    message ?: return false
+    return message.parts.any { part ->
+        when (part) {
+            is UIMessagePart.Text -> part.text.isNotBlank()
+            is UIMessagePart.Image,
+            is UIMessagePart.Video,
+            is UIMessagePart.Audio,
+            is UIMessagePart.Document,
+            -> true
+
+            is UIMessagePart.Tool ->
+                part.isExecuted ||
+                    part.approvalState is ToolApprovalState.Answered ||
+                    // v320 审查位抓的真窗口：**等用户批准的卡片**（ask_user 提问、需要审批的工具）
+                    // 一旦出现在流式内容里就不许再撤 —— 撤掉等于把「TA 问了什么」连同卡片一起删掉，
+                    // 用户本来打算回答的东西凭空消失。
+                    // 注意这不影响本轮要修的症状：**正在执行中**的工具（approvalState 是 Auto/Approved、
+                    // 还没结果）仍然算没出声、仍然可以撤 —— 那才是用户抱怨的「干等他说完」。
+                    part.isPending
+            is UIMessagePart.ServerTool -> part.isFinished
+            // 旧形状：ToolResult 已经是跑完带回内容的（有真东西）；ToolCall 只是「想调用」，还没结果
+            is UIMessagePart.ToolResult -> true
+            is UIMessagePart.ToolCall -> part.approvalState is ToolApprovalState.Answered
+            // 只有思考过、没有说过
+            is UIMessagePart.Reasoning -> false
+            // 官方已 @Deprecated 的空标记（没有任何内容）→ 跟 Reasoning 同一侧
+            // ⚠️ 这一条是**编译器抓出来的**：我原本用「data class」找全部分片类型，
+            // 而 Search 写成 `data object`，漏了。故意不写 else 才让它当场报错而不是静默漏判。
+            is UIMessagePart.Search -> false
+            // ⚠️ 刻意**不写 else**：官方以后新增一种分片时，编译器会直接报错，
+            // 逼着人重新判断「这算不算已经出声」。写成 else 会把新类型默默归进「可以删」那一侧，
+            // 那是会丢用户内容的错法（手册 §7.4「静默退化」同一族）。
+        }
+    }
+}
+
+/**
+ * v320：用户点名换人 —— 服务层用它撤掉「还没出声」的那位成员。
+ *
+ * 为什么做成异常而不是返回值：发言是在流式 collect 里往外写的，撤掉只能靠**取消那次生成**，
+ * 取消一定会以 CancellationException 的形式冒出来；而引擎必须能区分
+ * 「用户点了停止」（整场结束）与「用户点名换人」（这一轮作废、当场换人继续跑）。
+ * 用一个专属异常类型把两者分开，是唯一不会靠猜的做法。
+ *
+ * 它**不占批次额度、不算成员失败、不推进轮流游标** —— 那位一句话都还没说。
+ */
+internal class GroupSpeakerAbortedException(
+    val modelId: Uuid,
+    val speakerName: String,
+) : Exception("已撤掉还没开口的发言：$speakerName")
+
+/**
+ * v320：撤场时把那条「什么都没留下」的发言从对话里删掉。
+ *
+ * 只删**本次调用新建的**那一条（[createdMessageId] 为空表示本次根本没写过消息，直接返回原样）。
+ * 回答提问后的续写路径走的是「原地覆盖同一条」，那条消息里带着用户写下的答案，
+ * 绝不允许被这个函数删掉 —— 所以调用方传进来的 id 只在 persist 且 overwriteMessageId == null 时才有值。
+ * 判据再核一遍 [groupUtteranceHasKeptContent]：有任何值得留下的东西就不删（宁可留一条半截也不丢内容）。
+ */
+internal fun removeEmptyGroupUtterance(
+    conversation: Conversation,
+    createdMessageId: Uuid?,
+): Conversation {
+    val messageId = createdMessageId ?: return conversation
+    val nodeIndex = conversation.messageNodes.indexOfFirst { node -> node.messages.any { it.id == messageId } }
+    if (nodeIndex < 0) return conversation
+    val node = conversation.messageNodes[nodeIndex]
+    val message = node.messages.firstOrNull { it.id == messageId } ?: return conversation
+    if (groupUtteranceHasKeptContent(message)) return conversation
+    val kept = node.messages.filterNot { it.id == messageId }
+    val newNodes = conversation.messageNodes.toMutableList()
+    if (kept.isEmpty()) {
+        newNodes.removeAt(nodeIndex)
+    } else {
+        newNodes[nodeIndex] = node.copy(messages = kept, selectIndex = (node.selectIndex - 1).coerceAtLeast(0))
+    }
+    return conversation.copy(messageNodes = newNodes.toList())
+}
+
+/**
+ * v320：群讨论停下来时，该不该给用户发一条系统通知、以及通知说成什么。
+ *
+ * 症状与根因（用户原话「弹出提问工具时，已经没有在继续生成了，但我处于后台不会弹出通知」）：
+ * 通知是由 [me.rerere.rikkahub.service.ChatNotificationManager] 订阅事件总线产生的，
+ * 而群讨论这条路**从来不往总线上发任何信号** —— 主对话能收到通知、群里收不到，差的就是这一段。
+ *
+ * 只在「停下来等人」时发，且**每批只发一次**（调用点在批次协程的收尾处，不在状态变更点）：
+ * 轮流推进时 markTurnDone 会短暂落到 PAUSED 再立刻换下一个人，若在状态变化点通知，
+ * 每句话都会响一次，比不发还糟。
+ */
+fun groupWaitReasonOf(status: GroupRunStatus, error: String?): AppEvent.GroupWaitReason? = when (status) {
+    GroupRunStatus.WAITING_FOR_USER -> AppEvent.GroupWaitReason.QUESTION
+    GroupRunStatus.PAUSED -> if (error != null) AppEvent.GroupWaitReason.FAILED else AppEvent.GroupWaitReason.TURN_DONE
+    // v320：整场结束与「这批说完了」是两件事，文案必须分开（见 AppEvent.GroupWaitReason.ENDED 的说明）
+    GroupRunStatus.FINISHED -> AppEvent.GroupWaitReason.ENDED
+    // IDLE = 新一批刚开跑；SPEAKING = 有人正在说；STOPPED = 用户自己点的停止，不该再吵他
+    GroupRunStatus.IDLE,
+    GroupRunStatus.SPEAKING,
+    GroupRunStatus.STOPPED,
+    -> null
+}
+
 internal class GroupChatRun(
     conversationId: Uuid,
     turnsBudget: Int,
@@ -95,11 +250,41 @@ internal class GroupChatRun(
 
     fun snapshot(): GroupRunState = _state.value
 
+    /**
+     * v320：场次编号（每真正开一批 +1）。
+     *
+     * 修的是「点了没反应」这一族症状里的一个隐藏根因：
+     * [beginRun] 会先把状态改成 IDLE，**再**由调用方取消上一批还挂着的协程；旧协程临死的
+     * catch 里无条件写 `markStopped()`，就会把新一批盖成 STOPPED —— 新一批一睁眼看到
+     * 「已停止」立刻退出，用户得到的就是「点了『你来说』，全场安静」。
+     * 收尾时先对一下场次编号，已经不是自己那一场就不再改写状态。
+     *
+     * 为什么不用「取消前先把状态设成 STOPPED」那种写法：那会把 beginRun 与 cancel 之间
+     * 的窗口原样留下，只是换个方向赌时序。
+     */
+    @Volatile
+    var runEpoch: Long = 0L
+        private set
+
+    /**
+     * v320：只有还在同一场次里才落 STOPPED。
+     *
+     * @return false = 这一批已经被更新的一批顶掉了，什么都不该改
+     */
+    fun markStoppedIfCurrent(epoch: Long): Boolean {
+        if (runEpoch != epoch) return false
+        markStopped()
+        return true
+    }
+
     /** 开始一批讨论：把批次计数清零，额度刷新 */
     fun beginRun(turnsBudget: Int): Boolean {
         val current = _state.value
         if (current.status == GroupRunStatus.SPEAKING) return false
         if (current.status == GroupRunStatus.WAITING_FOR_USER) return false
+        // v320：开新场次先记账，再改状态（顺序别颠倒：颠倒时旧协程可能读到「新状态 + 旧场次」
+        // 仍然把自己那一份 STOPPED 盖上来）
+        runEpoch++
         _state.update {
             it.copy(
                 status = GroupRunStatus.IDLE,
@@ -199,6 +384,30 @@ internal class GroupChatRun(
             )
         }
         return asked
+    }
+
+    /**
+     * v319：用户点名 —— 让指定成员下一个说话（跳过当前轮流顺序）。
+     *
+     * 已停 / 已结束的场次不接受点名：那时该走「继续讨论」，悄悄把状态改回可跑
+     * 会让用户以为讨论自己在动。
+     *
+     * @return false = 当前状态不接受点名（界面要告诉用户为什么没反应，不许静默）
+     */
+    fun requestSpeaker(modelId: Uuid): Boolean {
+        val current = _state.value
+        if (current.status == GroupRunStatus.STOPPED || current.status == GroupRunStatus.FINISHED) {
+            return false
+        }
+        _state.value = current.copy(nextSpeakerOverride = modelId)
+        return true
+    }
+
+    /** v319：取走点名并清空（引擎每轮开头调一次；没人被点名返回 null） */
+    fun takeRequestedSpeaker(): Uuid? {
+        val pending = _state.value.nextSpeakerOverride ?: return null
+        _state.value = _state.value.copy(nextSpeakerOverride = null)
+        return pending
     }
 
     fun markStopped() {

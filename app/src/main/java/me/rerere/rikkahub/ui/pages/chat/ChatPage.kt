@@ -94,6 +94,7 @@ import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.data.model.GroupChatConfig
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
 import me.rerere.rikkahub.service.ChatError
+import me.rerere.rikkahub.service.GroupPickOutcome
 import me.rerere.rikkahub.service.RoundTableTaskGuard
 import me.rerere.rikkahub.service.approxConversationTokens
 import me.rerere.rikkahub.service.buildContextUsageInfo
@@ -527,6 +528,31 @@ private fun ChatPageContent(
                         },
                         onResumeGroup = { vm.setGroupEnabled(true) },
                         membersEnough = groupMembersEnough,
+                        // v319：点名条要的成员名单（顺序与群里一致；模型已被删掉的自动跳过，
+                        // 不留一个点不动的空按钮骗人）
+                        memberNames = (groupConfig?.memberModelIds ?: emptyList()).mapNotNull { id ->
+                            setting.findModelById(id)?.let { id to it.displayName }
+                        },
+                        onPickSpeaker = { id ->
+                            // v319：每种结果各给一句人话，不留「点了没反应」（审查位 v319 抓的 P1）
+                        // v320：新增「当场换人」这一种（还没出声就不该让用户等他说完）
+                            when (vm.requestGroupSpeaker(id)) {
+                                GroupPickOutcome.STARTED -> toaster.show(
+                                    "已让他说，正在开口",
+                                    type = ToastType.Info,
+                                )
+                                GroupPickOutcome.INTERRUPTED -> toaster.show(
+                                    "已撤掉还没开口的这位，正在让他说",
+                                    type = ToastType.Info,
+                                )
+                                GroupPickOutcome.QUEUED -> toaster.show(
+                                    "已记下：这位已经开口了，等他说完就轮到他（不打断、不丢他写下的内容）",
+                                    type = ToastType.Info,
+                                )
+                                // 没有启用中的群：服务层已在对话里贴了错误卡片，不再叠一条
+                                GroupPickOutcome.NO_GROUP -> Unit
+                            }
+                        },
                         onOpenSettings = { showGroupSettings = true },
                         // v317：整块可折叠（用户：「这个太占空间了，给我做一个可以折叠起来的」）。
                         // 偏好存 DisplaySetting.groupPanelCollapsed —— 全局记住，换对话/重启都保持；
@@ -819,6 +845,31 @@ private fun ChatPageContent(
             GroupChatSettingsDialog(
                 initial = groupConfig ?: GroupChatConfig(),
                 providers = setting.providers,
+                // v321：全局「讨论只保留发言正文」的真值递进弹窗；改的是全局设置，
+                // 不是 groupChatConfigs（所以它不受「彻底删除群配置」影响）。
+                cleanContext = setting.groupChatCleanContext,
+                onCleanContextChange = { on ->
+                    vm.updateSettings(setting.copy(groupChatCleanContext = on))
+                },
+                // v319：设置里也能点名 —— 当场生效，不必先保存、再关窗、再点继续。
+                // 提示口径与面板上那条点名条完全一致（审查位 v319 抓的 P1：不许静默）。
+                onPickSpeaker = { id ->
+                    when (vm.requestGroupSpeaker(id)) {
+                        GroupPickOutcome.STARTED -> toaster.show(
+                            "已让他说，正在开口",
+                            type = ToastType.Info,
+                        )
+                        GroupPickOutcome.INTERRUPTED -> toaster.show(
+                            "已撤掉还没开口的这位，正在让他说",
+                            type = ToastType.Info,
+                        )
+                        GroupPickOutcome.QUEUED -> toaster.show(
+                            "已记下：这位已经开口了，等他说完就轮到他（不打断、不丢他写下的内容）",
+                            type = ToastType.Info,
+                        )
+                        GroupPickOutcome.NO_GROUP -> Unit
+                    }
+                },
                 // v315：暂停与彻底删除分开 —— 暂停把配置全留着，彻底删除才是真清空
                 onPauseToggle = { enabled ->
                     vm.setGroupEnabled(enabled)

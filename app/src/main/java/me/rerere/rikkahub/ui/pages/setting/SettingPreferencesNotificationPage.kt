@@ -133,6 +133,23 @@ fun SettingPreferencesNotificationPage(vm: SettingVM = koinViewModel()) {
                             )
                         },
                     )
+                    // v320：讨论群专属开关（默认开）。刻意与上面那条互不影响 ——
+                    // 群里停下来等回话是另一件事，用户要能单独关掉，也不能蹭主对话那个开关。
+                    item(
+                        headlineContent = { Text(stringResource(R.string.setting_display_page_notification_group_waiting)) },
+                        supportingContent = { Text(stringResource(R.string.setting_display_page_notification_group_waiting_desc)) },
+                        trailingContent = {
+                            Switch(
+                                checked = displaySetting.notifyGroupChatWaiting,
+                                onCheckedChange = {
+                                    if (it && !permissionState.allPermissionsGranted) {
+                                        permissionState.requestPermissions()
+                                    }
+                                    updateDisplaySetting(displaySetting.copy(notifyGroupChatWaiting = it))
+                                }
+                            )
+                        },
+                    )
                 }
             }
         }

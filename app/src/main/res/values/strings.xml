@@ -865,6 +865,8 @@
   <string name="setting_display_page_message_jumper_position_title">Message Jumper Position</string>
   <string name="setting_display_page_notification_message_generated">Notify when AI stops</string>
   <string name="setting_display_page_notification_message_generated_desc">When the app is in the background, notify only after the AI finishes, fails, or is cancelled; no ongoing generation notification</string>
+  <string name="setting_display_page_notification_group_waiting">Notify when a discussion group waits for you</string>
+  <string name="setting_display_page_notification_group_waiting_desc">Group chat only, independent of the switch above: notify when a member is asking you something, when the round ends and needs your "continue", or when a turn failed</string>
   <string name="setting_display_page_paste_long_text_as_file_desc">When pasting text exceeds the threshold, automatically save it as a file attachment</string>
   <string name="setting_display_page_paste_long_text_as_file_title">Paste Long Text as File</string>
   <string name="setting_display_page_paste_long_text_threshold_title">Text Length Threshold</string>

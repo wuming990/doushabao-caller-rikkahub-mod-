@@ -57,6 +57,23 @@ internal const val AGENT_AUTO_RETRY_MAX = 2
 internal const val AGENT_RESUME_TOTAL_MAX = 8
 
 /**
+ * v321：真正生效的续跑总上限 —— **全局只允许这一处算法**，别的文件一律调它。
+ *
+ * 为什么要单独抽出来：v241 把「设成 10 却卡在第 8 次」修过一次，但只在
+ * AgentThreadManager 里就地写了 `maxOf(常量, 设置 × 2)`，而
+ * ① 工具层回传给主模型的 resume_limit、② resume_agent / 换模型的前置校验，
+ * 两处仍在用**裸常量 8**。结果就是同一件事两把尺子：用户设 10 次时自动能续到 20 次，
+ * 手动点「继续输出」却在第 9 次被拒；主模型看到的上限还永远是 8，会误判「快烧穿了」
+ * （真机实锤：一条线程续跑到 11 次还在跑，回执仍写 resume_limit=8）。
+ *
+ * 口径：下限是 [AGENT_RESUME_TOTAL_MAX] 这个防呆值；用户把自动续跑次数调到 N，
+ * 总上限就是 max(8, N × 2) —— 乘 2 是因为一次中断可能要「同模型重试 + 换模型再试」各占一跳。
+ * 设成 0（完全不自动续跑）时总上限仍按 8 算：手动点「继续输出」不该被自己的设置管死。
+ */
+internal fun effectiveResumeTotalMax(autoResumeMax: Int): Int =
+    maxOf(AGENT_RESUME_TOTAL_MAX, autoResumeMax.coerceIn(0, 10) * 2)
+
+/**
  * v241：中途换模型时，最多等这么久让当前那次生成停下来。
  *
  * 等不到就明确告诉用户「这次没换成」，不假装成功 —— 卡死的上游可能几十秒都醒不过来。
@@ -441,6 +458,16 @@ class AgentThreadManager(
         threadId in autoResumePlanned || autoRetryJobs[threadId]?.isActive == true
 
     /**
+     * v321：当前**真正生效**的续跑总上限。
+     *
+     * 工具层（wait_agents 的 resume_limit 回执、resume_agent 与换模型的前置校验）
+     * 必须读这里，不许再各自引用裸常量 AGENT_RESUME_TOTAL_MAX ——
+     * 「自动那条路按 max(8, 次数×2)、手动那条路按 8」就是 v321 要修的两把尺子。
+     */
+    suspend fun resumeTotalMax(): Int =
+        effectiveResumeTotalMax(runCatching { autoResumeMax() }.getOrDefault(0))
+
+    /**
      * v222：状态写入串行锁。
      *
      * 停止过渡态（STOPPING）与收尾终态（STOPPED）可能同时发生，
@@ -589,10 +616,9 @@ class AgentThreadManager(
             // v235：防呆上限。坏掉的上游 + 自动重试可能把线程拖进无限循环。
             // v241：用户可以把自动续跑次数调到 10，总上限不能比它还小，
             // 否则设了也白设（会在第 8 次被这里挡下来）。
-            val totalMax = maxOf(
-                AGENT_RESUME_TOTAL_MAX,
-                runCatching { autoResumeMax() }.getOrDefault(0) * 2,
-            )
+            // v321：改成调用唯一的算法（见 effectiveResumeTotalMax）。语义与 v241 完全一致，
+            // 只是不再有两份写法 —— 闸口与回执显示从此读的是同一个数。
+            val totalMax = resumeTotalMax()
             if (thread.resumeCount >= totalMax) return null
             if (jobs.containsKey(threadId)) return null
             if (repository.activeCount() >= maxConcurrent) {

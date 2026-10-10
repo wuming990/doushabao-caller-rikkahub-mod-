@@ -21,6 +21,7 @@ import me.rerere.rikkahub.agent.model.AgentThreadStatus
 import me.rerere.rikkahub.agent.repo.InMemoryAgentThreadRepository
 import me.rerere.rikkahub.agent.runtime.AGENT_AUTO_RETRY_MAX
 import me.rerere.rikkahub.agent.runtime.AGENT_RESUME_TOTAL_MAX
+import me.rerere.rikkahub.agent.runtime.effectiveResumeTotalMax
 import me.rerere.rikkahub.agent.runtime.AgentBackend
 import me.rerere.rikkahub.agent.runtime.AgentRunOutcome
 import me.rerere.rikkahub.agent.runtime.AgentThreadManager
@@ -266,8 +267,28 @@ class AgentAutoResumeTest {
     @Test
     fun `进度查询必须暴露重试所需的信息`() {
         val control = source("app/src/main/java/me/rerere/rikkahub/agent/tools/AgentControlTools.kt")
+        // v321：这个测试现在还核「上限只算一次」的接线，所以多读一份管理器源码
+        val manager = source("app/src/main/java/me/rerere/rikkahub/agent/runtime/AgentThreadManager.kt")
         assertTrue("必须回传 resume_count", control.contains("put(\"resume_count\", t.resumeCount)"))
-        assertTrue("必须回传 resume_limit", control.contains("put(\"resume_limit\", AGENT_RESUME_TOTAL_MAX)"))
+        // v321 判据更新（理由写在这，不是为了把测试改绿）：
+        // resume_limit 必须回传「真正生效的上限」，而生效值只有 manager.resumeTotalMax() 这一个来源。
+        // 原来这里钉的是 put("resume_limit", AGENT_RESUME_TOTAL_MAX) —— 钉住常量就等于把本轮要修的
+        // bug 当规范锁死：主模型看到的永远是 8，而实际闸口是 max(8, 次数×2)（真机：线程续跑 11 次仍在跑）。
+        assertTrue(
+            "resume_limit 必须回传生效值，且来源唯一",
+            control.contains("put(\"resume_limit\", resumeLimit)") &&
+                control.contains("val resumeLimit = manager.resumeTotalMax()"),
+        )
+        assertTrue(
+            "v321：工具层不许再拿裸常量判手动续跑（两把尺子的根因）",
+            !control.contains("resumeCount >= AGENT_RESUME_TOTAL_MAX") &&
+                !control.contains("put(\"resume_limit\", AGENT_RESUME_TOTAL_MAX)"),
+        )
+        assertTrue(
+            "v321：总上限必须由唯一算法算出，不许在管理器里就地再写一份 maxOf",
+            manager.contains("val totalMax = resumeTotalMax()") &&
+                !manager.contains("getOrDefault(0) * 2"),
+        )
         assertTrue(
             "必须回传 error_kind，主模型才能决定等重试还是自己接手",
             control.contains("put(\"error_kind\", AgentErrorKind.classify(t.error).name)"),
@@ -639,6 +660,49 @@ class AgentAutoResumeTest {
             delay(120_000)
             return AgentRunOutcome(report = AgentReport(conclusion = "不该走到这里"))
         }
+    }
+
+    @Test
+    fun `v321 生效上限的唯一算法：不低于防呆值，且随设置次数放宽`() {
+        // 这条函数是 v321 新加的「上限只许算一次」的落点：
+        // 自动续跑的闸口、手动「继续输出」的闸口、回传给主模型的 resume_limit 全读它。
+        // 之前是分三处写（两处写死 8、一处 max(8, 次数×2)），于是出现
+        // 「自动还能续、手动被拒绝」和「主模型看到 8 就以为快烧完了」两类误判。
+        // 用户设 0（完全不自动续跑）时总上限仍按 8：手动点「继续输出」不该被自动设置管死。
+        assertEquals(8, effectiveResumeTotalMax(0))
+        // 放大值还没超过防呆值时，常量兜住下限
+        assertEquals(8, effectiveResumeTotalMax(2))
+        assertEquals(8, effectiveResumeTotalMax(4))
+        // 从 5 次起放大值接管（v241 的口径：设了就别白设）
+        assertEquals(10, effectiveResumeTotalMax(5))
+        assertEquals(12, effectiveResumeTotalMax(6))
+        // 档位上限 10 → 20
+        assertEquals(20, effectiveResumeTotalMax(10))
+        // 越界输入不许把闸门算歪（设置层夹不住时的兜底：负数按 0、超过 10 按 10）
+        assertEquals(8, effectiveResumeTotalMax(-5))
+        assertEquals(20, effectiveResumeTotalMax(999))
+    }
+
+    @Test
+    fun `v321 手动与自动续跑必须读同一个生效上限`() {
+        val manager = source("app/src/main/java/me/rerere/rikkahub/agent/runtime/AgentThreadManager.kt")
+        val control = source("app/src/main/java/me/rerere/rikkahub/agent/tools/AgentControlTools.kt")
+        // 管理器对外只提供一个读取口，且自动闸口走它
+        assertTrue(
+            "管理器必须对外提供 resumeTotalMax()",
+            manager.contains("suspend fun resumeTotalMax(): Int"),
+        )
+        assertTrue(
+            "读取口必须调用那个唯一算法，不许就地重算",
+            manager.contains("effectiveResumeTotalMax(runCatching { autoResumeMax() }.getOrDefault(0))"),
+        )
+        // 工具层两处（回执 + 手动续跑校验）都必须用它
+        // 数「赋值语句」而不是数函数名：注释里也可能提到这个名字，数函数名会把注释算进去。
+        assertEquals(
+            "工具层应当有两处取生效上限（wait 的回执、resume 的前置校验）",
+            2,
+            Regex("val resumeLimit = manager\\.resumeTotalMax\\(\\)").findAll(control).count(),
+        )
     }
 
     private class FatalBackend : AgentBackend {
