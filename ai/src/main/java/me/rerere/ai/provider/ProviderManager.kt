@@ -1,25 +1,32 @@
 package me.rerere.ai.provider
 
 import android.content.Context
+import me.rerere.ai.provider.providers.chatgpt.ChatGPTProvider
 import me.rerere.ai.provider.providers.claude.ClaudeProvider
 import me.rerere.ai.provider.providers.google.GoogleProvider
+import me.rerere.ai.provider.providers.grok.GrokProvider
 import me.rerere.ai.provider.providers.openai.OpenAIProvider
 import okhttp3.OkHttpClient
 
 /**
  * Provider管理器，负责注册和获取Provider实例
  */
-class ProviderManager(client: OkHttpClient, context: Context) {
+class ProviderManager(
+    client: OkHttpClient,
+    context: Context,
+    accountCredentials: AccountCredentialProvider,
+) {
     // 存储已注册的Provider实例
     private val providers = mutableMapOf<String, Provider<*>>()
 
     init {
         // 注册默认Provider
-        // 包一层 ReasoningFallbackProvider：任意思考档位被服务端拒绝时，
-        // 自动沿档位链降到该模型可用的最高档重发一次（黑名单跳级，进程内有效）
+        // v323：官方账号型 provider 照常注册；我们的思考档位兜底继续包在三家里。
         registerProvider("openai", ReasoningFallbackProvider(OpenAIProvider(client, context)))
         registerProvider("google", ReasoningFallbackProvider(GoogleProvider(client, context)))
         registerProvider("claude", ReasoningFallbackProvider(ClaudeProvider(client, context)))
+        registerProvider("chatgpt", ChatGPTProvider(client, accountCredentials))
+        registerProvider("grok", GrokProvider(client, accountCredentials))
     }
 
     /**
@@ -54,10 +61,13 @@ class ProviderManager(client: OkHttpClient, context: Context) {
             is ProviderSetting.OpenAI -> getProvider("openai")
             is ProviderSetting.Google -> getProvider("google")
             is ProviderSetting.Claude -> getProvider("claude")
-            // v274：三套官方账号 OAuth 登录（实例由 app 侧 DataSourceModule 注册，照搬 ExTV）
+            // v274：三套官方账号 OAuth 登录（实例由 app 侧 DataSourceModule 注册）
             is ProviderSetting.Codex -> getProvider("codex")
-            is ProviderSetting.Grok -> getProvider("grok")
             is ProviderSetting.GeminiOAuth -> getProvider("gemini_oauth")
+            is ProviderSetting.Grok -> getProvider("grok")
+            is ProviderSetting.ChatGPT -> getProvider("chatgpt")
+            // v323：Gemini 网页版（cookie 直连）
+            is ProviderSetting.GeminiWeb -> getProvider("gemini_web")
         } as Provider<T>
     }
 }

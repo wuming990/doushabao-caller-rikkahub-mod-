@@ -16,7 +16,6 @@ plugins {
 
 android {
     namespace = "me.rerere.rikkahub"
-    // v306 合并上游 2.5.3：官方改用 AGP 新语法声明「37 的小幅版本 2」
     compileSdk {
         version = release(37) {
             minorApiLevel = 2
@@ -24,17 +23,17 @@ android {
     }
 
     defaultConfig {
-        // 二改版: 独立 applicationId, 可与官方版同时安装 (namespace 保持不变以免动全部代码引用)
         applicationId = "me.rerere.rikkahub.mod"
         minSdk = 26
         targetSdk = 37
-        versionCode = 322
-        versionName = "2.5.6-mod89"
+        versionCode = 1017
+        versionName = "3.1.1-mod15"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // 探路：交给下面的 splits 只产出 arm64-v8a（与二创做法一致；
-        // 同时设 ndk abiFilters 会被 AGP 判为冲突配置）
+        ndk {
+            abiFilters += listOf("arm64-v8a", "x86_64")
+        }
     }
 
     splits {
@@ -44,8 +43,8 @@ android {
             val isBuildingBundle = gradle.startParameter.taskNames.any { it.lowercase().contains("bundle") }
             isEnable = !isBuildingBundle
             reset()
-            include("arm64-v8a")
-            isUniversalApk = false
+            include("arm64-v8a", "x86_64")
+            isUniversalApk = true
         }
     }
 
@@ -90,6 +89,26 @@ android {
             buildConfigField("String", "VERSION_CODE", "\"${android.defaultConfig.versionCode}\"")
         }
     }
+    // v1017: official distribution flavors. Our delivery target is the github APK variant; play remains upstream-compatible.
+    flavorDimensions += "distribution"
+    productFlavors {
+        create("github") {
+            dimension = "distribution"
+            isDefault = true
+            buildConfigField("boolean", "IS_PLAY_STORE", "false")
+        }
+        create("play") {
+            dimension = "distribution"
+            buildConfigField("boolean", "IS_PLAY_STORE", "true")
+        }
+    }
+    // v323：官方 3.1 的 SettingsStore 在「读取失败重试 / 设置损坏」路径里用了 android.util.Log，
+    // 本地单元测试没有 Android 运行时，不打开这个会直接抛 "Method w in android.util.Log not mocked"。
+    // 只影响测试环境（未被 mock 的 Android 方法返回默认值），不改变 App 运行时行为。
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -103,13 +122,17 @@ android {
     }
     androidResources {
         generateLocaleConfig = true
+        // v1017: official locale pruning; our seven translations remain listed.
+        localeFilters += listOf("en", "ar", "de", "ja", "ko", "ko-rKR", "ru", "zh", "zh-rTW")
     }
     packaging {
         jniLibs {
             useLegacyPackaging = true
             pickFirsts += "lib/*/libtermux.so"
-            // 探路：本环境只有 x86_64 版 NDK strip 工具，跳过剥离（与二创做法一致）
-            keepDebugSymbols += "**/*.so"
+        }
+        resources {
+            // v1017: official 3.1.1 removes unused BouncyCastle Picnic tables.
+            excludes += "org/bouncycastle/pqc/crypto/picnic/**"
         }
     }
     tasks.withType<KotlinCompile>().configureEach {
@@ -127,6 +150,19 @@ android {
     }
 }
 
+// v1017: official baseline-profile merge for distribution flavors.
+baselineProfile {
+    mergeIntoMain = true
+}
+
+// baselineprofile 插件按 release 复制出 nonMinifiedRelease 时只关掉 isMinifyEnabled，关不掉 optimization，
+// 不手动关的话生成用的包会被 R8 内联、合并类，profile 里记下的是优化后的类和方法
+androidComponents {
+    finalizeDsl { extension ->
+        extension.buildTypes.findByName("nonMinifiedRelease")?.optimization?.enable = false
+    }
+}
+
 composeCompiler {
     stabilityConfigurationFiles.add(
         project.layout.projectDirectory.file("compose_compiler_config.conf")
@@ -134,7 +170,7 @@ composeCompiler {
 }
 
 tasks.register("buildAll") {
-    dependsOn("assembleRelease", "bundleRelease")
+    dependsOn("assembleGithubRelease", "bundlePlayRelease")
     description = "Build both APK and AAB"
 }
 
@@ -148,9 +184,12 @@ kotlin {
     }
 }
 
-// v306 合并上游 2.5.3：官方换了 JS 引擎库（quickjs-kt），本地 JVM 单测要用桌面版
-// 原生库而不是 Android AAR，官方靠这段依赖替换实现。照抄，否则 :app 的 JVM 单测会挂。
 // Local JVM tests need the desktop native library instead of the Android AAR.
+// v1017: official 3.1.1 excludes unused kotlin-reflect from runtime classpaths.
+configurations.matching { it.name.endsWith("RuntimeClasspath") }.configureEach {
+    exclude(group = "org.jetbrains.kotlin", module = "kotlin-reflect")
+}
+
 configurations.matching { it.name.endsWith("UnitTestRuntimeClasspath") }.configureEach {
     resolutionStrategy.dependencySubstitution {
         substitute(module("io.github.dokar3:quickjs-kt-android"))
@@ -159,7 +198,6 @@ configurations.matching { it.name.endsWith("UnitTestRuntimeClasspath") }.configu
 }
 
 dependencies {
-    // v306 合并上游 2.5.3：app 模块直接使用 quickjs（JavascriptTool 重写），官方显式加依赖
     implementation(libs.quickjs)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
@@ -167,7 +205,10 @@ dependencies {
     implementation(libs.androidx.work.runtime.ktx)
     implementation(libs.androidx.browser)
     implementation(libs.androidx.profileinstaller)
-    implementation(libs.termux.terminal.view)
+    implementation(libs.termux.terminal.view) {
+        // v1017: official :terminal provides terminal-emulator.
+        exclude(group = "com.termux.termux-app", module = "terminal-emulator")
+    }
     implementation(libs.guava.listenablefuture)
 
     // Compose
@@ -194,16 +235,15 @@ dependencies {
     // DataStore
     implementation(libs.androidx.datastore.preferences)
 
-    // 视频：对话内嵌播放器（media3/ExoPlayer）
-    implementation(libs.androidx.media3.common)
-    implementation(libs.androidx.media3.exoplayer)
-    implementation(libs.androidx.media3.ui)
+    // EXIF orientation for picked images
+    // v1017: official 3.1.1 image orientation support.
+    implementation(libs.androidx.exifinterface)
 
     // Image metadata extractor
     // https://github.com/drewnoakes/metadata-extractor
     implementation(libs.metadata.extractor)
 
-    // Haze (background blur and glass) —— v306 合并上游 2.5.3：官方新增玻璃效果两个模块
+    // Haze (background blur and glass)
     implementation(libs.haze)
     implementation(libs.haze.blur)
     implementation(libs.haze.blur.material3)
@@ -216,9 +256,6 @@ dependencies {
     implementation(libs.koin.compose)
     implementation(libs.koin.androidx.workmanager)
 
-    // jetbrains markdown parser
-    implementation(libs.jetbrains.markdown)
-
     // okhttp
     implementation(libs.okhttp)
     implementation(libs.okhttp.sse)
@@ -230,9 +267,6 @@ dependencies {
     implementation(libs.ktor.client.okhttp)
     implementation(libs.ktor.client.content.negotiation)
     implementation(libs.ktor.serialization.kotlinx.json)
-
-    // ucrop
-    implementation(libs.ucrop)
 
     // pebble (template engine)
     implementation(libs.pebble)
@@ -250,15 +284,18 @@ dependencies {
     // serialization
     implementation(libs.kotlinx.serialization.json)
 
-    // zxing
-    implementation(libs.zxing.core)
+    // YAML front matter
+    implementation(libs.snakeyaml)
 
-    // quickie (qrcode scanner)
-    implementation(libs.quickie.bundled)
-    implementation(libs.barcode.scanning)
-    implementation(libs.androidx.camera.core)
+    // v1017: official 3.1.1 zxing + CameraX scanner.
+    implementation(libs.zxing.core)
+    implementation(libs.androidx.camera.camera2)
+    implementation(libs.androidx.camera.lifecycle)
+    implementation(libs.androidx.camera.compose)
 
     // Room
+    implementation("androidx.sqlite:sqlite:2.6.2")
+    implementation(libs.jetbrains.markdown)
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)
     implementation(libs.androidx.room.paging)
@@ -269,17 +306,17 @@ dependencies {
     implementation(libs.androidx.paging.runtime)
     implementation(libs.androidx.paging.compose)
 
+    // media3 (video playback)
+    implementation(libs.androidx.media3.exoplayer)
+    implementation(libs.androidx.media3.ui)
+
     // Apache Commons Text
     implementation(libs.commons.text)
-
-    // Toast (Sonner)
-    implementation(libs.sonner)
 
     // Reorderable (https://github.com/Calvin-LL/Reorderable/)
     implementation(libs.reorderable)
 
-    // lucide icons
-    implementation(libs.lucide.icons)
+    // icons
     implementation(libs.huge.icons)
 
     // image viewer
@@ -311,22 +348,20 @@ dependencies {
     implementation(project(":highlight"))
     implementation(project(":search"))
     implementation(project(":speech"))
+    implementation(project(":mediagen"))
     implementation(project(":common"))
     implementation(project(":material3"))
+    implementation(project(":ui"))
     implementation(project(":workspace"))
+    implementation(project(":terminal"))
     implementation(project(":oauth"))
-    // YAML front matter（2.4.12 skill 解析）
-    implementation(libs.snakeyaml)
-
-    implementation(project(":videogen"))
     implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.jar", "*.aar"))))
-    implementation(kotlin("reflect"))
-
     // Leak Canary
     // debugImplementation(libs.leakcanary.android)
 
     // tests
     testImplementation(libs.junit)
+    testImplementation(libs.kotlinx.coroutines.test)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))

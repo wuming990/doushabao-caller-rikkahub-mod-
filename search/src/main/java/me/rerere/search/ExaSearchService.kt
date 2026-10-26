@@ -56,7 +56,8 @@ object ExaSearchService : SearchService<SearchServiceOptions.ExaOptions> {
             properties = buildJsonObject {
                 put("query", buildJsonObject {
                     put("type", "string")
-                    put("description", "search keyword")
+                    // v1017 合并官方 3.1.1：query 描述改用官方统一常量（教模型写「关键词而非整句」并按来源语言写）
+                    put("description", SEARCH_QUERY_DESCRIPTION)
                 })
                 put("type", buildJsonObject {
                     put("type", "string")

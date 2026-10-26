@@ -30,8 +30,8 @@ internal class ReasoningFallbackProvider<T : ProviderSetting>(
     override suspend fun listModels(providerSetting: T): List<Model> =
         delegate.listModels(providerSetting)
 
-    override suspend fun getBalance(providerSetting: T): String =
-        delegate.getBalance(providerSetting)
+    override suspend fun getQuota(providerSetting: T): ProviderQuota? =
+        delegate.getQuota(providerSetting)
 
     override suspend fun generateText(
         providerSetting: T,

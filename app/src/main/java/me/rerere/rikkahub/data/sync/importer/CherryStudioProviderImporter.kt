@@ -127,9 +127,11 @@ object CherryStudioProviderImporter {
             is ProviderSetting.Google -> "google|${provider.baseUrl}|${provider.apiKey}"
             is ProviderSetting.Claude -> "claude|${provider.baseUrl}|${provider.apiKey}"
             // v274：三套官方账号 OAuth 登录（无 apiKey/baseUrl，按 id 区分）
-            is ProviderSetting.Codex -> "codex|${provider.id}"
+            is ProviderSetting.ChatGPT -> "chatgpt|${provider.id}"
+        is ProviderSetting.Codex -> "codex|${provider.id}"
             is ProviderSetting.Grok -> "grok|${provider.id}"
             is ProviderSetting.GeminiOAuth -> "gemini_oauth|${provider.id}"
+            is ProviderSetting.GeminiWeb -> "gemini_web|${provider.id}"
         }
     }
 }

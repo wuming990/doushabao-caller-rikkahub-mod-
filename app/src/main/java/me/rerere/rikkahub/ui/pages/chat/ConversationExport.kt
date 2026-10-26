@@ -65,7 +65,7 @@ import coil3.compose.AsyncImage
 import coil3.request.ImageRequest
 import coil3.request.allowHardware
 import coil3.request.crossfade
-import com.dokar.sonner.ToastType
+import me.rerere.ui.toast.ToastType
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.contentOrNull
@@ -77,6 +77,7 @@ import me.rerere.ai.ui.isEmptyUIMessage
 import me.rerere.ai.util.encodeBase64
 import me.rerere.common.android.appTempFolder
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.data.ai.tools.MemoryToolNames
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.findModelById
 import me.rerere.rikkahub.data.model.Conversation
@@ -84,16 +85,14 @@ import me.rerere.rikkahub.ui.components.message.MessagePartBlock
 import me.rerere.rikkahub.ui.components.message.ThinkingStep
 import me.rerere.rikkahub.ui.components.message.ChatMessageServerToolStep
 import me.rerere.rikkahub.ui.components.message.groupMessageParts
+import me.rerere.rikkahub.ui.components.message.tools.memoryToolTitle
 import me.rerere.rikkahub.ui.components.richtext.MarkdownBlock
 import me.rerere.rikkahub.ui.components.ui.AutoAIIcon
-import me.rerere.rikkahub.ui.components.ui.BitmapComposer
 import me.rerere.rikkahub.ui.components.ui.ChainOfThought
-import me.rerere.rikkahub.ui.components.charts.ChartCard
-import me.rerere.rikkahub.ui.components.charts.ChartSpec
 import me.rerere.rikkahub.ui.components.ui.ChainOfThoughtScope
 import me.rerere.rikkahub.ui.context.LocalNavController
 import me.rerere.rikkahub.ui.context.LocalSettings
-import com.dokar.sonner.rememberToasterState
+import me.rerere.ui.toast.rememberToasterState
 import me.rerere.rikkahub.ui.context.LocalToaster
 import me.rerere.rikkahub.ui.theme.RikkahubTheme
 import me.rerere.rikkahub.utils.exportImage
@@ -101,6 +100,9 @@ import me.rerere.rikkahub.utils.getActivity
 import me.rerere.rikkahub.utils.JsonInstantPretty
 import me.rerere.rikkahub.utils.jsonPrimitiveOrNull
 import me.rerere.rikkahub.utils.toLocalString
+import me.rerere.ui.charts.ChartCard
+import me.rerere.ui.charts.ChartSpec
+import me.rerere.ui.components.BitmapComposer
 import java.io.FileOutputStream
 import java.time.LocalDateTime
 import kotlin.time.Duration.Companion.seconds
@@ -542,7 +544,7 @@ private fun ExportedChatMessage(
     if (parts.isEmptyUIMessage()) return
     val context = LocalContext.current
     val settings = LocalSettings.current
-    val model = message.modelId?.let { settings.findModelById(it) }
+    val model = message.modelId?.let { settings.findModelById(it) } ?: message.snapshotModel()
     // Always show model icon for assistant messages in exported images
     val showModelIcon = message.role == MessageRole.ASSISTANT && prevMessage?.role == MessageRole.USER
     val iconLabel = when {
@@ -731,17 +733,7 @@ private fun ChainOfThoughtScope.ExportedReasoningStep(
 private fun ChainOfThoughtScope.ExportedToolStep(
     tool: UIMessagePart.Tool
 ) {
-    val memoryAction = runCatching {
-        tool.inputAsJson().jsonObject["action"]?.jsonPrimitiveOrNull?.contentOrNull
-    }.getOrNull()
     val title = when (tool.toolName) {
-        "memory_tool" -> when (memoryAction) {
-            "create" -> stringResource(R.string.chat_message_tool_create_memory)
-            "edit" -> stringResource(R.string.chat_message_tool_edit_memory)
-            "delete" -> stringResource(R.string.chat_message_tool_delete_memory)
-            else -> stringResource(R.string.chat_message_tool_call_generic, tool.toolName)
-        }
-
         "search_web" -> {
             val query = runCatching {
                 tool.inputAsJson().jsonObject["query"]?.jsonPrimitiveOrNull?.contentOrNull ?: ""
@@ -750,7 +742,8 @@ private fun ChainOfThoughtScope.ExportedToolStep(
         }
 
         "scrape_web" -> stringResource(R.string.chat_message_tool_scrape_web)
-        else -> stringResource(R.string.chat_message_tool_call_generic, tool.toolName)
+        else -> memoryToolTitle(tool.toolName, runCatching { tool.inputAsJson() }.getOrNull())
+            ?: stringResource(R.string.chat_message_tool_call_generic, tool.toolName)
     }
     ControlledChainOfThoughtStep(
         expanded = true,
@@ -758,14 +751,10 @@ private fun ChainOfThoughtScope.ExportedToolStep(
         icon = {
             Icon(
                 imageVector = when (tool.toolName) {
-                    "memory_tool" -> when (memoryAction) {
-                        "create", "edit" -> HugeIcons.Book04
-                        "delete" -> HugeIcons.Book02
-                        else -> HugeIcons.Wrench01
-                    }
-
                     "search_web" -> HugeIcons.Search01
                     "scrape_web" -> HugeIcons.Earth
+                    MemoryToolNames.DELETE -> HugeIcons.Book02
+                    in MemoryToolNames.WRITES -> HugeIcons.Book04
                     else -> HugeIcons.Wrench01
                 },
                 contentDescription = null,

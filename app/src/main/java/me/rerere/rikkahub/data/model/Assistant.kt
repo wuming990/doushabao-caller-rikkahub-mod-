@@ -3,10 +3,11 @@ package me.rerere.rikkahub.data.model
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import me.rerere.ai.core.MessageRole
+import me.rerere.ai.core.ReasoningLevel
 import me.rerere.ai.provider.CustomBody
 import me.rerere.ai.provider.CustomHeader
 import me.rerere.ai.ui.UIMessage
-import me.rerere.ai.core.ReasoningLevel
+import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.data.ai.tools.local.LocalToolOption
 import me.rerere.rikkahub.utils.SimpleCache
 import java.util.concurrent.TimeUnit
@@ -28,6 +29,7 @@ data class Assistant(
     val streamOutput: Boolean = true,
     val enableMemory: Boolean = false,
     val useGlobalMemory: Boolean = false, // 使用全局共享记忆而非助手隔离记忆
+    val autoConsolidateMemory: Boolean = true, // 对话停下来后在后台自动整理记忆; 关闭后只能手动整理
     val enableRecentChatsReference: Boolean = false,
     val messageTemplate: String = "{{ message }}",
     val presetMessages: List<UIMessage> = emptyList(),
@@ -84,6 +86,7 @@ data class QuickMessage(
 )
 
 @Serializable
+// v323：官方 3.1 把记忆改成了文件库，但生成层仍用这个轻量结构承载「本次要注入的记忆」。
 data class AssistantMemory(
     val id: Int,
     val content: String = "",
@@ -145,25 +148,34 @@ fun String.replaceRegexes(
     }
 }
 
+/** 对用户输入的文本应用助手作用于用户消息的正则替换 */
+fun List<UIMessagePart>.replaceUserRegexes(assistant: Assistant): List<UIMessagePart> = map { part ->
+    if (part is UIMessagePart.Text) {
+        part.copy(text = part.text.replaceRegexes(assistant, AssistantAffectScope.USER, visual = false))
+    } else {
+        part
+    }
+}
+
 /**
  * 注入位置
  */
 @Serializable
 enum class InjectionPosition {
     @SerialName("before_system_prompt")
-    BEFORE_SYSTEM_PROMPT,   // 系统提示词之前
+    BEFORE_SYSTEM_PROMPT, // 系统提示词之前
 
     @SerialName("after_system_prompt")
-    AFTER_SYSTEM_PROMPT,    // 系统提示词之后（最常用）
+    AFTER_SYSTEM_PROMPT, // 系统提示词之后（最常用）
 
     @SerialName("top_of_chat")
-    TOP_OF_CHAT,            // 对话最开头（第一条用户消息之前）
+    TOP_OF_CHAT, // 对话最开头（第一条用户消息之前）
 
     @SerialName("bottom_of_chat")
-    BOTTOM_OF_CHAT,         // 最新消息之前（当前用户输入之前）
+    BOTTOM_OF_CHAT, // 最新消息之前（当前用户输入之前）
 
     @SerialName("at_depth")
-    AT_DEPTH,               // 在指定深度位置插入（从最新消息往前数）
+    AT_DEPTH, // 在指定深度位置插入（从最新消息往前数）
 }
 
 /**

@@ -43,13 +43,18 @@ class ChatCompletionsRequestMessageTest {
         messages: List<UIMessage>,
         includeHistoryReasoning: Boolean = true,
         includeOpenRouterReasoningDetails: Boolean = false,
+        // v1010：buildMessages 多了第 5 个参数（DeepSeek 补发 reasoning_content 的标记）。
+        // 反射是按**完整签名**找方法的，这里不加就会 NoSuchMethodException，
+        // 把官方这条既有测试整条打红 —— 加参数必须同步改反射。
+        alwaysIncludeReasoning: Boolean = false,
     ): JsonArray {
         val method = ChatCompletionsAPI::class.java.getDeclaredMethod(
             "buildMessages",
             List::class.java,
             Boolean::class.javaPrimitiveType,
             Boolean::class.javaPrimitiveType,
-            List::class.java
+            List::class.java,
+            Boolean::class.javaPrimitiveType,
         )
         method.isAccessible = true
         return method.invoke(
@@ -57,7 +62,8 @@ class ChatCompletionsRequestMessageTest {
             messages,
             includeHistoryReasoning,
             includeOpenRouterReasoningDetails,
-            listOf(Modality.TEXT, Modality.IMAGE)
+            listOf(Modality.TEXT, Modality.IMAGE),
+            alwaysIncludeReasoning,
         ) as JsonArray
     }
 

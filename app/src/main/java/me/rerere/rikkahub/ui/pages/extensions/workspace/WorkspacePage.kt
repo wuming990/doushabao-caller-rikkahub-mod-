@@ -1,11 +1,5 @@
 package me.rerere.rikkahub.ui.pages.extensions.workspace
 
-import android.content.Intent
-import android.net.Uri
-import android.widget.Toast
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -13,71 +7,82 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
-import androidx.compose.material3.Card
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LargeFlexibleTopAppBar
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.nestedscroll.nestedScroll
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import me.rerere.hugeicons.HugeIcons
+import me.rerere.hugeicons.stroke.CloudServer
 import me.rerere.hugeicons.stroke.Add01
 import me.rerere.hugeicons.stroke.Delete01
-import me.rerere.hugeicons.stroke.File02
+import me.rerere.hugeicons.stroke.FolderCode
 import me.rerere.hugeicons.stroke.PencilEdit01
 import me.rerere.rikkahub.Screen
-import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.db.entity.WorkspaceEntity
-import me.rerere.rikkahub.data.files.OfficialImportOutcome
-import me.rerere.rikkahub.data.files.OfficialRikkaHubStorage
-import me.rerere.rikkahub.data.files.OfficialSourceEntry
-import me.rerere.rikkahub.data.files.OfficialTransferInfo
-import me.rerere.rikkahub.data.files.OfficialWorkspaceMigrationPhase
-import me.rerere.rikkahub.data.files.OfficialWorkspaceMigrationProgress
-import me.rerere.rikkahub.data.files.SharedStorageManager
+import androidx.compose.ui.res.stringResource
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.ui.components.ai.ExtensionEmptyState
 import me.rerere.rikkahub.ui.components.nav.BackButton
-import me.rerere.rikkahub.ui.components.ui.OfficialConnectFailedDialog
-import me.rerere.rikkahub.ui.components.ui.OfficialConnectGuideDialog
+import me.rerere.rikkahub.ui.components.ui.CardGroup
+import me.rerere.rikkahub.ui.components.ui.CardGroupIcon
 import me.rerere.rikkahub.ui.components.ui.ItemAction
 import me.rerere.rikkahub.ui.components.ui.ItemActionMenu
-import me.rerere.rikkahub.ui.components.ui.RikkaConfirmDialog
 import me.rerere.rikkahub.ui.context.LocalNavController
-import me.rerere.rikkahub.ui.context.LocalSettings
 import me.rerere.rikkahub.ui.theme.CustomColors
 import me.rerere.rikkahub.utils.plus
+import me.rerere.ui.components.RikkaConfirmDialog
 import org.koin.androidx.compose.koinViewModel
 import org.koin.compose.koinInject
+import me.rerere.rikkahub.ui.context.LocalSettings
+import me.rerere.rikkahub.ui.components.ui.OfficialConnectGuideDialog
+import me.rerere.rikkahub.ui.components.ui.OfficialConnectFailedDialog
+import me.rerere.rikkahub.data.files.SharedStorageManager
+import me.rerere.rikkahub.data.files.OfficialSourceEntry
+import me.rerere.rikkahub.data.files.OfficialRikkaHubStorage
+import me.rerere.rikkahub.data.files.OfficialImportOutcome
+import me.rerere.rikkahub.data.datastore.SettingsStore
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.LaunchedEffect
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Dispatchers
+import androidx.compose.runtime.produceState
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Card
+import androidx.compose.material3.Button
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.clickable
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.compose.rememberLauncherForActivityResult
+import android.widget.Toast
+import android.net.Uri
 
 @Composable
 fun WorkspacePage(
@@ -85,17 +90,17 @@ fun WorkspacePage(
     sharedStorageManager: SharedStorageManager = koinInject(),
     settingsStore: SettingsStore = koinInject(),
 ) {
-    val navController = LocalNavController.current
+    // v1015：这三个局部量是「复制官方工作区」接线要的，合并时被官方签名一起抹掉了。
     val context = LocalContext.current
     val settings = LocalSettings.current
     val scope = rememberCoroutineScope()
+
+    val navController = LocalNavController.current
     val workspaces by vm.workspaces.collectAsStateWithLifecycle()
     val migrationState by vm.officialMigration.collectAsStateWithLifecycle()
     val importState by vm.officialImport.collectAsStateWithLifecycle()
-    val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
-    var showAddDialog by rememberSaveable { mutableStateOf(false) }
-    var editTarget by remember { mutableStateOf<WorkspaceEntity?>(null) }
-    var deleteTarget by remember { mutableStateOf<WorkspaceEntity?>(null) }
+    // v1015：scrollBehavior / showAddDialog / editTarget / deleteTarget 这四行官方文件里本来就有，
+    // 第一次搬接线段时把它们也带了一遍 → Conflicting declarations。这里只留官方那份，勿再加回。
     var showOfficialPicker by remember { mutableStateOf(false) }
     var showOfficialConnectGuide by remember { mutableStateOf(false) }
     var showOfficialDisconnectConfirm by remember { mutableStateOf(false) }
@@ -107,6 +112,16 @@ fun WorkspacePage(
     val officialTreeUri = settings.sharedStorageTreeUris
         .map(Uri::parse)
         .firstOrNull(OfficialRikkaHubStorage::isOfficialTree)
+
+    // v1015（二审计出）：connectedName 原先直接在 Composable 里同步查——复制进行中进度约
+    // 300ms 推一次就重组一次，每回都要跨进程向官方 App 的 DocumentsProvider 问一次根目录名，
+    // 官方 App 卡顿时会拖住主线程。改成 produceState：只在目录句柄变化时到 IO 线程取一次，
+    // 取不到就不显示名字（runCatching 兜 binder 异常，不能让它掀翻整页组合）。
+    val connectedName by produceState<String?>(initialValue = null, officialTreeUri) {
+        value = withContext(Dispatchers.IO) {
+            officialTreeUri?.let { uri -> runCatching { sharedStorageManager.queryRoot(uri)?.name }.getOrNull() }
+        }
+    }
 
     fun openOfficialApp() {
         val intent = context.packageManager
@@ -175,6 +190,45 @@ fun WorkspacePage(
             showOfficialPicker = false
         }
     }
+    val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
+    var showAddDialog by rememberSaveable { mutableStateOf(false) }
+    // v1017 合并官方 3.1.1：新建工作区要先选类型（本地 / SSH 远程）
+    var showTypeSheet by rememberSaveable { mutableStateOf(false) }
+    var editTarget by remember { mutableStateOf<WorkspaceEntity?>(null) }
+    var deleteTarget by remember { mutableStateOf<WorkspaceEntity?>(null) }
+
+    // v1017 合并官方 3.1.1：没有这个入口，SSH 工作区就建不出来 ——
+    // 路由 Screen.WorkspaceSshEditor、编辑器页、DI、数据库 type/ssh_config 都已就位，
+    // 唯独缺这里的「新建时选类型」入口（上一轮只做了详情页的分支渲染，属于半成品）。
+    if (showTypeSheet) {
+        ModalBottomSheet(onDismissRequest = { showTypeSheet = false }) {
+            CardGroup(
+                modifier = Modifier
+                    .padding(horizontal = 16.dp)
+                    .padding(bottom = 24.dp),
+                title = { Text(stringResource(R.string.workspace_page_create)) },
+            ) {
+                item(
+                    onClick = {
+                        showTypeSheet = false
+                        showAddDialog = true
+                    },
+                    leadingContent = { CardGroupIcon(HugeIcons.FolderCode) },
+                    supportingContent = { Text(stringResource(R.string.workspace_page_type_local_desc)) },
+                    headlineContent = { Text(stringResource(R.string.workspace_page_type_local)) },
+                )
+                item(
+                    onClick = {
+                        showTypeSheet = false
+                        navController.navigate(Screen.WorkspaceSshEditor())
+                    },
+                    leadingContent = { CardGroupIcon(HugeIcons.CloudServer) },
+                    supportingContent = { Text(stringResource(R.string.workspace_page_type_ssh_desc)) },
+                    headlineContent = { Text(stringResource(R.string.workspace_page_type_ssh)) },
+                )
+            }
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -186,7 +240,7 @@ fun WorkspacePage(
             )
         },
         floatingActionButton = {
-            FloatingActionButton(onClick = { showAddDialog = true }) {
+            FloatingActionButton(onClick = { showTypeSheet = true }) {
                 Icon(HugeIcons.Add01, contentDescription = null)
             }
         },
@@ -201,8 +255,7 @@ fun WorkspacePage(
             item {
                 OfficialRikkaHubWorkspaceCard(
                     connected = officialTreeUri != null,
-                    connectedName = officialTreeUri
-                        ?.let { sharedStorageManager.queryRoot(it)?.name },
+                    connectedName = connectedName,
                     importing = importState.importing,
                     resuming = importState.resuming,
                     discarding = importState.discarding,
@@ -225,12 +278,16 @@ fun WorkspacePage(
 
             if (workspaces.isEmpty()) {
                 item {
-                    EmptyWorkspaceState()
+                    ExtensionEmptyState(
+                        message = stringResource(R.string.workspace_page_empty),
+                        description = stringResource(R.string.workspace_page_empty_desc),
+                        icon = HugeIcons.FolderCode,
+                    )
                 }
             }
 
             items(workspaces, key = { it.id }) { workspace ->
-                WorkspaceCard(
+                WorkspaceItem(
                     workspace = workspace,
                     onRename = { editTarget = workspace },
                     onDelete = { deleteTarget = workspace },
@@ -238,6 +295,46 @@ fun WorkspacePage(
                 )
             }
         }
+    }
+
+    if (showAddDialog) {
+        EditWorkspaceDialog(
+            title = stringResource(R.string.workspace_page_create),
+            initialName = "",
+            existingNames = workspaces.map { it.name.trim() }.toSet(),
+            onDismiss = { showAddDialog = false },
+            onConfirm = { name ->
+                vm.create(name)
+                showAddDialog = false
+            },
+        )
+    }
+
+    editTarget?.let { workspace ->
+        EditWorkspaceDialog(
+            title = stringResource(R.string.workspace_page_rename),
+            initialName = workspace.name,
+            existingNames = workspaces.filter { it.id != workspace.id }.map { it.name.trim() }.toSet(),
+            onDismiss = { editTarget = null },
+            onConfirm = { name ->
+                vm.rename(workspace, name)
+                editTarget = null
+            },
+        )
+    }
+
+    RikkaConfirmDialog(
+        show = deleteTarget != null,
+        title = stringResource(R.string.workspace_page_delete),
+        confirmText = stringResource(R.string.common_delete),
+        dismissText = stringResource(R.string.common_cancel),
+        onConfirm = {
+            deleteTarget?.let { vm.delete(it) }
+            deleteTarget = null
+        },
+        onDismiss = { deleteTarget = null },
+    ) {
+        Text(stringResource(R.string.workspace_page_delete_confirm))
     }
 
     if (showOfficialPicker) {
@@ -528,351 +625,63 @@ fun WorkspacePage(
             onDismiss = { officialConnectionError = null },
         )
     }
-
-    if (showAddDialog) {
-        EditWorkspaceDialog(
-            title = stringResource(R.string.workspace_page_create),
-            initialName = "",
-            existingNames = workspaces.map { it.name.trim() }.toSet(),
-            onDismiss = { showAddDialog = false },
-            onConfirm = { name ->
-                vm.create(name)
-                showAddDialog = false
-            },
-        )
-    }
-
-    editTarget?.let { workspace ->
-        EditWorkspaceDialog(
-            title = stringResource(R.string.workspace_page_rename),
-            initialName = workspace.name,
-            existingNames = workspaces.filter { it.id != workspace.id }.map { it.name.trim() }.toSet(),
-            onDismiss = { editTarget = null },
-            onConfirm = { name ->
-                vm.rename(workspace, name)
-                editTarget = null
-            },
-        )
-    }
-
-    RikkaConfirmDialog(
-        show = deleteTarget != null,
-        title = stringResource(R.string.workspace_page_delete),
-        confirmText = stringResource(R.string.common_delete),
-        dismissText = stringResource(R.string.common_cancel),
-        onConfirm = {
-            deleteTarget?.let { vm.delete(it) }
-            deleteTarget = null
-        },
-        onDismiss = { deleteTarget = null },
-    ) {
-        Text(stringResource(R.string.workspace_page_delete_confirm))
-    }
 }
 
 @Composable
-private fun OfficialRikkaHubWorkspaceCard(
-    connected: Boolean,
-    connectedName: String?,
-    importing: Boolean,
-    resuming: Boolean,
-    discarding: Boolean,
-    progress: OfficialWorkspaceMigrationProgress?,
-    resumable: OfficialTransferInfo?,
-    onConnect: () -> Unit,
-    onReselect: () -> Unit,
-    onDisconnect: () -> Unit,
-    onOpenOfficial: () -> Unit,
-    onRefresh: () -> Unit,
-    onResume: () -> Unit,
-    onPause: () -> Unit,
-    onDiscard: () -> Unit,
-    onImport: () -> Unit,
-) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CustomColors.cardColorsOnSurfaceContainer,
-    ) {
-        Column(
-            modifier = Modifier.fillMaxWidth().padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Text(
-                stringResource(R.string.workspace_official_card_title),
-                style = MaterialTheme.typography.titleMedium,
-            )
-            Text(
-                if (connected) {
-                    stringResource(R.string.workspace_official_card_connected)
-                } else {
-                    stringResource(R.string.workspace_official_card_disconnected)
-                },
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            if (connected && connectedName != null) {
-                Text(
-                    stringResource(R.string.workspace_official_selected, connectedName),
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
-
-            if (importing) {
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    CircularProgressIndicator(modifier = Modifier.size(20.dp))
-                    Text(
-                        stringResource(
-                            if (resuming) {
-                                R.string.workspace_official_transfer_resuming
-                            } else {
-                                R.string.workspace_official_transfer_running
-                            }
-                        ),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.primary,
-                    )
-                }
-                progress?.let {
-                    Text(
-                        stringResource(
-                            R.string.workspace_official_transfer_progress_detail,
-                            it.processedFiles,
-                            it.transferredFiles,
-                            it.processedDirectories,
-                            it.skippedEntries,
-                        ),
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                    Text(
-                        stringResource(
-                            when (it.phase) {
-                                OfficialWorkspaceMigrationPhase.SCANNING_DIRECTORY ->
-                                    R.string.workspace_official_transfer_phase_scanning
-                                OfficialWorkspaceMigrationPhase.DISCOVERING_DIRECTORY ->
-                                    R.string.workspace_official_transfer_phase_discovering
-                                OfficialWorkspaceMigrationPhase.CHECKING_EXISTING_FILE ->
-                                    R.string.workspace_official_transfer_phase_checking
-                                OfficialWorkspaceMigrationPhase.COPYING_FILE ->
-                                    R.string.workspace_official_transfer_phase_copying
-                            },
-                            it.currentItemName,
-                        ),
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-                OutlinedButton(
-                    onClick = onPause,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text(stringResource(R.string.workspace_official_transfer_pause))
-                }
-            } else if (resumable != null) {
-                Text(
-                    stringResource(R.string.workspace_official_transfer_interrupted, resumable.workspaceName),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error,
-                )
-                if (resumable.processedFiles > 0 || resumable.processedDirectories > 0) {
-                    Text(
-                        stringResource(
-                            R.string.workspace_official_transfer_saved_progress,
-                            resumable.processedFiles,
-                            resumable.processedDirectories,
-                        ),
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                }
-                resumable.lastError?.takeIf { it.isNotBlank() }?.let { error ->
-                    Text(
-                        stringResource(R.string.workspace_official_transfer_last_error, error),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 3,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    OutlinedButton(
-                        onClick = onResume,
-                        enabled = !discarding,
-                        modifier = Modifier.weight(1f),
-                    ) {
-                        Text(stringResource(R.string.workspace_official_transfer_resume))
-                    }
-                    OutlinedButton(
-                        onClick = onDiscard,
-                        enabled = !discarding,
-                        modifier = Modifier.weight(1f),
-                    ) {
-                        Text(
-                            stringResource(
-                                if (discarding) {
-                                    R.string.workspace_official_transfer_discarding
-                                } else {
-                                    R.string.workspace_official_transfer_discard
-                                }
-                            )
-                        )
-                    }
-                }
-            }
-
-            Button(
-                onClick = if (connected) onImport else onConnect,
-                enabled = !importing && !discarding && resumable == null,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text(
-                    if (connected) {
-                        stringResource(R.string.workspace_official_card_import)
-                    } else {
-                        stringResource(R.string.workspace_official_card_connect)
-                    }
-                )
-            }
-            if (connected) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    OutlinedButton(
-                        onClick = onReselect,
-                        enabled = !importing && resumable == null,
-                        modifier = Modifier.weight(1f),
-                    ) {
-                        Text(stringResource(R.string.workspace_official_reselect))
-                    }
-                    OutlinedButton(
-                        onClick = onDisconnect,
-                        enabled = !importing && resumable == null,
-                        modifier = Modifier.weight(1f),
-                    ) {
-                        Text(stringResource(R.string.workspace_official_disconnect))
-                    }
-                }
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    OutlinedButton(
-                        onClick = onOpenOfficial,
-                        modifier = Modifier.weight(1f),
-                    ) {
-                        Text(stringResource(R.string.workspace_official_open_confirm))
-                    }
-                    OutlinedButton(
-                        onClick = onRefresh,
-                        enabled = !importing,
-                        modifier = Modifier.weight(1f),
-                    ) {
-                        Text(stringResource(R.string.workspace_official_refresh))
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun EmptyWorkspaceState() {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 48.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Icon(
-            imageVector = HugeIcons.File02,
-            contentDescription = null,
-            modifier = Modifier.size(48.dp),
-            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Text(
-            text = stringResource(R.string.workspace_page_empty),
-            style = MaterialTheme.typography.bodyLarge,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Text(
-            text = stringResource(R.string.workspace_page_empty_desc),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-    }
-}
-
-@Composable
-private fun WorkspaceCard(
+private fun WorkspaceItem(
     workspace: WorkspaceEntity,
     onRename: () -> Unit,
     onDelete: () -> Unit,
     onOpen: () -> Unit,
 ) {
-    Card(
+    Surface(
         onClick = onOpen,
         modifier = Modifier.fillMaxWidth(),
-        colors = CustomColors.cardColorsOnSurfaceContainer,
+        shape = RoundedCornerShape(20.dp),
+        color = CustomColors.listItemColors.containerColor,
     ) {
-        Column(
-            modifier = Modifier.fillMaxWidth(),
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 16.dp, top = 12.dp, bottom = 12.dp, end = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Row(
+            CardGroupIcon(if (workspace.isSsh()) HugeIcons.CloudServer else HugeIcons.FolderCode)
+            Column(
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(start = 16.dp, top = 12.dp, bottom = 12.dp, end = 4.dp),
-                verticalAlignment = Alignment.CenterVertically,
+                    .weight(1f)
+                    .padding(horizontal = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
             ) {
-                Icon(
-                    imageVector = HugeIcons.File02,
-                    contentDescription = null,
-                    modifier = Modifier.size(22.dp),
-                    tint = MaterialTheme.colorScheme.primary,
+                Text(
+                    text = workspace.name,
+                    style = MaterialTheme.typography.bodyLarge,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
-                Column(
-                    modifier = Modifier
-                        .weight(1f)
-                        .padding(horizontal = 12.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp),
-                ) {
-                    Text(
-                        text = workspace.name,
-                        style = MaterialTheme.typography.titleSmallEmphasized,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    Text(
-                        text = workspace.shellStatus.toShellStatusLabel(),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-                ItemActionMenu(
-                    actions = listOf(
-                        ItemAction(
-                            text = stringResource(R.string.common_rename),
-                            icon = HugeIcons.PencilEdit01,
-                            onClick = onRename,
-                        ),
-                        ItemAction(
-                            text = stringResource(R.string.common_delete),
-                            icon = HugeIcons.Delete01,
-                            destructive = true,
-                            onClick = onDelete,
-                        ),
-                    )
+                Text(
+                    text = workspace.statusLabel(),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
             }
+            ItemActionMenu(
+                actions = listOf(
+                    ItemAction(
+                        text = stringResource(R.string.common_rename),
+                        icon = HugeIcons.PencilEdit01,
+                        onClick = onRename,
+                    ),
+                    ItemAction(
+                        text = stringResource(R.string.common_delete),
+                        icon = HugeIcons.Delete01,
+                        destructive = true,
+                        onClick = onDelete,
+                    ),
+                )
+            )
         }
     }
 }

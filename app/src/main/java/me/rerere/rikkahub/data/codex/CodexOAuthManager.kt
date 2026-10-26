@@ -16,12 +16,15 @@ import io.ktor.server.engine.embeddedServer
 import io.ktor.server.response.respondText
 import io.ktor.server.routing.get
 import io.ktor.server.routing.routing
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import me.rerere.common.http.await
 import me.rerere.rikkahub.R
 import okhttp3.FormBody
@@ -48,6 +51,14 @@ class CodexOAuthManager(
 
     fun startLogin() {
         val state = randomUrlSafe(32)
+        // v1016：整段挪出界面线程。调用点是 Compose 的 onClick = oauthManager::startLogin，
+        // 而 embeddedServer(CIO).start(wait = false) 内部是 runBlocking（已在打包实际使用的
+        // ktor-server-cio 3.5.2 字节码里用 javap 确认：CIOApplicationEngine.start(Z) 调
+        // CoroutineUtilsJvmKt.runBlockingBridge）。它把界面线程按住的这段时间里浏览器也不会弹出来，
+        // 加上 ensureCallbackServer 的 @Synchronized，用户连点几次全部排在锁后面 ——
+        // 就是用户报的"点登录卡死、越点越死"。与 GeminiOAuthManager 同一族，改法保持一致。
+        _status.value = CodexOAuthStatus.Waiting
+        scope.launch(Dispatchers.IO) {
         try {
             val verifier = randomUrlSafe(64)
             val challenge = Base64.getUrlEncoder().withoutPadding().encodeToString(
@@ -87,6 +98,7 @@ class CodexOAuthManager(
                     error.message ?: "Unable to open the OpenAI sign-in page"
                 }
             )
+        }
         }
     }
 
@@ -130,7 +142,16 @@ class CodexOAuthManager(
                                             awaitNetworkUnblocked()
                                             val account = exchangeCode(code, session)
                                             _status.value = CodexOAuthStatus.Success(account.id)
-                                            runCatching { repository.refreshAccount(account.id) }
+                                            // v1009：取消原样上抛；刷新失败不影响「登录已成功」这个结果
+                                            try {
+                                                repository.refreshAccount(account.id)
+                                            } catch (cancel: CancellationException) {
+                                                throw cancel
+                                            } catch (_: Exception) {
+                                            }
+                                        } catch (cancel: CancellationException) {
+                                            // 用户离开 / 作用域被取消：不许当成登录失败写状态
+                                            throw cancel
                                         } catch (error: Throwable) {
                                             Log.e(
                                                 TAG,
@@ -159,6 +180,13 @@ class CodexOAuthManager(
 
     private suspend fun awaitNetworkUnblocked() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        // v1016：加超时兜底，不再无限期等。onBlockedStatusChanged 只在「阻塞状态发生变化」时回调，
+        // 网络本来就通的时候可能一次都不来；原来的无限挂起会让浏览器已经授权成功、应用却永远停在
+        // 「等待授权」。等不到就往下走，最坏是这次换 token 失败并报出原因，比永久卡住好。
+        withTimeoutOrNull(NETWORK_UNBLOCK_WAIT_MS) { waitForNetworkUnblocked() }
+    }
+
+    private suspend fun waitForNetworkUnblocked() {
         val connectivityManager = context.getSystemService(ConnectivityManager::class.java)
         suspendCancellableCoroutine { continuation ->
             lateinit var callback: ConnectivityManager.NetworkCallback
@@ -232,6 +260,9 @@ class CodexOAuthManager(
     companion object {
         private const val TAG = "CodexOAuthManager"
         private const val CALLBACK_PORTS_UNAVAILABLE = "OAuth callback ports are unavailable"
+
+        /** v1016：等「网络解除阻塞」的最长时间，超时就照样往下走（见 awaitNetworkUnblocked）。 */
+        private const val NETWORK_UNBLOCK_WAIT_MS = 15_000L
         const val CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
         const val TOKEN_URL = "https://auth.openai.com/oauth/token"
         const val AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"

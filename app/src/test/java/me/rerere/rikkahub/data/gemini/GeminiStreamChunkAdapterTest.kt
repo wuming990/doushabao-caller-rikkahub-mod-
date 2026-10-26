@@ -12,8 +12,11 @@ import me.rerere.ai.ui.UIMessageChoice
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.ai.ui.toMetadata
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import me.rerere.rikkahub.agent.model.AgentFinishReason
 
 /**
  * Regression coverage for issue #48: [GeminiStreamChunkAdapter] must forward a Tool part's
@@ -141,5 +144,49 @@ class GeminiStreamChunkAdapterTest {
         assertTrue(out.any { it is StreamChunk.ServerToolStart })
         val text = out.filterIsInstance<StreamChunk.TextDelta>().single()
         assertEquals("the answer", text.text)
+    }
+
+    // ---- v1007：结束原因必须透传 ----
+    // 这条通道以前恒发 Finish()（finishReason = null），而主对话的
+    // 「撞输出上限自动续写」判据是 AgentFinishReason.isTruncated(finishReason)，
+    // 对 null 恒为 false —— 于是反重力通道的自动续写从来没生效过。
+
+    private fun finishChunk(reason: String?) = MessageChunk(
+        id = "resp-finish",
+        model = "gemini-3.1-pro",
+        choices = listOf(
+            UIMessageChoice(
+                index = 0,
+                delta = null,
+                message = null,
+                finishReason = reason,
+            )
+        ),
+    )
+
+    @Test
+    fun `结束原因必须传到 Finish`() {
+        val adapter = GeminiStreamChunkAdapter()
+        adapter.translate(finishChunk("MAX_TOKENS"))
+        val finish = adapter.finish() as StreamChunk.Finish
+        assertEquals("MAX_TOKENS", finish.finishReason)
+        assertTrue(finish.terminatedWithoutSentinel)
+    }
+
+    @Test
+    fun `没有结束原因时保持为空但仍算无终止信号`() {
+        val adapter = GeminiStreamChunkAdapter()
+        adapter.translate(finishChunk(null))
+        val finish = adapter.finish() as StreamChunk.Finish
+        assertNull(finish.finishReason)
+        assertTrue(finish.terminatedWithoutSentinel)
+    }
+
+    @Test
+    fun `STOP 不算截断 MAX_TOKENS 算截断`() {
+        assertFalse(AgentFinishReason.isTruncated("STOP"))
+        assertFalse(AgentFinishReason.isTruncated("stop"))
+        assertFalse(AgentFinishReason.isTruncated(null))
+        assertTrue(AgentFinishReason.isTruncated("MAX_TOKENS"))
     }
 }

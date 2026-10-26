@@ -32,8 +32,12 @@ class TokenSpeedDisplayGuardTest {
         )
         assertTrue(nerd.contains("message.cumulativeGenerationMs"))
         assertTrue(nerd.contains("message.cumulativeResponseMs"))
-        assertTrue(nerd.contains("生成 "))
-        assertTrue(nerd.contains("响应 "))
+        // v1014 三审 P3：这两条原来钉的是界面上的「生成 / 响应」字样，而 v1014 把两格改成了
+        // 「速度 / 响应速度」两行 —— 那时它们只剩注释能满足，变成「删注释才红、删功能反而绿」
+        // 的假守卫。改成钉真实符号与文案键：功能被整覆盖掉时必须当场红。
+        assertTrue(nerd.contains("chat_message_usage_response_speed"))
+        assertTrue(nerd.contains("SpeedReadout"))
+        assertTrue(nerd.contains("headlineTps"))
     }
 
     @Test

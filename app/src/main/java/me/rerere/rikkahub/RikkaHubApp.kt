@@ -12,12 +12,17 @@ import androidx.compose.runtime.tooling.ComposeStackTraceMode
 import androidx.core.app.NotificationChannelCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.ProcessLifecycleOwner
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.Lifecycle
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import me.rerere.rikkahub.data.ai.MemoryConsolidationScheduler
 import me.rerere.rikkahub.data.files.FileFolders
-import me.rerere.rikkahub.data.files.SkillManager
+import me.rerere.rikkahub.data.remote.ModelsDevUpdater
+import me.rerere.rikkahub.data.skills.SkillManager
 import me.rerere.rikkahub.data.event.AppEventBus
 import java.io.File
 import kotlinx.coroutines.SupervisorJob
@@ -25,7 +30,6 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.flow.first
 import me.rerere.common.android.appTempFolder
 import me.rerere.rikkahub.di.agentModule
 import me.rerere.rikkahub.di.appModule
@@ -37,6 +41,7 @@ import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.sync.BackupManager
 import me.rerere.rikkahub.data.sync.RestoreFailedException
 import me.rerere.rikkahub.utils.JsonInstant
+import me.rerere.rikkahub.service.MediaCreationService
 import me.rerere.rikkahub.service.WebServerService
 import me.rerere.rikkahub.service.WorkspaceBoostManager
 import me.rerere.rikkahub.utils.CrashHandler
@@ -51,6 +56,8 @@ import org.koin.core.context.startKoin
 
 private const val TAG = "RikkaHubApp"
 
+const val MEMORY_DREAM_NOTIFICATION_CHANNEL_ID = "memory_dream"
+const val MEDIA_CREATION_NOTIFICATION_CHANNEL_ID = "media_creation"
 const val CHAT_COMPLETED_NOTIFICATION_CHANNEL_ID = "chat_completed_v261"
 const val CHAT_LIVE_UPDATE_NOTIFICATION_CHANNEL_ID = "chat_live_update_v261"
 const val WEB_SERVER_NOTIFICATION_CHANNEL_ID = "web_server_v261"
@@ -107,13 +114,46 @@ class RikkaHubApp : Application() {
         // Extract builtin skills from assets after install/update
         extractBuiltinSkills()
 
+        // v1017 合并官方 3.1.1：先读入 models.dev 能力数据，再在后台刷新
+        updateModelsDev()
+
         // Start WebServer if enabled in settings
         startWebServerIfEnabled()
+
+        // Resume media generations interrupted by the last process death
+        resumeMediaCreations()
+        resumeMemoryConsolidation()
 
         // Increment launch count
         incrementLaunchCount()
 
         // Composer.setDiagnosticStackTraceMode(ComposeStackTraceMode.Auto)
+    }
+
+    private fun resumeMediaCreations() {
+        get<AppScope>().launch(Dispatchers.IO) {
+            runCatching {
+                get<MediaCreationService>().resumePending()
+            }.onFailure {
+                Log.e(TAG, "resumeMediaCreations failed", it)
+            }
+        }
+    }
+
+    private fun resumeMemoryConsolidation() {
+        // 应用被切走后进程随时可能被冻结，等不到空闲计时结束，这时直接开始整理
+        ProcessLifecycleOwner.get().lifecycle.addObserver(
+            LifecycleEventObserver { _, event ->
+                if (event == Lifecycle.Event.ON_STOP) get<MemoryConsolidationScheduler>().onAppHidden()
+            }
+        )
+        get<AppScope>().launch(Dispatchers.IO) {
+            runCatching {
+                get<MemoryConsolidationScheduler>().resumePending()
+            }.onFailure {
+                Log.e(TAG, "resumeMemoryConsolidation failed", it)
+            }
+        }
     }
 
     private fun incrementLaunchCount() {
@@ -160,9 +200,28 @@ class RikkaHubApp : Application() {
         get<AppScope>().launch(Dispatchers.IO) {
             runCatching {
                 val dir = File(filesDir, FileFolders.TOOL_OUTPUTS)
-                if (dir.exists()) {
-                    dir.deleteRecursively()
+                if (!dir.exists()) return@runCatching
+                // v1017：旧写法是开机把整个目录 deleteRecursively 掉。后果是真的会发生的：
+                // 历史消息里写着「用 shell 读 /tool_outputs/xxx.txt」，App 被系统杀过一次
+                // 再打开，那条路径就成了死链 —— 本地工作区也一样中招（官方也没管这点）。
+                // 现在改成「只清过期 + 控制总量」：7 天内的文件保留，超过 512MB 时从最旧的删起。
+                val ttlMillis = 7L * 24 * 60 * 60 * 1000
+                val maxBytes = 512L * 1024 * 1024
+                val now = System.currentTimeMillis()
+                dir.listFiles()?.filter { it.isFile }
+                    ?.filter { now - it.lastModified() > ttlMillis }
+                    ?.forEach { it.delete() }
+                val survivors = ArrayDeque(
+                    dir.listFiles()?.filter { it.isFile }?.sortedBy { it.lastModified() }.orEmpty(),
+                )
+                var used = survivors.sumOf { it.length() }
+                while (used > maxBytes && survivors.isNotEmpty()) {
+                    val oldest = survivors.removeFirst()
+                    used -= oldest.length()
+                    oldest.delete()
                 }
+                val left = survivors.size
+                if (left > 0) Log.i(TAG, "cleanupToolOutputs: kept $left tool outputs (~${used / 1024 / 1024}MB)")
             }
         }
     }
@@ -170,6 +229,12 @@ class RikkaHubApp : Application() {
     private fun extractBuiltinSkills() {
         get<AppScope>().launch(Dispatchers.IO) {
             get<SkillManager>().ensureBuiltinSkillsExtracted()
+        }
+    }
+
+    private fun updateModelsDev() {
+        get<AppScope>().launch {
+            get<ModelsDevUpdater>().start()
         }
     }
 
@@ -187,7 +252,7 @@ class RikkaHubApp : Application() {
         get<AppScope>().launch {
             runCatching {
                 delay(500)
-                val settings = get<SettingsStore>().settingsFlowRaw.first()
+                val settings = get<SettingsStore>().awaitLoaded()
                 if (settings.webServerEnabled) {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
                         ContextCompat.checkSelfPermission(

@@ -42,15 +42,14 @@ class ConversationTokenStatsTest {
     fun `消息实体带 cumulativeUsage 字段 走 JSON 不落库版本`() {
         val msg = source("ai", "src", "main", "java", "me", "rerere", "ai", "ui", "Message.kt")
         assertTrue("UIMessage 缺 cumulativeUsage 字段", msg.contains("val cumulativeUsage: TokenUsage? = null"))
-        // v300：数据库版本由用户明确授权，从 24 采纳为官方 2.5.1 的 25
-        // （只多一列 workspaces.shell_compatibility_mode，官方自带 AutoMigration 24→25，不丢数据）。
-        // 这条守护的**本意没变**：版本只能由「用户拍板」改，而且改的时候必须同时带着迁移 ——
-        // 所以顺手把断言加强成「版本必须是 25 且迁移必须在」，比原来只钉数字更难蒙混。
         val db = source(
             "app", "src", "main", "java", "me", "rerere", "rikkahub", "data", "db", "AppDatabase.kt"
         )
-        assertTrue("AppDatabase 版本不是 25（v300 用户授权改为 25）", db.contains("version = 25"))
-        assertTrue("升级迁移 24→25 丢了（会让老用户升级时崩）", db.contains("AutoMigration(from = 24, to = 25)"))
+        // v323：用户已明确授权，主数据库从 25 升级到官方 3.1.0 的 31
+        // （官方自带 25→26→27、28→29、29→30 AutoMigration + 27→28、30→31 手写迁移，不丢聊天记录）。
+        // 这条守护的**本意没变**：版本只能由「用户拍板」改，而且改的时候必须同时带着迁移。
+        assertTrue("AppDatabase 版本不是 32（v1017 用户授权31升32）", db.contains("version = 32"))
+        assertTrue("v300 的 24→25 迁移丢了（会让老用户升级时崩）", db.contains("AutoMigration(from = 24, to = 25)"))
     }
 
     @Test
@@ -135,7 +134,9 @@ class ConversationTokenStatsTest {
         assertTrue("明细窗没接上", page.contains("ConversationTokenStatsDialog("))
         val prefs = source(
             "app", "src", "main", "java", "me", "rerere", "rikkahub", "data", "datastore", "PreferencesStore.kt"
-        )
+        ) + "\n" + source(
+            "app", "src", "main", "java", "me", "rerere", "rikkahub", "data", "datastore", "Settings.kt"
+        ) // v323：官方 3.1 把 Settings 字段拆到 Settings.kt，判据改读两个文件（断言内容未改）
         assertTrue("设置项默认值不是开", prefs.contains("val showConversationTokenStats: Boolean = true"))
         val settingPage = source(
             "app", "src", "main", "java", "me", "rerere", "rikkahub", "ui", "pages", "setting",

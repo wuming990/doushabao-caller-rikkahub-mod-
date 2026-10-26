@@ -5,8 +5,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -31,7 +29,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.dokar.sonner.ToastType
+import me.rerere.ui.toast.ToastType
 import kotlinx.coroutines.launch
 import me.rerere.ai.provider.ProviderManager
 import me.rerere.ai.provider.ProviderSetting
@@ -91,9 +89,14 @@ fun GeminiProviderConfigure(
     }
 
     Column(
+        // v1008：这里**故意**没有 verticalScroll。
+        // 官方 3.1 的供应商详情页（SettingProviderConfigPage）本身已经是
+        // Column(...verticalScroll(...))，这个组件就渲染在它里面。
+        // 两层竖向滚动 = 「Vertically scrollable component was measured with an
+        // infinity maximum height constraints」→ 一点进 Gemini 账号页就崩。
+        // 滚动交给外层页面负责，这里只管排版。
         modifier = Modifier
             .fillMaxWidth()
-            .verticalScroll(rememberScrollState())
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {

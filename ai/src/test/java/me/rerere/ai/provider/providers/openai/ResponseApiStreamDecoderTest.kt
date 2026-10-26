@@ -1,7 +1,7 @@
 package me.rerere.ai.provider.providers.openai
 
-import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -241,6 +241,63 @@ class ResponseApiStreamDecoderTest {
     }
 
     @Test
+    fun `text continued in the same item after server tools should become a new part`() {
+        // xAI：搜索前后的正文都写在同一个 message item 里
+        val decoder = ResponseApiStreamDecoder()
+        fun text(delta: String) = buildJsonObject {
+            put("type", "response.output_text.delta")
+            put("item_id", "msg_1")
+            put("output_index", 1)
+            put("content_index", 0)
+            put("delta", delta)
+        }
+        val chunks = buildList {
+            addAll(decoder.decode(buildJsonObject {
+                put("type", "response.content_part.added")
+                put("item_id", "msg_1")
+                put("content_index", 0)
+                put("part", buildJsonObject { put("type", "output_text") })
+            }))
+            addAll(decoder.decode(text("Let me search. ")))
+            addAll(decoder.decode(buildJsonObject {
+                put("type", "response.output_item.added")
+                put("item", webSearchItem("in_progress"))
+            }))
+            addAll(decoder.decode(buildJsonObject {
+                put("type", "response.output_item.done")
+                put("item", webSearchItem("completed"))
+            }))
+            addAll(decoder.decode(reasoningItemEvent("response.output_item.done", encryptedContent = "tool")))
+            addAll(decoder.decode(text("Here is ")))
+            addAll(decoder.decode(text("the answer.")))
+            addAll(decoder.decode(buildJsonObject {
+                put("type", "response.output_text.done")
+                put("item_id", "msg_1")
+                put("content_index", 0)
+            }))
+            addAll(decoder.decode(buildJsonObject {
+                put("type", "response.completed")
+                put("response", buildJsonObject { put("id", "resp_1") })
+            }))
+        }
+
+        val handler = StreamChunkHandler(Model(modelId = "test-model"))
+        val parts = chunks.fold(listOf(UIMessage.user("news"))) { messages, chunk ->
+            handler.handle(messages, chunk)
+        }.last().parts
+
+        assertEquals(4, parts.size)
+        assertEquals("Let me search. ", (parts[0] as UIMessagePart.Text).text)
+        assertTrue(parts[1] is UIMessagePart.ServerTool)
+        assertTrue(parts[2] is UIMessagePart.Reasoning)
+        assertEquals("Here is the answer.", (parts[3] as UIMessagePart.Text).text)
+        assertEquals(
+            chunks.count { it is StreamChunk.TextStart },
+            chunks.count { it is StreamChunk.TextEnd },
+        )
+    }
+
+    @Test
     fun `non streaming response should parse web search without synthetic output`() {
         val result = api.parseResponseOutput(buildJsonObject {
             put("id", "resp_1")
@@ -363,6 +420,73 @@ class ResponseApiStreamDecoderTest {
         }
 
         assertSingleSearchTool(chunks)
+    }
+
+    @Test
+    fun `server executed function call output should mark tool as executed`() {
+        val decoder = ResponseApiStreamDecoder()
+        val chunks = buildList {
+            addAll(decoder.decode(functionCallItemEvent("response.output_item.added", id = "fc_1")))
+            addAll(decoder.decode(buildJsonObject {
+                put("type", "response.function_call_arguments.done")
+                put("item_id", "fc_1")
+                put("arguments", "{\"query\":\"Kotlin\"}")
+            }))
+            addAll(decoder.decode(functionCallItemEvent("response.output_item.done", id = "fc_1")))
+            addAll(decoder.decode(functionCallOutputItemEvent("response.output_item.added")))
+            addAll(decoder.decode(functionCallOutputItemEvent("response.output_item.done")))
+        }
+
+        assertSingleSearchTool(chunks)
+        val handler = StreamChunkHandler(Model(modelId = "test-model"))
+        val tool = chunks.fold(listOf(UIMessage.user("search"))) { messages, chunk ->
+            handler.handle(messages, chunk)
+        }.last().getTools().single()
+        assertTrue(tool.isExecuted)
+        assertEquals("result", tool.output.filterIsInstance<UIMessagePart.Text>().single().text)
+    }
+
+    @Test
+    fun `non streaming response should attach server executed function call output`() {
+        val result = api.parseResponseOutput(buildJsonObject {
+            put("id", "resp_1")
+            put("model", "test-model")
+            put("status", "completed")
+            put("output", buildJsonArray {
+                add(buildJsonObject {
+                    put("type", "function_call")
+                    put("id", "fc_1")
+                    put("call_id", "call_1")
+                    put("name", "search_web")
+                    put("arguments", "{\"query\":\"Kotlin\"}")
+                })
+                add(buildJsonObject {
+                    put("type", "function_call_output")
+                    put("call_id", "call_1")
+                    put("output", buildJsonArray {
+                        add(buildJsonObject {
+                            put("type", "input_text")
+                            put("text", "result")
+                        })
+                    })
+                })
+            })
+        })
+
+        val tool = result.message.getTools().single()
+        assertTrue(tool.isExecuted)
+        assertEquals("result", tool.output.filterIsInstance<UIMessagePart.Text>().single().text)
+    }
+
+    private fun functionCallOutputItemEvent(type: String) = buildJsonObject {
+        put("type", type)
+        put("output_index", 2)
+        put("item", buildJsonObject {
+            put("type", "function_call_output")
+            put("id", "fco_1")
+            put("call_id", "call_1")
+            put("output", "result")
+        })
     }
 
     private fun assertSingleSearchTool(chunks: List<StreamChunk>) {

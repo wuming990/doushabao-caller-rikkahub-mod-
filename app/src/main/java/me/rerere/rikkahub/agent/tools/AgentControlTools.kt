@@ -47,7 +47,14 @@ fun createAgentControlTools(
     manager: AgentThreadManager,
     workspaceId: String? = null,
     /**
-     * v239：取「主对话完整原文」的钩子，签名是 `(includeReasoning, maxChars) -> 文本`。
+     * v239：取「主对话完整原文」的钩子，签名是 `(maxChars) -> 文本`。
+     *
+     * v1013：**这里刻意不再有「要不要带思考块」这一档**。原先工具入参里有个
+     * include_reasoning，而 Anthropic 官方把「工具入参里出现 reasoning/thinking/trace 字段」
+     * 逐字列为 reasoning_extraction 拒答的触发形状之一（define-tools：A parameter that asks
+     * for the model's thinking ... might lead to a reasoning_extraction refusal）。
+     * 参数删了、内部管道也一起删 —— 只删 schema 而留一个能被翻回 true 的布尔，
+     * 等于给下一次误判留好接口，而且 schema 扫描类的守卫看不见它。
      *
      * 用户原话：「可以自己选择给不给全部上文，但不能做不到给不了全部上文。」
      * 在此之前 `context_summary` 只能由主模型手打转述 —— 它没有任何办法导出自己的
@@ -58,7 +65,7 @@ fun createAgentControlTools(
      * 传 null 表示这次装配拿不到对话原文，此时 `include_full_context=true`
      * 会**明确报错**而不是悄悄降级成没有上文 —— 主模型必须知道自己没拿到。
      */
-    fullContextProvider: (suspend (Boolean, Int) -> String?)? = null,
+    fullContextProvider: (suspend (Int) -> String?)? = null,
 ): List<Tool> = listOf(
     createSpawnTool(conversationId, manager, workspaceId, fullContextProvider),
     createWaitTool(manager),
@@ -85,7 +92,7 @@ const val AGENT_FULL_CONTEXT_UNAVAILABLE =
  */
 private suspend fun resolveContextSummary(
     params: kotlinx.serialization.json.JsonObject,
-    fullContextProvider: (suspend (Boolean, Int) -> String?)?,
+    fullContextProvider: (suspend (Int) -> String?)?,
 ): Result<String?> {
     val manual = params["context_summary"]?.jsonPrimitive?.contentOrNull
         ?.trim()?.takeIf { it.isNotEmpty() }
@@ -95,11 +102,9 @@ private suspend fun resolveContextSummary(
     if (fullContextProvider == null) {
         return Result.failure(IllegalStateException(AGENT_FULL_CONTEXT_UNAVAILABLE))
     }
-    val includeReasoning = params["include_reasoning"]?.jsonPrimitive?.contentOrNull
-        ?.toBooleanStrictOrNull() ?: false
     val maxChars = params["full_context_max_chars"]?.jsonPrimitive?.contentOrNull
         ?.toIntOrNull() ?: AGENT_FULL_CONTEXT_DEFAULT_MAX_CHARS
-    val full = runCatching { fullContextProvider(includeReasoning, maxChars) }
+    val full = runCatching { fullContextProvider(maxChars) }
         .getOrElse { return Result.failure(it) }
     if (full.isNullOrBlank()) {
         return Result.failure(
@@ -132,21 +137,13 @@ private fun kotlinx.serialization.json.JsonObjectBuilder.putFullContextParams() 
                 "saying how much was dropped.",
         )
     })
-    put("include_reasoning", buildJsonObject {
-        put("type", "boolean")
-        put(
-            "description",
-            "Whether to include model reasoning blocks in the transcript. Default false: " +
-                "reasoning is usually longer than the answer itself and rarely helps.",
-        )
-    })
 }
 
 private fun createSpawnTool(
     conversationId: String,
     manager: AgentThreadManager,
     workspaceId: String?,
-    fullContextProvider: (suspend (Boolean, Int) -> String?)?,
+    fullContextProvider: (suspend (Int) -> String?)?,
 ) = Tool(
     name = "spawn_agent",
     description = "Create a new subagent thread for an independent task and return its thread_id immediately. " +
@@ -689,7 +686,7 @@ private fun createPipelineTool(
     conversationId: String,
     manager: AgentThreadManager,
     workspaceId: String?,
-    fullContextProvider: (suspend (Boolean, Int) -> String?)?,
+    fullContextProvider: (suspend (Int) -> String?)?,
 ) = Tool(
     name = "run_agent_pipeline",
     description = "Run a sequential subagent pipeline in one call and return only the summary. " +

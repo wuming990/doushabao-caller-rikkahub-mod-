@@ -93,7 +93,7 @@ fun <T> ChainOfThought(
     Card(
         modifier = modifier,
         colors = cardColors,
-        shape = RoundedCornerShape(16.dp),
+        shape = RoundedCornerShape(20.dp),
     ) {
         Column(
             modifier = Modifier

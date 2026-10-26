@@ -119,6 +119,132 @@ private fun formatResumeError(error: Throwable): String {
 private const val TRUNCATION_RESUME_INSTRUCTION: String = "继续"
 
 /**
+ * v1011：主对话「零产出定格」的分类结果。
+ *
+ * 六种情形的含义、措辞与「该调哪里」全部写在 [classifyEmptyReply] 上（二审时发现这里也抄了
+ * 一份、还漏了两个新 kind，注释重复就会各说各话，故只保留一份权威说明）。
+ */
+internal enum class EmptyReplyKind {
+    OutputBudgetExhausted,
+    StreamCutWithoutSignal,
+    RefusedByPolicy,
+    ThinkingOnlyWithoutAnswer,
+    ContextWindowExceeded,
+    UpstreamReturnedNothing,
+}
+
+/** 上下文窗口被占满这一类结束原因（Claude 的 model_context_window_exceeded 等）。 */
+private val CONTEXT_WINDOW_KEYWORDS = listOf("context_window", "context-window", "contextwindow")
+
+/**
+ * 这条回答里有没有「给读者看的东西」：正文 / 工具调用 / 服务端工具 / 图片等媒体。
+ *
+ * ⚠️ **思考不算答复** —— 用户这次报的原话就是「开启思考了，没有显示思考框，直接回复被截断了」：
+ * 只有思考、没有正文，对他来说就等于没回答。审查位也抓到同一件事：如果只按
+ * `isEmptyUIMessage()` 判，「有思考、零正文」这种形态永远判成「非空」，第④项就白做了。
+ *
+ * 与渲染同源但不完全同一条尺子：`isEmptyUIMessage()` 把非空思考也算「有内容」（气泡该不该
+ * 渲染的问题），这里只问「有没有答复」。legacy 的 ToolCall/Search 部件在这里算「没有答复」，
+ * 与界面不渲染它们一致。
+ */
+internal fun List<UIMessagePart>.hasVisibleAnswer(): Boolean = any { part ->
+    when (part) {
+        is UIMessagePart.Text -> part.text.isNotBlank()
+        is UIMessagePart.Image -> part.url.isNotBlank()
+        is UIMessagePart.Document -> part.url.isNotBlank()
+        is UIMessagePart.Video -> part.url.isNotBlank()
+        is UIMessagePart.Audio -> part.url.isNotBlank()
+        is UIMessagePart.Tool, is UIMessagePart.ServerTool -> true
+        else -> false
+    }
+}
+
+/**
+ * v1011：主对话「零产出定格」的分类 —— 抽成纯函数以便真单测（照 `shouldRetryWithNextGrokAccount`
+ * 那条先例：判定逻辑必须能不依赖 Android 就测得动）。
+ *
+ * 返回 null 表示**这轮有产出，绝对不该报错**（正常回答、只回工具、只回图片、等审批、等用户
+ * 回答「询问用户」全都走这里返回 null）。
+ *
+ * 四种情形的**措辞不能混**，因为该调的地方完全不同（判据取自上游官方文档与社区共识）：
+ * - [OutputBudgetExhausted]：上游明确说了到输出上限（Claude `max_tokens` / OpenAI `length`）。
+ *   思考与正文共用同一份输出预算（Anthropic 官方文档），预算被思考吃光就是「有思考、零正文」。
+ *   → 该动的是「输出上限」或思考档位。
+ * - [ThinkingOnlyWithoutAnswer]：上游自称正常说完（end_turn / stop），却只给了思考、没有正文。
+ *   同上，该动的是输出上限或思考档位，但措辞要如实说「只想不答」。
+ * - [StreamCutWithoutSignal]：连协议终止信号（`[DONE]` / `message_stop` / `response.completed`）
+ *   都没等到，也没给任何结束原因 —— 上游偷偷掐线。→ 该动的是重试/换线路，不是设置。
+ * - [RefusedByPolicy]：被安全策略拦下（Claude `refusal`、OpenAI `content_filter`、
+ *   Google `SAFETY`/`RECITATION`）。→ 续跑也没用，必须原话告诉用户。
+ * - [ContextWindowExceeded]：上下文窗口被占满（Claude `model_context_window_exceeded`）。
+ *   → 该开新对话或压缩，绝不是「报文形态不对」，也不是调输出上限能解决的。
+ *   （审查位 P2 抓到：以前它会被归到 [UpstreamReturnedNothing]，文案把用户指向错误的方向。）
+ * - [UpstreamReturnedNothing]：上游说「我说完了」却一个字产出都没有。
+ *   典型来源就是解析器对不认识的帧整段跳过（兼容网关形态）。→ 该查的是协议兼容。
+ */
+internal fun classifyEmptyReply(
+    parts: List<UIMessagePart>,
+    finishReason: String?,
+    truncatedWithoutSentinel: Boolean,
+): EmptyReplyKind? {
+    if (parts.hasVisibleAnswer()) return null
+    val normalized = finishReason?.trim()?.lowercase().orEmpty()
+    return when {
+        AgentFinishReason.isBlockedByPolicy(normalized) -> EmptyReplyKind.RefusedByPolicy
+        CONTEXT_WINDOW_KEYWORDS.any { it in normalized } -> EmptyReplyKind.ContextWindowExceeded
+        AgentFinishReason.isTruncated(normalized) -> EmptyReplyKind.OutputBudgetExhausted
+        parts.any { it is UIMessagePart.Reasoning && it.reasoning.isNotBlank() } ->
+            EmptyReplyKind.ThinkingOnlyWithoutAnswer
+        truncatedWithoutSentinel && normalized.isEmpty() -> EmptyReplyKind.StreamCutWithoutSignal
+        else -> EmptyReplyKind.UpstreamReturnedNothing
+    }
+}
+
+
+/**
+ * v1011：零产出说明。**专门的类型**，好让下面的「异常中断自动续跑」和「网络重试」都能一眼
+ * 认出它、原样上抛 —— 它不是异常中断，再发一次请求必然还是零产出，白烧一次钱。
+ */
+internal class EmptyReplyException(
+    val kind: EmptyReplyKind,
+    message: String,
+) : Exception(message)
+
+/**
+ * v1012：这类零产出，**重发一次**到底有没有意义。
+ *
+ * v1011 一刀切地「直接上抛、绝不重发」，把用户长期口径要的「只要是报错就续跑」也一起挡了
+ * （真机表现：弹一句看不懂的 refusal 就死，一次都不试）。现在按两个客观事实分开判：
+ *
+ * - [EmptyReplyKind.UpstreamReturnedNothing] / [EmptyReplyKind.StreamCutWithoutSignal]：
+ *   一个字都没吐。官方对「产出前就被拒/就断掉」的请求不计费（refusal 文档原话：
+ *   *When a refusal arrives before Claude generates any output, you are not billed*），
+ *   而且这两类多半是临时故障 —— **重发免费且可能救回来**，交给整请求重试通道。
+ * - 其余四类：[EmptyReplyKind.ThinkingOnlyWithoutAnswer] 与
+ *   [EmptyReplyKind.OutputBudgetExhausted] 意味着**已经吐过思考 token，那是要计费的**，
+ *   重发一次就是再花一次钱还是同样结果；[EmptyReplyKind.ContextWindowExceeded] 与
+ *   [EmptyReplyKind.RefusedByPolicy] 改的是设置或措辞，重发必然同样被拒。
+ *   这四类继续直接上抛，把「该改哪里」讲清楚，不闷头烧钱。
+ *
+ * （注：Claude 通道的 refusal 现在在 provider 层就变成了 [ClaudeRefusalException]，
+ * 走的是换密钥 + 续跑那条路；这里的 [EmptyReplyKind.RefusedByPolicy] 主要接住
+ * OpenAI 式 content_filter 那种「HTTP 200 + 空正文」的形态。）
+ */
+internal val EmptyReplyKind.isWorthResending: Boolean
+    get() = this == EmptyReplyKind.UpstreamReturnedNothing ||
+        this == EmptyReplyKind.StreamCutWithoutSignal
+
+/** v1011：分类 → 用户可见文案。 */
+internal fun emptyReplyMessageRes(kind: EmptyReplyKind): Int = when (kind) {
+    EmptyReplyKind.OutputBudgetExhausted -> R.string.chat_generation_empty_reply_budget
+    EmptyReplyKind.StreamCutWithoutSignal -> R.string.chat_generation_empty_reply_cut
+    EmptyReplyKind.RefusedByPolicy -> R.string.chat_generation_empty_reply_refused
+    EmptyReplyKind.ThinkingOnlyWithoutAnswer -> R.string.chat_generation_empty_reply_thinking_only
+    EmptyReplyKind.ContextWindowExceeded -> R.string.chat_generation_empty_reply_context_window
+    EmptyReplyKind.UpstreamReturnedNothing -> R.string.chat_generation_empty_reply_none
+}
+
+/**
  * v270：重点标色插件说明（设置→显示→「重点标色」打开时才附加到系统提示词末尾）。
  *
  * 用户拍板的插件式设计（原话）：「不要对主模型参生影响，只是提供给模型一个可额外使用的
@@ -331,14 +457,33 @@ class GenerationLoop(
         /**
          * v248：单个工具返回的字符上限。
          *
-         * ⚠️ **默认值必须保持上游那个 32KB，主对话绝对不许被改动。**
+         * ⚠️ **默认值必须保持上游那个常量原样，主对话绝对不许被改动。**
          * 用户明确要求：「主模型绝对不能乱动，不能做出任何限制」。主对话不传这个参数，
-         * 因此行为与上游逐字节一致 —— 被截断时完整内容会存成文件，主对话有终端可以 grep 取回。
+         * 因此长度上限与上游逐字节一致。
          *
          * 只有**子代理**会显式传值（它没有终端、拿不回被截掉的部分，而且跑的是廉价模型、
          * 结果只回一份摘要，多读一些不污染主对话）。子代理传的是设置里那个可调档位。
+         *
+         * v1017 纠正此处旧说明：原文写着「被截断时完整内容会存成文件，主对话有终端可以
+         * grep 取回」—— 这句话在两种场景下是假的：没绑工作区时根本没有终端，
+         * 远程 SSH 工作区里 `/tool_outputs/…` 这个路径压根不存在（文件在本机）。
+         * 现在由下面的 toolOutputsReadable 按**工作区真实能力**判断，读不回来就不落盘、
+         * 也不给路径（见 maybeTruncateToolOutput）。
          */
         toolOutputCharLimit: Int = MAX_TOOL_OUTPUT_CHARS,
+        /**
+         * v1017：超长工具输出「能不能被读回来」的判据（按工作区能力，不按工具名猜）。
+         *
+         * null = 沿用旧判断（看这轮工具有没有 workspace_shell），
+         * 因此**圆桌 / 讨论群组 / 子代理 / 压缩 / 翻译一条都不变**；
+         * 只有 ChatService 的主对话路径显式传，且值是
+         * `capabilities().rootfs == true && shellStatus == READY` 两个条件同时成立 ——
+         * 与工作区工具的装配闸门（createWorkspaceToolsIfReady）同一口径。
+         * ⚠️ 少了 READY 半句就会重新造出死链：rootfs 装了但 shell 没就绪时，
+         * 工具整批不装配，给了路径模型也没有终端去读（第一轮审查位抓的 P1）。
+         * 与上面那个参数同一套「默认不生效、谁要谁显式打开」的隔离规矩（§4 禁区 #13）。
+         */
+        toolOutputsReadable: Boolean? = null,
         /**
          * v263：主对话「异常截断自动续跑」开关。
          *
@@ -385,7 +530,35 @@ class GenerationLoop(
          * 是为了让「关着」时的行为与 v320 逐字节一致 —— 不许把两个条件合成一个布尔。
          */
         stripGroupReasoningParts: Boolean = false,
-    ): Flow<GenerationChunk> = flow {
+        /**
+         * v1011：主对话「一个字都没有却正常收尾」不再装死。
+         *
+         * 起因（用户真机口径）：「claude兼容格式好像有问题，输出会被截断导致空回」
+         * 「输出上限是无限，开启思考了，没有显示思考框，直接回复被截断了」。
+         * 本地复现见 `ClaudeCompatTruncationProbeTest`：解析器一帧都没认出来时，上游给的是
+         * HTTP 200 且**没有任何错误**，ChatService 把 cause=null 记成 COMPLETED，界面上连
+         * 头像都不渲染（ChatMessage 那条 `isEmptyUIMessage()` 判断）—— 用户看到的就是
+         * 「它没回过话、也没报错、续跑也不动」。
+         *
+         * 打开后：这一趟结束时如果这条助手消息**没有给出任何答复**，就抛一条带分类说明的错误
+         * （思考吃满输出上限 / 只想不答 / 上游没给结束信号 / 被拒答 / 上下文超窗 / 上游返回空内容），
+         * 并附上上游给的 stop_reason 原文，用户一眼能看出该调哪里。流式与非流式两条路都覆盖。
+         *
+         * 判据是 [hasVisibleAnswer]：正文 / 工具调用 / 服务端工具 / 图片媒体里只要有一样非空，
+         * 就**绝不报错** —— 所以「只回工具调用」「只回图片」「等审批」「等用户回答（询问工具）」
+         * 都不受影响。它与界面渲染用的 `isEmptyUIMessage()` 同源但**故意更严一档**：
+         * 后者把「非空思考」也算作有内容（决定气泡画不画），而这里认为只有思考等于没回答。
+         * ⚠️ 两个函数比的都是 outputTransforms **之前**那份 parts，别据此推断「变换器清空内容」
+         * 也会被抓到 —— 不会。
+         *
+         * 与 truncationAutoResumeMax / highlightKeyPoints 同一套隔离规矩：默认 false，
+         * **只有 ChatService 主对话路径显式传 true**，圆桌/子代理/群组/压缩/翻译不传，
+         * 行为与改前逐字节一致。
+         */
+        reportEmptyReplyAsError: Boolean = false,
+        // v323：显式给 flow 一个类型参数。Kotlin 2.4 的 K2 在推断这个超长 lambda 的
+        // 公共父类型时会崩（Expected some types），显式标注可绕开，不改任何逻辑。
+    ): Flow<GenerationChunk> = flow<GenerationChunk> {
         val owningProvider = model.findProvider(settings.providers, checkOverwrite = false)
             ?: error("Provider not found")
         val provider = model.findProvider(settings.providers) ?: error("Provider not found")
@@ -449,6 +622,7 @@ class GenerationLoop(
                     highlightKeyPoints = highlightKeyPoints,
                     stripGroupToolParts = stripGroupToolParts,
                     stripGroupReasoningParts = stripGroupReasoningParts,
+                    reportEmptyReplyAsError = reportEmptyReplyAsError,
                 )
                 messages = messages.visualTransforms(
                     transformers = outputTransformers,
@@ -573,12 +747,16 @@ class GenerationLoop(
                             }
                             Log.i(TAG, "generateText: executing tool ${toolDef.name} with args: $args")
                             val result = toolDef.execute(args)
-                            val hasShellAccess = tools.any { it.name == "workspace_shell" }
+                            // v1017：判据从「工具名里有没有 shell」换成「这个工作区到底能不能把
+                            // /tool_outputs 里的文件读回来」。没传值时（圆桌/群/子代理）保持旧判据。
+                            val canReadBackToolOutputs = toolOutputsReadable
+                                ?: tools.any { it.name == "workspace_shell" }
                             executedTools += tool.copy(
                                 output = maybeTruncateToolOutput(
                                     tool.toolCallId,
+                                    tool.toolName,
                                     result,
-                                    hasShellAccess,
+                                    canReadBackToolOutputs,
                                     toolOutputCharLimit,
                                 )
                             )
@@ -665,6 +843,8 @@ class GenerationLoop(
         stripGroupToolParts: Boolean = false,
         /** v321：见 generateText 处 KDoc（「只保留发言正文」时连群发言的思考过程一起剥） */
         stripGroupReasoningParts: Boolean = false,
+        /** v1011：见 generateText 处 KDoc（主对话「零产出定格」不再装死；默认关） */
+        reportEmptyReplyAsError: Boolean = false,
     ) {
         val internalMessages = buildList {
             val system = buildString {
@@ -771,6 +951,12 @@ class GenerationLoop(
         val entryCumulativeRequestCount = messages.lastOrNull()
             ?.takeIf { it.role == MessageRole.ASSISTANT }?.cumulativeRequestCount ?: 0
         var roundsRequestCount = 0
+        // v1017：官方步数与按次计价分开；普通网络重试仍预览同一步，不改计费账本。
+        val previousStepMessage = messages.lastOrNull()?.takeIf { it.role == MessageRole.ASSISTANT }
+        val stepStats = GenerationStepStats(
+            previousStepMessage?.stepCount,
+            previousStepMessage?.cumulativeRequestCount,
+        )
         // 至少有一轮量到过「首字→写完」，才写 cumulativeGenerationMs；
         // 整趟都没量到（非流式）时保持 null，界面就只显示响应速度那一格。
         var generationMeasured = false
@@ -783,6 +969,7 @@ class GenerationLoop(
          * 否则 break 出循环后这次写入不会落库。
          */
         suspend fun foldRoundUsage(round: TokenUsage?, timing: RoundTiming? = null) {
+            val completedStepCount = stepStats.complete()
             // v304：本函数被调用 = 这一轮模型请求走完了 → 请求次数 +1（本轮没报用量也照样算）
             roundsRequestCount += 1
             if (round != null) {
@@ -819,6 +1006,7 @@ class GenerationLoop(
                     cumulativeResponseMs = entryResponseMs + roundsResponseMs,
                     cumulativeGenerationMs = totalGenerationMs,
                     cumulativeRequestCount = entryCumulativeRequestCount + roundsRequestCount,
+                    stepCount = completedStepCount,
                 )
             }
             onUpdateMessages(messages)
@@ -879,6 +1067,13 @@ class GenerationLoop(
                                     processingStatus.value = null
                                 }
                                 attemptMessages = streamChunkHandler.handle(attemptMessages, chunk)
+                                // v1017：与官方一致，生成中就显示当前步骤；分片和同一步重试不累加。
+                                val previewIndex = attemptMessages.lastIndex
+                                if (previewIndex >= 0 && attemptMessages[previewIndex].role == MessageRole.ASSISTANT) {
+                                    attemptMessages = attemptMessages.toMutableList().also { list ->
+                                        list[previewIndex] = list[previewIndex].copy(stepCount = stepStats.preview())
+                                    }
+                                }
                                 onUpdateMessages(attemptMessages)
                             } catch (error: CancellationException) {
                                 throw error
@@ -1018,11 +1213,45 @@ class GenerationLoop(
                             preResumePartCount = resumeAssistant?.parts?.size
                             continue
                         }
+                        // v1011：走到这里说明「不再续跑了」。如果这一趟**没有给出任何答复**
+                        //（正文 / 工具 / 图片全无；**只有思考、没有正文也算没答复** —— 用户原话是
+                        // 「没有显示思考框，直接回复被截断了」），旧代码直接 break：ChatService
+                        // 因为 cause=null 记成 COMPLETED、不弹错，界面上要么一片空白，要么只挂着
+                        // 一排操作按钮（ChatMessage 对最后一条消息恒显示按钮）。
+                        // 现在抛一条分类清楚的说明，并把上游给的 stop_reason 原文一并带上。
+                        // 仅主对话显式打开时生效（默认关，其余路径逐字节不变）。
+                        if (reportEmptyReplyAsError) {
+                            // 用户点「停止」的那一瞬间不能被这条守卫变成假报错（审查位 P2）：
+                            // 取消信号必须原样上抛，走 CANCELLED 而不是 FAILED。
+                            currentCoroutineContext().ensureActive()
+                            val silentMessage = messages.getOrNull(assistantIndex)
+                            val kind = classifyEmptyReply(
+                                parts = silentMessage?.parts.orEmpty(),
+                                finishReason = silentMessage?.finishReason,
+                                truncatedWithoutSentinel =
+                                    silentMessage?.truncatedWithoutSentinel == true,
+                            )
+                            if (kind != null) {
+                                // ⚠️ 这里**刻意不去摘掉**那条空助手消息。我本来写了 removeAt +
+                                // onUpdateMessages 想避免「空气泡 + 一排按钮」，但审查位抓到那是
+                                // 无效代码：Conversation.updateCurrentMessages 只按新列表的下标
+                                // 覆盖前缀节点，**从不裁剪多出来的尾部节点**，摘了等于没摘。
+                                // 真要治得改节点裁剪或让 ChatMessage 的 showActions 也让路给
+                                // isEmptyUIMessage —— 那属于界面改造，超出本轮四项范围，
+                                // 记进任务板待办。当前表现：报错卡正常显示，底下可能多一条空行。
+                                throw EmptyReplyException(kind, emptyReplyMessage(kind, silentMessage?.finishReason))
+                            }
+                        }
                         break
                     } catch (error: Throwable) {
                         if (error is StreamChunkHandlingException) {
                             throw error.cause ?: error
                         }
+                        // v1011：「零产出说明」不是异常中断，绝不能被下面的续跑机制吃掉。
+                        // v1012 修正：v1011 那版是「一律直接上抛」，把用户要的「只要是报错就
+                        // 续跑」也一起挡了（真机表现：弹一句看不懂的 refusal 就死）。现在按
+                        // 「重发这一趟要不要再收一次钱」分档，判据与依据见 isWorthResending。
+                        if (error is EmptyReplyException && !error.kind.isWorthResending) throw error
                         // v264：用户主动停止必须原样上抛，绝不能被当成「异常中断」自动续跑。
                         // 取消信号本身也原样上抛（协程未取消却收到取消信号的罕见竞态不续跑）。
                         if (error is CancellationException) throw error
@@ -1137,6 +1366,8 @@ class GenerationLoop(
                                 }
                                 // 已写的半截内容保留为展示基线：续写增量会追加进同一条助手消息；
                                 // 下一轮请求输入从 internalMessages 重建（本次新增文字 + 「继续」）。
+                                // v1017：保留半截再发「继续」是下一逻辑步骤；重生成分支不推进。
+                                stepStats.acceptInterruptedStep()
                                 responseBaseMessages = attemptMessages
                                 // v268：去重快照（含被中断那轮已写出的部分）
                                 val continuedMessage = attemptMessages.lastOrNull {
@@ -1193,11 +1424,40 @@ class GenerationLoop(
                     timing = RoundTiming(responseMs = responseMs, generationMs = null),
                 )
                 onUpdateMessages(messages)
+                // v1011（两个审查位都抓到）：非流式路径以前没有这道守卫 —— 用户把「流式输出」
+                // 关掉时，「一个字都没有却正常收尾」的旧症状会原样存在。判据复用同一个纯函数，
+                // 不另写一套，免得两条路径各坏一次。
+                if (reportEmptyReplyAsError) {
+                    currentCoroutineContext().ensureActive()
+                    val silentMessage = messages.lastOrNull { it.role == MessageRole.ASSISTANT }
+                    val kind = classifyEmptyReply(
+                        parts = silentMessage?.parts.orEmpty(),
+                        finishReason = silentMessage?.finishReason,
+                        truncatedWithoutSentinel = silentMessage?.truncatedWithoutSentinel == true,
+                    )
+                    if (kind != null) {
+                        // 与流式那条一样：刻意不摘空消息（updateCurrentMessages 摘不掉，
+                        // 详见流式分支那段注释）。
+                        throw EmptyReplyException(kind, emptyReplyMessage(kind, silentMessage?.finishReason))
+                    }
+                }
             }
         } finally {
             processingStatus.value = null
         }
     }
+
+    /**
+     * v1011：把零产出分类拼成用户可见的一句话，末尾一律带上游给的 stop_reason 原文。
+     *
+     * 上游没给结束原因时填「（上游没给）」而不是留空 —— 用户要能分辨「上游没给」和「我们没读到」。
+     */
+    private fun emptyReplyMessage(kind: EmptyReplyKind, finishReason: String?): String =
+        context.getString(
+            emptyReplyMessageRes(kind),
+            finishReason?.takeIf { it.isNotBlank() }
+                ?: context.getString(R.string.chat_generation_empty_reply_no_stop_reason),
+        )
 
     private suspend fun <T> executeProviderRequestWithRetry(
         processingStatus: MutableStateFlow<String?>,
@@ -1297,37 +1557,68 @@ class GenerationLoop(
 
     private fun maybeTruncateToolOutput(
         toolCallId: String,
+        toolName: String,
         output: List<UIMessagePart>,
-        hasShellAccess: Boolean,
+        canReadBack: Boolean,
         charLimit: Int = MAX_TOOL_OUTPUT_CHARS,
     ): List<UIMessagePart> {
+        // v1017：结构化输出不参与截断。search_web 的返回是 JSON，结果列表 UI 与引用角标
+        // 跳转都依赖完整结构，切碎后解析失败 = 卡片空白且一声不响（有单测钉住这条豁免）。
+        if (toolName in TOOLS_WITHOUT_OUTPUT_TRUNCATION) return output
+
         val textParts = output.filterIsInstance<UIMessagePart.Text>()
         val nonTextParts = output.filter { it !is UIMessagePart.Text }
         val totalChars = textParts.sumOf { it.text.length }
 
         if (totalChars <= charLimit.coerceAtLeast(4 * 1024)) return output
 
-        Log.i(TAG, "maybeTruncateToolOutput: truncating tool $toolCallId output ($totalChars chars)")
+        Log.i(
+            TAG,
+            "maybeTruncateToolOutput: truncating tool $toolCallId ($toolName) output " +
+                "($totalChars chars, canReadBack=$canReadBack)",
+        )
 
         val fullText = textParts.joinToString("\n") { it.text }
-        val preview = fullText.take(TOOL_OUTPUT_PREVIEW_CHARS)
+        // v1017：头 + 尾双端预览。命令的报错与最终结论通常在末尾，只留前 4K 恰好丢掉最该看的。
+        val preview = headAndTailPreview(fullText, TOOL_OUTPUT_PREVIEW_CHARS)
 
-        val fileName = "${toolCallId}.txt"
-        val outputDir = File(context.filesDir, FileFolders.TOOL_OUTPUTS).apply { mkdirs() }
-        File(outputDir, fileName).writeText(fullText)
+        // v1017：只有确认模型能把原文读回来，才落盘并给出路径。
+        // 旧写法是先无条件 writeText、再判断有没有终端，两个后果都是真的：
+        //   ① 没绑工作区 → 手机里留下一份永远不会被读的文件；
+        //   ② 远程 SSH 工作区 → 给出 /tool_outputs/xxx 这条远端不存在的路径，模型照着跑必然报错。
+        // 写盘失败同样不给路径 —— 宁可少给一个提示，也不给一条死链。
+        val fileName = "$toolCallId.txt"
+        val saved = if (canReadBack) {
+            runCatching {
+                val outputDir = File(context.filesDir, FileFolders.TOOL_OUTPUTS).apply { mkdirs() }
+                File(outputDir, fileName).writeText(fullText)
+            }.onFailure {
+                Log.w(TAG, "maybeTruncateToolOutput: failed to save $fileName", it)
+            }.isSuccess
+        } else {
+            false
+        }
 
         return listOf(
             UIMessagePart.Text(
                 buildString {
                     appendLine("[Tool output truncated: $totalChars characters total]")
-                    if (hasShellAccess) {
-                        appendLine("Full output saved to: /tool_outputs/$fileName")
+                    if (saved) {
+                        appendLine("Output saved to: /tool_outputs/$fileName")
                         appendLine("Use shell to read: `cat /tool_outputs/$fileName`")
+                        appendLine("Use shell to read a range: `sed -n '1,200p' /tool_outputs/$fileName`")
                         appendLine("Use shell to search: `grep \"pattern\" /tool_outputs/$fileName`")
+                    } else if (canReadBack) {
+                        // 有终端但这次没写成功（磁盘/权限异常）：如实说，不编路径
+                        appendLine("Saving the output to a file failed this time, so only the excerpt below is available.")
                     } else {
                         // v209: 圆桌等只读会话没有 shell，拿不回完整内容，
                         // 与其把整块塞进上下文（费用暴涨），不如让模型把问题问小一点。
-                        appendLine("Tool output was too large to include. Ask a narrower question or request a smaller specific part.")
+                        // v1017: 不再留下无人读取的文件；预览同时保住开头与结尾。
+                        appendLine("The full output was not kept this time (this session cannot read a saved file back).")
+                        appendLine("The excerpt below keeps the beginning and the end of the output.")
+                        appendLine("To get more, ask again with a narrower request (for example read a specific line range instead of the whole file).")
+                        appendLine("Only re-run the command with head/tail/grep if you actually have a shell in this session.")
                     }
                     appendLine()
                     append(preview)

@@ -44,6 +44,10 @@ interface MessageNodeDAO {
     @Query("DELETE FROM message_node WHERE id = :nodeId")
     suspend fun deleteById(nodeId: String)
 
+    // 官方 3.1.0：消息节点数（重新生成的分支不另算）
+    @Query("SELECT COUNT(*) FROM message_node")
+    suspend fun countAll(): Int
+
     // 使用 @RawQuery 绕过 Room 编译期校验，以便使用 json_each() 虚拟表
     @RawQuery
     suspend fun getTokenStatsRaw(query: SupportSQLiteQuery): MessageTokenStats

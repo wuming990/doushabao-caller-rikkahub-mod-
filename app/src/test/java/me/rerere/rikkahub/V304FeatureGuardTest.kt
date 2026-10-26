@@ -1,5 +1,6 @@
 package me.rerere.rikkahub
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -43,18 +44,79 @@ class V304FeatureGuardTest {
 
     @Test
     fun `技能顺序的五环节与拖动接线没被覆盖`() {
-        val prefs = source("app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt")
+        val prefs = source("app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt") + "\n" + source("app/src/main/java/me/rerere/rikkahub/data/datastore/Settings.kt") // v323：官方 3.1 把 Settings 字段拆到 Settings.kt，判据改读两个文件（断言内容未改）
         assertTrue(prefs.contains("val SKILL_ORDER = stringPreferencesKey(\"skill_order\")"))
         assertTrue(prefs.contains("preferences[SKILL_ORDER] = encodeSkillOrder(settings.skillOrder)"))
         assertTrue(prefs.contains("skillOrder = decodeSkillOrder(preferences[SKILL_ORDER]),"))
         assertTrue(prefs.contains("internal fun encodeSkillOrder(names: List<String>): String"))
         assertTrue(prefs.contains("internal fun decodeSkillOrder(raw: String?): List<String>"))
-        val manager = source("app/src/main/java/me/rerere/rikkahub/data/files/SkillManager.kt")
+        // v323：官方 3.1 把技能管理从 data/files 迁到 data/skills（只是文件位置变了，
+        // 「按用户拖动顺序排序」这个功能没变），判据跟着改到新路径；其余断言一个字没动。
+        val manager = source("app/src/main/java/me/rerere/rikkahub/data/skills/SkillManager.kt")
         assertTrue(manager.contains("sortSkillsByOrder(raw, settingsStore.settingsFlow.value.skillOrder)"))
         val vm = source("app/src/main/java/me/rerere/rikkahub/ui/pages/extensions/skills/SkillsVM.kt")
         assertTrue(vm.contains("fun reorderSkills(ordered: List<SkillMetadata>)"))
         val page = source("app/src/main/java/me/rerere/rikkahub/ui/pages/extensions/skills/SkillsPage.kt")
         assertTrue(page.contains("dragToReorder("))
+    }
+
+    @Test
+    fun `会话视角与发送链路没被官方覆盖(v323)`() {
+        val service = source("app/src/main/java/me/rerere/rikkahub/service/ChatService.kt")
+        assertTrue(
+            "主对话生成必须用会话视角助手（settings.getAssistantOf(conversation)）",
+            service.contains("settings.getAssistantOf(initialConversation)"),
+        )
+        assertTrue(
+            "主对话生成必须用会话视角模型（settings.getChatModelOf(conversation)）",
+            service.contains("settings.getChatModelOf(initialConversation)"),
+        )
+        val searchFn = service
+            .substringAfter("suspend fun updateChatSearch")
+            .substringBefore("suspend fun updateChatAssistant")
+        assertTrue(
+            "updateChatSearch 不许 bindConfig（会把新会话配置提前固定死）",
+            !searchFn.contains("bindConfig("),
+        )
+        assertTrue(
+            "updateChatSearch 的 config 分支必须真的落库",
+            searchFn.contains("updateConversationConfig"),
+        )
+        assertTrue(
+            "updateChatAssistant 必须真的写 conversation.config",
+            service.contains("conversationRepo::updateConversationConfig"),
+        )
+
+        val page = source("app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatPage.kt")
+        assertTrue("发送前自动压缩分叉丢了", page.contains("vm.shouldAutoCompressBeforeSend()"))
+        assertTrue("附件处理中发送拦截丢了", page.contains("inputState.hasPendingProcessing()"))
+        assertTrue("附件失败时发送拦截丢了", page.contains("inputState.hasFailedPending()"))
+        assertTrue(
+            "聊天页必须用会话视角助手，不许用 setting.getCurrentAssistant()",
+            page.contains("val assistant by vm.assistant.collectAsStateWithLifecycle()"),
+        )
+        // v323：反向断言只认调用语法，避免被解释这条坑的注释误伤（手册 §7.3）。
+        assertTrue(
+            "聊天页仍有把全局当前助手当会话助手的写法",
+            !Regex("""val\s+assistant\s*=\s*setting\.getCurrentAssistant\s*\(""").containsMatchIn(page),
+        )
+        // v323：文件面板/输入框都必须走 VM（否则会话视角助手会被整份写回全局助手设置）
+        assertEquals(
+            "onUpdateAssistant 必须走 vm::updateAssistant（两处：输入框 + 文件面板）",
+            2,
+            Regex("""onUpdateAssistant\s*=\s*vm::updateAssistant""").findAll(page).count(),
+        )
+
+        val prefs = source("app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt")
+        listOf(
+            "enableAutoTitle = preferences[ENABLE_AUTO_TITLE]",
+            "translateTargetLanguage = preferences[TRANSLATE_TARGET_LANGUAGE]",
+            "uploadS3Config = preferences[UPLOAD_S3_CONFIG]",
+            "mediaGenerationProviders = preferences[MEDIA_GENERATION_PROVIDERS]",
+            "sponsorAlertDismissedAt = preferences[SPONSOR_ALERT_DISMISSED_AT]",
+        ).forEach { needle ->
+            assertTrue("设置读路径漏字段：$needle", prefs.contains(needle))
+        }
     }
 
     @Test

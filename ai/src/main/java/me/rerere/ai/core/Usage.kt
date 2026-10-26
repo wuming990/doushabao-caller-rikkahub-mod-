@@ -91,3 +91,20 @@ fun TokenUsage?.accumulate(other: TokenUsage?): TokenUsage {
 private fun TokenUsage.isEmpty(): Boolean =
     promptTokens == 0 && completionTokens == 0 && cachedTokens == 0 &&
             totalTokens == 0 && reasoningTokens == 0
+
+/**
+ * 累加多次请求的 usage，每次请求都会按完整上下文计费，因此 prompt 也直接相加。
+ * v323：与上面的 accumulate 并存 —— 官方 3.1.0 新代码用的是 sum，二改老代码用的是
+ * accumulate（多一个「服务商没报用量就不加」的保护），两边都保留，避免静默改语义。
+ */
+fun TokenUsage?.sum(other: TokenUsage?): TokenUsage? {
+    if (this == null) return other
+    if (other == null) return this
+    return TokenUsage(
+        promptTokens = promptTokens + other.promptTokens,
+        completionTokens = completionTokens + other.completionTokens,
+        cachedTokens = cachedTokens + other.cachedTokens,
+        totalTokens = totalTokens + other.totalTokens,
+        reasoningTokens = reasoningTokens + other.reasoningTokens,
+    )
+}

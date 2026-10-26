@@ -1091,6 +1091,42 @@ class GroupChatTest {
     }
 
     @Test
+    fun `已停场次点名的名字会被记住，新一批第一位就是他`() {
+        // v1009 真机 bug（用户原话）：「轮到 B 讨论，我想开始就让 C 先，点 C 后还是从 B 开始，
+        // 需要开始之后再点一次 C 才切过来」。
+        // 根因：旧写法在 STOPPED / FINISHED 时**连名字都不记**，紧接着开的第一批只能按轮流来。
+        val run = GroupChatRun(conversationId = Uuid.random(), turnsBudget = 3)
+        run.markSpeaking(modelA, "甲模型")
+        run.markTurnDone(modelA) // 轮流游标落到甲
+        run.markStopped()
+        assertFalse(
+            "停了的场次仍然返回 false —— 状态不许被点名改回可跑",
+            run.requestSpeaker(modelC),
+        )
+        assertTrue("但要能开新一批", run.beginRun(3))
+        assertEquals(
+            "用户点的名字必须成为这一批的第一位（不许退回轮流从甲的下一位开始）",
+            modelC,
+            run.takeRequestedSpeaker(),
+        )
+    }
+
+    @Test
+    fun `开批后显式指定的第一位优先于轮流顺序`() {
+        // ChatService.startGroupDiscussion(firstSpeaker) 的落点：开批成功后再落一次名字。
+        val run = GroupChatRun(conversationId = Uuid.random(), turnsBudget = 3)
+        run.markSpeaking(modelB, "乙模型")
+        run.markTurnDone(modelB) // 轮流游标落到乙
+        assertTrue(run.beginRun(3))
+        run.requestSpeaker(modelC)
+        assertEquals(
+            "开批后落的名字要能被第一轮取走",
+            modelC,
+            run.takeRequestedSpeaker(),
+        )
+    }
+
+    @Test
     fun `已停或已结束的场次不接受点名`() {
         // 那时该走「继续讨论」，让点名悄悄把状态改回可跑，用户会以为讨论自己在动
         val stopped = GroupChatRun(conversationId = Uuid.random(), turnsBudget = 3)
@@ -1455,6 +1491,19 @@ class GroupChatTest {
         )
         assertFalse("思考原文不许出现在上文里", kept.toText().contains("我先搜一下再说"))
     }
+
+
+
+    private fun UIMessagePart.isAnyToolPartForTest(): Boolean = when (this) {
+        is UIMessagePart.Tool,
+        is UIMessagePart.ServerTool,
+        is UIMessagePart.ToolCall,
+        is UIMessagePart.ToolResult,
+        -> true
+
+        else -> false
+    }
+
 
     @Test
     fun `开关打开时，开群之前的历史照旧整份带，一个字都不许摘`() {

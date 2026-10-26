@@ -8,6 +8,8 @@
   <uses-permission
     android:name="android.permission.WRITE_EXTERNAL_STORAGE"
     android:maxSdkVersion="28" />
+  <!-- v323：二改的本地文件浏览器需要它。官方 3.1 没有这个功能，合并时整条声明被覆盖，
+       导致设置页里“允许访问所有文件”开关不可用、点进去返回后仍判定未授权 → 循环弹窗。 -->
   <uses-permission
     android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
     tools:ignore="ScopedStorage" />
@@ -16,8 +18,11 @@
   <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
   <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+  <!-- v1015：工作区终端「不让 CPU 睡」所需（WorkspaceBoostManager.acquireWakeLock 申请）。
+       合并上游时这行极易被整覆盖：丢了不报错也不崩，只是终端跑长任务会被系统休眠打断。
+       由 V1015ManifestGuardTest 钉住。 -->
   <uses-permission android:name="android.permission.WAKE_LOCK" />
   <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
   <uses-permission
@@ -69,6 +74,9 @@
       android:exported="false"
       android:label="@string/title_activity_safe_mode"
       android:theme="@style/Theme.Rikkahub" />
+    <!-- v1015：下面两块在合并 3.1.0 时被整覆盖丢掉过（类文件一直在、注册没了）。
+         症状：账号登录点「去授权」后浏览器回跳 rikkahub://codex|gemini/oauth 无人承接，
+         界面永远停在等待授权 = 用户报过的「登录卡死」。由 V1015ManifestGuardTest 钉住。 -->
     <!-- v274：官方账号 OAuth 登录的浏览器回跳页（照搬 ExTV；scheme 固定 rikkahub 是
          OAuth client 注册的 redirect_uri 约定，不能改成我们自己的 rikkahubmod） -->
     <activity
@@ -99,6 +107,19 @@
           android:scheme="rikkahub" />
       </intent-filter>
     </activity>
+
+    <!-- v1016：Gemini 网页版「一键登录」页（应用内登录 + 抓 Cookie）。
+         这条注册是硬红线：合并官方时整覆盖 Manifest 会把它抹掉，类文件还在、页面起不来，
+         表现是点「一键登录」报 Unable to find explicit activity class ——
+         与 v1015 抓到的两个 OAuth 回跳页丢失是同一族事故，守卫见 V1016GeminiWebLoginGuardTest。 -->
+    <activity
+      android:name=".ui.activity.GeminiWebLoginActivity"
+      android:configChanges="keyboardHidden|orientation|screenSize|screenLayout|smallestScreenSize|density"
+      android:exported="false"
+      android:label="登录 Google（Gemini 网页版）"
+      android:theme="@style/Theme.Rikkahub"
+      android:windowSoftInputMode="adjustResize" />
+
     <activity
       android:name=".RouteActivity"
       android:configChanges="keyboardHidden|orientation|screenSize"
@@ -132,7 +153,7 @@
       </intent-filter>
 
       <intent-filter>
-        <action android:name="me.rerere.rikkahub.action.IMAGE_GEN" />
+        <action android:name="me.rerere.rikkahub.action.MEDIA_CREATION" />
         <category android:name="android.intent.category.DEFAULT" />
       </intent-filter>
 
@@ -151,13 +172,9 @@
 
         <data
           android:host="shortcut"
-          android:scheme="rikkahubmod" />
+          android:scheme="rikkahubmod" />  <!-- v1015：与 res/xml/shortcuts.xml 的 data 必须一致，改回官方值会让快捷方式匹配不到本应用（也避免与官方 App 抢 intent） -->
       </intent-filter>
     </activity>
-    <activity
-      android:name="com.yalantis.ucrop.UCropActivity"
-      android:theme="@style/Theme.AppCompat.Light.NoActionBar" />
-
     <service
       android:name=".service.OfficialTransferService"
       android:exported="false"
@@ -166,8 +183,18 @@
         android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
         android:value="resumable official workspace transfer with progress notification" />
     </service>
+
+
     <service
       android:name=".service.ChatGenerationForegroundService"
+      android:exported="false"
+      android:foregroundServiceType="dataSync" />
+    <service
+      android:name=".service.MediaCreationForegroundService"
+      android:exported="false"
+      android:foregroundServiceType="dataSync" />
+    <service
+      android:name=".service.MemoryDreamForegroundService"
       android:exported="false"
       android:foregroundServiceType="dataSync" />
     <service
@@ -189,7 +216,7 @@
         android:resource="@xml/file_paths" />
     </provider>
     <provider
-      android:name=".data.provider.WorkspaceDocumentsProvider"
+      android:name=".service.WorkspaceDocumentsProvider"
       android:authorities="${applicationId}.documents"
       android:exported="true"
       android:grantUriPermissions="true"

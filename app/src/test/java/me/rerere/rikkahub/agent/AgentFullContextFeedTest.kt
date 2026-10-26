@@ -119,14 +119,22 @@ class AgentFullContextFeedTest {
     }
 
     @Test
-    fun `思考过程默认不下传开关打开才下传`() {
+    fun `思考过程一律不下传，而且没有任何可翻开的开关`() {
+        // v1013：原来这里是「默认不下传、includeReasoning=true 才下传」。
+        // 那个开关连同工具入参一起删掉了 —— Anthropic 官方把「工具入参里出现
+        // reasoning / thinking / trace 字段」逐字列为 reasoning_extraction 拒答的
+        // 触发形状之一（真机实锤：只发「测试」两个字也被这一类拦下）。
+        // 刻意不做成「参数还在、默认 false」：那正是最容易被后人翻成 true 的形状。
         val message = assistantParts(UIMessagePart.Reasoning(reasoning = "先看 RoundTableCoordinator"))
-        val without = AgentContextFeed.render(messages = listOf(message))
-        assertFalse("默认不带思考正文", without.contains("先看 RoundTableCoordinator"))
-        assertTrue("但要告诉子代理省掉了", without.contains("未下传"))
-
-        val with = AgentContextFeed.render(messages = listOf(message), includeReasoning = true)
-        assertTrue("打开开关就要带上", with.contains("先看 RoundTableCoordinator"))
+        val rendered = AgentContextFeed.render(messages = listOf(message))
+        assertFalse("思考正文绝不能下传", rendered.contains("先看 RoundTableCoordinator"))
+        assertTrue("但必须告诉子代理「这里本来有一段思考、我们没给你」", rendered.contains("未下传"))
+        // 渲染函数不能再收这个参数（编译期就锁死）
+        val renderSource = source("service/AgentContextFeed.kt")
+        assertFalse(
+            "render 的签名里不能再出现 includeReasoning",
+            renderSource.contains("includeReasoning: Boolean"),
+        )
     }
 
     @Test
@@ -193,7 +201,7 @@ class AgentFullContextFeedTest {
         toolName: String,
         manager: AgentThreadManager,
         args: String,
-        provider: (suspend (Boolean, Int) -> String?)? = null,
+        provider: (suspend (Int) -> String?)? = null,
     ): String {
         val tools = createAgentControlTools(
             conversationId = "conv-1",
@@ -216,7 +224,10 @@ class AgentFullContextFeedTest {
         val schema = tools.first { it.name == "spawn_agent" }.parameters().toString()
         assertTrue("要有开关", schema.contains("include_full_context"))
         assertTrue("要能限长", schema.contains("full_context_max_chars"))
-        assertTrue("要能选择带不带思考", schema.contains("include_reasoning"))
+        assertFalse(
+            "工具入参里绝不能再出现 include_reasoning —— 官方把它列为 reasoning_extraction 触发形状",
+            schema.contains("include_reasoning"),
+        )
     }
 
     @Test
@@ -235,7 +246,7 @@ class AgentFullContextFeedTest {
             "spawn_agent",
             manager,
             """{"task":"读一下背景","include_full_context":true}""",
-            provider = { _, _ -> full },
+            provider = { _ -> full },
         )
         val id = textOf(out, "thread_id")
         assertTrue("应该派发成功：$out", id != null)
@@ -255,7 +266,7 @@ class AgentFullContextFeedTest {
             "spawn_agent",
             manager,
             """{"task":"照旧","context_summary":"只给一句话"}""",
-            provider = { _, _ -> "不该被用到" },
+            provider = { _ -> "不该被用到" },
         )
         val id = textOf(out, "thread_id")
         val thread = withTimeout(5_000) {
@@ -275,7 +286,7 @@ class AgentFullContextFeedTest {
             "spawn_agent",
             manager,
             """{"task":"两个都要","context_summary":"划重点：只看第 3 条","include_full_context":true}""",
-            provider = { _, _ -> full },
+            provider = { _ -> full },
         )
         val id = textOf(out, "thread_id")
         val thread = withTimeout(5_000) {
@@ -310,27 +321,27 @@ class AgentFullContextFeedTest {
             "spawn_agent",
             newManager(),
             """{"task":"要原文","include_full_context":true}""",
-            provider = { _, _ -> "   " },
+            provider = { _ -> "   " },
         )
         assertTrue(textOf(out, "error").orEmpty().contains(AGENT_FULL_CONTEXT_UNAVAILABLE))
     }
 
     @Test
-    fun `参数会被透传给渲染钩子`() {
-        var seenReasoning: Boolean? = null
+    fun `即便模型硬塞 include_reasoning 也不会生效，上限仍然透传`() {
+        // 删掉入参不等于删掉风险：模型可能照旧传这个字段（它见过太多客户端）。
+        // 所以这条测的是「传了也没用」——钩子签名里已经没有这个维度。
         var seenMax: Int? = null
-        exec(
+        val result = exec(
             "spawn_agent",
             newManager(),
             """{"task":"看参数","include_full_context":true,"include_reasoning":true,"full_context_max_chars":4321}""",
-            provider = { reasoning, max ->
-                seenReasoning = reasoning
+            provider = { max ->
                 seenMax = max
                 "原文"
             },
         )
-        assertTrue("include_reasoning 要传下去", seenReasoning == true)
         assertTrue("上限要传下去，实际 $seenMax", seenMax == 4321)
+        assertTrue("这条本不该报错：忽略未知入参即可", !result.contains("失败", ignoreCase = true))
     }
 
     @Test
@@ -342,7 +353,7 @@ class AgentFullContextFeedTest {
             manager,
             """{"stages":[{"task":"第一棒","role":"explorer"},{"task":"第二棒","role":"explorer"}],
                 "include_full_context":true,"stage_timeout_seconds":30}""",
-            provider = { _, _ -> full },
+            provider = { _ -> full },
         )
         val threads = withTimeout(20_000) {
             manager.threadsFlow("conv-1").first { list ->
@@ -375,7 +386,7 @@ class AgentFullContextFeedTest {
         val text = source("service/ChatService.kt")
         assertTrue(
             "createAgentControlTools 必须传 fullContextProvider，否则「完整上文」永远拿不到",
-            text.contains("fullContextProvider = { includeReasoning, maxChars ->"),
+            text.contains("fullContextProvider = { maxChars ->"),
         )
         assertTrue(
             "必须有真正组装原文的方法",

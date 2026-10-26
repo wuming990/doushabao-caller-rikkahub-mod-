@@ -43,6 +43,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.core.Tool
 import me.rerere.ai.core.ReasoningLevel
+import me.rerere.ai.provider.BuiltInTools
 import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelAbility
 import me.rerere.ai.provider.ProviderManager
@@ -85,7 +86,7 @@ import me.rerere.rikkahub.data.ai.tools.createRoundTableReadOnlyWorkspaceTools
 import me.rerere.rikkahub.agent.model.AgentReport
 import me.rerere.rikkahub.agent.tools.createAgentControlTools
 import me.rerere.rikkahub.data.ai.tools.createWorkspaceTools
-import me.rerere.rikkahub.data.files.SkillManager
+import me.rerere.rikkahub.data.skills.SkillManager
 import me.rerere.rikkahub.data.ai.tools.ChatToolFactory
 import me.rerere.rikkahub.data.ai.tools.InvalidMcpServerNamesException
 import me.rerere.rikkahub.data.ai.tools.shouldUseExternalWebSearch
@@ -114,14 +115,23 @@ import me.rerere.rikkahub.data.datastore.getCurrentAssistant
 import me.rerere.rikkahub.data.datastore.getCurrentChatModel
 import me.rerere.rikkahub.data.gemini.GeminiSearchClient
 import me.rerere.rikkahub.data.files.FilesManager
+import me.rerere.rikkahub.data.model.ConversationConfig
 import me.rerere.rikkahub.data.model.Conversation
+import me.rerere.rikkahub.data.model.fillModelSnapshots
+import me.rerere.rikkahub.data.model.bindConfig
 import me.rerere.rikkahub.data.model.GroupChatConfig
 import me.rerere.rikkahub.data.model.clampResumeMax
 import me.rerere.rikkahub.data.model.Assistant
+import me.rerere.rikkahub.data.model.AssistantMemory
 import me.rerere.rikkahub.data.model.AutoCompressModelSource
 import me.rerere.rikkahub.data.model.AssistantAffectScope
 import me.rerere.rikkahub.data.model.MessageNode
 import me.rerere.rikkahub.data.model.sanitizeGroupMembers
+import me.rerere.rikkahub.data.model.getAssistantOf
+import me.rerere.rikkahub.data.model.getChatModelOf
+import me.rerere.rikkahub.data.model.getStoredAssistantOf
+import me.rerere.rikkahub.data.model.withAssistantUpdate
+import me.rerere.rikkahub.data.model.withoutConversationFields
 import me.rerere.rikkahub.data.model.localFileUrls
 import me.rerere.rikkahub.data.model.replaceRegexes
 import me.rerere.rikkahub.data.model.toMessageNode
@@ -396,7 +406,25 @@ class ChatService(
     // v306 合并上游 2.5.3：底层换成官方 ConversationSessionManager（生命周期、引用计数、
     // 空闲回收都在里面），下面 getOrCreateSession / launchWithConversationReference 等
     // 调用名全部保留，作为转发层，避免 2707 行二改（圆桌等）跟着官方重构重写。
+    // v323 合并 3.1.0：官方把会话落库抽成 ConversationStore。这里用现有仓库实现，
+    // 行为与官方一致：新会话插入、已有会话更新。文件清理维持原 ChatService 的路径，不额外接管。
+    private val conversationStore = object : ConversationStore {
+        override suspend fun prepareWrite(): (Conversation) -> Conversation {
+            val settings = settingsStore.settingsFlow.value
+            return { it.bindConfig(settings).fillModelSnapshots(settings) }
+        }
+
+        override suspend fun write(previous: Conversation?, current: Conversation) {
+            if (previous == null && !conversationRepo.existsConversationById(current.id)) {
+                conversationRepo.insertConversation(current)
+            } else {
+                conversationRepo.updateConversation(current)
+            }
+        }
+    }
+
     private val sessionManager = ConversationSessionManager(
+        store = conversationStore,
         scope = appScope,
         createInitialConversation = { id ->
             Conversation.ofId(
@@ -488,6 +516,13 @@ class ChatService(
     fun getProcessingStatusFlow(conversationId: Uuid): StateFlow<String?> =
         sessionManager.getProcessingStatusFlow(conversationId)
 
+    // v1017: expose official floating-window/session state without changing existing ChatService behavior.
+    fun getReplyMessageIdFlow(conversationId: Uuid): StateFlow<Uuid?> =
+        sessionManager.getReplyMessageIdFlow(conversationId)
+
+    fun getGenerationStartedAtFlow(conversationId: Uuid): StateFlow<Long?> =
+        sessionManager.getGenerationStartedAtFlow(conversationId)
+
     // 2.4.13：后台生成保活。生成仍归 ChatService 管，这里只借前台服务的生命周期，
     // 让切到后台后流式生成不被系统杀进程打断。
     private fun launchGenerationJob(
@@ -525,26 +560,26 @@ class ChatService(
         // initialized 标志 + synchronized 双重检查）比旧版强，但 v229 硬保护必须保留 ——
         // 把判断搬进 load 闭包：生成中或内存已有消息时返回内存态（Session 内部不会覆盖）。
         sessionManager.withSession(conversationId) { session ->
-        session.initialize {
+        session.initialize(load = load@{
             // 生成已经开始时，内存态比数据库新，绝不能用旧快照覆盖。
             if (session.isGenerating) {
                 Log.i(TAG, "initializeConversation: keep active in-memory state for $conversationId")
-                return@initialize session.state.value
+                return@load session.state.value
             }
             // v229 硬保护：内存里只要已经有消息，就绝不允许用「空的新对话」覆盖。
             // 旧版只看 isGenerating 这个瞬时状态，判断落空就会把刚写进去的用户消息冲掉。
             if (session.state.value.messageNodes.isNotEmpty()) {
                 Log.i(TAG, "initializeConversation: memory already has messages, skip for $conversationId")
-                return@initialize session.state.value
+                return@load session.state.value
             }
             val conversation = conversationRepo.getConversationById(conversationId)
             if (session.isGenerating) {
                 Log.i(TAG, "initializeConversation: generation started while loading $conversationId; keep memory")
-                return@initialize session.state.value
+                return@load session.state.value
             }
             if (session.state.value.messageNodes.isNotEmpty()) {
                 Log.i(TAG, "initializeConversation: messages appeared while loading $conversationId; keep memory")
-                return@initialize session.state.value
+                return@load session.state.value
             }
             if (conversation != null) {
                 settingsStore.updateAssistant(conversation.assistantId)
@@ -559,7 +594,7 @@ class ChatService(
                     newConversation = true
                 ).updateCurrentMessages(assistant.presetMessages)
             }
-        }
+        })
         }
     }
 
@@ -767,7 +802,7 @@ class ChatService(
 
                 if (message.role == MessageRole.USER) {
                     // 如果是用户消息，则截止到当前消息
-                    val node = conversation.getMessageNodeByMessage(message)
+                    val node = conversation.getMessageNodeByMessageId(message.id)
                     val indexAt = conversation.messageNodes.indexOf(node)
                     val newConversation = conversation.copy(
                         messageNodes = conversation.messageNodes.subList(0, indexAt + 1)
@@ -776,7 +811,7 @@ class ChatService(
                     handleMessageComplete(conversationId)
                 } else {
                     if (regenerateAssistantMsg) {
-                        val node = conversation.getMessageNodeByMessage(message)
+                        val node = conversation.getMessageNodeByMessageId(message.id)
                         val nodeIndex = conversation.messageNodes.indexOf(node)
                         handleMessageComplete(conversationId, messageRange = 0..<nodeIndex)
                     } else {
@@ -1550,7 +1585,6 @@ class ChatService(
      */
     private suspend fun buildAgentFullContext(
         conversationId: Uuid,
-        includeReasoning: Boolean,
         maxChars: Int,
     ): String {
         val latest = getConversationFlow(conversationId).value
@@ -1571,7 +1605,6 @@ class ChatService(
             messages = latest.currentMessages,
             threads = digests,
             maxChars = maxChars,
-            includeReasoning = includeReasoning,
         )
     }
 
@@ -3102,11 +3135,12 @@ class ChatService(
                 conversationModeInjectionIds = conversation.modeInjectionIds,
                 conversationLorebookIds = conversation.lorebookIds,
                 workspaceCwd = conversation.workspaceCwd,
-                memories = if (assistant.useGlobalMemory) {
-                    memoryRepository.getGlobalMemories()
-                } else {
-                    memoryRepository.getMemoriesOfAssistant(assistant.id.toString())
-                },
+                // v323：3.1 的记忆改成文件库，这里按助手读取并把内容映射成生成层用的轻量结构。
+                memories = memoryRepository.getFiles(
+                    if (assistant.useGlobalMemory) MemoryRepository.GLOBAL_MEMORY_ID
+                    else assistant.id.toString()
+                )
+                    .mapIndexed { index, file -> AssistantMemory(id = index, content = file.content) },
                 inputTransformers = buildList {
                     addAll(inputTransformers)
                     add(templateTransformer)
@@ -3309,7 +3343,18 @@ class ChatService(
      * @param topic 用户在「开始讨论」弹框里写的、这次想问什么。为空表示直接开跑（不强制填表）；
      *   插话那条路径不传（插话内容本身就是发言）。
      */
-    fun startGroupDiscussion(conversationId: Uuid, topic: String? = null) {
+    fun startGroupDiscussion(
+        conversationId: Uuid,
+        topic: String? = null,
+        /**
+         * v1009：这一批的**第一位**指定由来说（用户在开跑前点的那个名字）。
+         *
+         * 为什么不只靠 [GroupChatRun.requestSpeaker]：那条路在「上一场已经停/已结束」时
+         * 返回 false（调用方据此决定开新一批），名字有可能在开批途中被别的分支带掉。
+         * 这里在 beginRun **之后**再落一次，保证「开跑的第一位」一定是用户点的那个。
+         */
+        firstSpeaker: Uuid? = null,
+    ) {
         val settings = settingsStore.settingsFlow.value
         // v315：只有「启用」状态的群才开跑（暂停 = 配置留着但不用）
         val config = settings.groupChatConfigs[conversationId]?.takeIf { it.enabled } ?: return
@@ -3324,9 +3369,13 @@ class ChatService(
             if (trimmedTopic.isNotEmpty()) {
                 appScope.launch { runCatching { saveGroupTopic(conversationId, trimmedTopic, settings) } }
             }
+            // v1009：这一批开不起来（正在跑），点名也要记下 —— 否则用户点了人却毫无下落
+            if (firstSpeaker != null) run.requestSpeaker(firstSpeaker)
             publishGroupState(run)
             return
         }
+        // v1009：开批成功后立刻把「第一位」落进 run，再发车（advanceTurns 第一轮就会取走）
+        if (firstSpeaker != null) run.requestSpeaker(firstSpeaker)
         publishGroupState(run)
 
         val previousJob = session.getJob()
@@ -3431,13 +3480,14 @@ class ChatService(
         val accepted = run.requestSpeaker(modelId)
         publishGroupState(run)
         if (!accepted) {
-            // 场次已停 / 已结束：直接开一批，点名会在这一批的第一轮生效
-            startGroupDiscussion(conversationId)
+            // 场次已停 / 已结束：直接开一批，并把点名作为**这一批的第一位**显式带进去
+            // （v1009：只靠 run 里记的名字不够稳，真机上出现过「点 C 却从 B 开始」）
+            startGroupDiscussion(conversationId, firstSpeaker = modelId)
             return GroupPickOutcome.STARTED
         }
         if (run.snapshot().status.canAdvance) {
             // 停着等用户：顺手开一批，用户当场就能看到「谁在说话」
-            startGroupDiscussion(conversationId)
+            startGroupDiscussion(conversationId, firstSpeaker = modelId)
             return GroupPickOutcome.STARTED
         }
         // 正有人在说话（**他已经出声了**）/ 正等用户回答提问：只记下名字，不打断。
@@ -3759,9 +3809,12 @@ class ChatService(
     ) {
         val settings = settingsStore.settingsFlow.first()
         val initialConversation = getConversationFlow(conversationId).value
-        val assistant = settings.getAssistantById(initialConversation.assistantId)
-            ?: settings.getCurrentAssistant()
-        val model = settings.findModelById(assistant.chatModelId ?: settings.chatModelId)
+        // v323：必须用「会话视角」的助手与模型（官方 3.1 的 ChatRequestFactory.createContext 口径）。
+        // 旧写法 getAssistantById(assistantId).chatModelId 只读助手全局设置：会话一旦 bind 过
+        // config（发过消息或切过搜索就会 bind），界面上换的模型/思考档/MCP/技能全部不生效 ——
+        // 用户看到新模型、请求仍发到旧模型，还按旧模型计费。
+        val assistant = settings.getAssistantOf(initialConversation)
+        val model = settings.getChatModelOf(initialConversation)
             ?: throw IllegalStateException("No chat model selected")
 
         val senderName = if (assistant.useAssistantAvatar) {
@@ -3778,7 +3831,7 @@ class ChatService(
 
             // memory tool
             if (!model.abilities.contains(ModelAbility.TOOL)) {
-                if (useExternalWebSearch || mcpManager.getAllAvailableTools().isNotEmpty()) {
+                if (useExternalWebSearch || mcpManager.getAllAvailableTools(assistant).isNotEmpty()) {
                     addError(
                         IllegalStateException(context.getString(R.string.tools_warning)),
                         conversationId,
@@ -3831,6 +3884,19 @@ class ChatService(
                 conversationModeInjectionIds = conversation.modeInjectionIds,
                 conversationLorebookIds = conversation.lorebookIds,
                 workspaceCwd = conversation.workspaceCwd,
+                // v1017：主对话显式传「超长工具输出能否被读回来」，按工作区真实能力判断
+                // （只有本机 Rootfs 工作区挂载了 /tool_outputs；远程 SSH 与没绑工作区都是 false）。
+                // 旧写法靠「这轮工具里有没有 workspace_shell」猜，在 SSH 工作区里会给出一条
+                // 远端根本不存在的文件路径。判据为 false 时不写文件、不给死链。
+                // ⚠️ 这条与上面那组隔离规矩一致：只主对话显式传值，其余路径不传 = 行为不变。
+                toolOutputsReadable = assistant.workspaceId?.toString()?.let { wsId ->
+                    // ⚠️ 必须两个条件同时成立：① 工作区是本地 Rootfs（/tool_outputs 挂在里面）；
+                    // ② shell 状态是 READY —— 因为 createWorkspaceToolsIfReady 在状态不是 READY 时
+                    // 会把工作区工具整批不装配，那时给了路径模型也没有终端去读（审查位抓到的死链回归）。
+                    val ws = workspaceRepository.getById(wsId)
+                    ws?.capabilities()?.rootfs == true &&
+                        ws.shellStatus == WorkspaceShellStatus.READY.name
+                } == true,
                 // v263：主对话显式打开「异常截断自动续跑」；圆桌/子代理/压缩/翻译不传，
                 // 默认 0 = 行为与改前一致（隔离规矩与 v248 那个工具输出上限参数同套）
                 truncationAutoResumeMax = settings.truncationAutoResumeMax,
@@ -3839,6 +3905,10 @@ class ChatService(
                 // v270：重点标色插件也只在主对话生效（默认关；打开才在系统提示词末尾
                 // 注入一段中性说明，关闭时零注入、模型不知道该功能存在）
                 highlightKeyPoints = settings.displaySetting.highlightKeyPoints,
+                // v1011：主对话「一个字都没有却正常收尾」不再静默定格 —— 抛一条分类清楚、
+                // 带上游 stop_reason 原文的说明（判据与界面渲染用同一把尺子，不会误伤
+                // 「只回工具调用」「只回图片」）。圆桌/子代理/群组/压缩/翻译不传，行为不变。
+                reportEmptyReplyAsError = true,
                 // v319：主对话拼上下文时剥掉「群组期间发言」的工具与搜索结果，只留方案与对话文字。
                 // 用户口径：解散群之后「不把群聊里的搜索/调用工具上文带出去」。
                 // 只影响这次发给模型的请求，对话记录本身一个字都不删（群里查过什么仍可回看）。
@@ -3848,11 +3918,10 @@ class ChatService(
                 // 一起剥掉再发请求。关掉时传 false = 与 v320 逐字节一致。
                 // 只改这次发出去的请求；库里的记录一个字都不动（用户仍可回看）。
                 stripGroupReasoningParts = settings.groupChatCleanContext,
-                memories = if (assistant.useGlobalMemory) {
-                    memoryRepository.getGlobalMemories()
-                } else {
-                    memoryRepository.getMemoriesOfAssistant(assistant.id.toString())
-                },
+                memories = memoryRepository.getFiles(
+                    if (assistant.useGlobalMemory) MemoryRepository.GLOBAL_MEMORY_ID
+                    else assistant.id.toString()
+                ).mapIndexed { index, file -> AssistantMemory(id = index, content = file.content) },
                 inputTransformers = buildList {
                     addAll(inputTransformers)
                     add(templateTransformer)
@@ -3885,10 +3954,9 @@ class ChatService(
                                 // v239：主对话原文只有主会话这一侧拿得到，在这里组装好交给工具层。
                                 // 主模型可以选择带不带（spawn_agent 的 include_full_context），
                                 // 但「想给却给不了」这种情况从此不存在。
-                                fullContextProvider = { includeReasoning, maxChars ->
+                                fullContextProvider = { maxChars ->
                                     buildAgentFullContext(
                                         conversationId = conversationId,
-                                        includeReasoning = includeReasoning,
                                         maxChars = maxChars,
                                     )
                                 },
@@ -3904,7 +3972,7 @@ class ChatService(
                             )
                         )
                     }
-                    mcpManager.getAllAvailableTools().also { allTools ->
+                    mcpManager.getAllAvailableTools(assistant).also { allTools ->
                         val invalidNames = allTools
                             .map { it.second }
                             .distinct()
@@ -4252,9 +4320,9 @@ class ChatService(
         val assistant = settings.getAssistantById(conversation.assistantId)
             ?: settings.getCurrentAssistant()
         val model = when (modelSource) {
-            CompressionModelSource.CURRENT_CHAT -> settings.findModelById(
-                assistant.chatModelId ?: settings.chatModelId
-            )
+            // v323：会话视角模型（官方 3.1 口径）。旧写法读助手全局 chatModelId，
+            // 会话换过模型时「压缩用当前对话模型」会拿错模型。
+            CompressionModelSource.CURRENT_CHAT -> settings.getChatModelOf(conversation)
             CompressionModelSource.FIXED -> settings.findModelById(settings.compressModelId)
         } ?: settings.getCurrentChatModel()
             ?: throw IllegalStateException(context.getString(R.string.chat_page_compress_no_model))
@@ -4351,7 +4419,13 @@ class ChatService(
             estimatedTokens = estimateConversationTokens(conversation),
             triggerTokens = resolveAutoCompressTriggerTokens(
                 assistant = assistant,
-                chatModelId = assistant.chatModelId ?: settings.chatModelId,
+                // v1007：按模型单独设的触发值必须按**会话当前模型**取。
+                // 官方 3.1 把模型固定到会话上（conversation.config.chatModelId），
+                // 旧写法读 assistant.chatModelId 会在会话换过模型时取错，
+                // 用户给某个模型单独设的触发值就等于不生效。
+                chatModelId = settings.getChatModelOf(conversation)?.id
+                    ?: assistant.chatModelId
+                    ?: settings.chatModelId,
                 overrides = settings.autoCompressModelOverrides,
             ),
         )
@@ -4492,6 +4566,12 @@ class ChatService(
             },
         ).getOrThrow()
 
+        // v1007：自动压缩建出来的分支同样要搬「按对话 id 存」的设置（群组配置 / 对话级模型记忆）。
+        // 之前只有手动「在此处创建分支」走了搬运，自动压缩这条漏了 —— 表现就是
+        // 压缩出来的新对话里讨论群组面板凭空消失、模型记忆对不上（与 v318 同一类问题）。
+        // 放在压缩成功之后：压缩失败会直接抛错、这条分支要作废，没必要给它留设置条目。
+        carryOverForkSettings(conversationId, forkConversation.id)
+
         return conversationRepo.getConversationById(forkConversation.id) ?: getConversationFlow(forkConversation.id).value
     }
 
@@ -4503,7 +4583,7 @@ class ChatService(
         checkFilesDelete(conversation, session.state.value)
         // v306：改用官方 session.updateConversation —— 会设置 initialized 标志，
         // 官方 initialize 的双重检查才不会在加载窗口内用旧快照覆盖新写入的消息。
-        session.updateConversation(conversation)
+        session.update { conversation }
     }
 
     fun updateConversationState(conversationId: Uuid, update: (Conversation) -> Conversation) {
@@ -4520,10 +4600,12 @@ class ChatService(
         persist: suspend (Conversation) -> Unit,
     ) {
         sessionManager.withSession(conversationId) { session ->
-            session.initialize {
-                conversationRepo.getConversationById(conversationId)
-                    ?: throw NotFoundException("Conversation not found")
-            }
+            session.initialize(
+                load = { conversationRepo.getConversationById(conversationId) },
+                // v323：草稿会话（还没落库）用内存态兜底，但**不能**把内存态塞进 load ——
+                // 那会让 existsInDatabase 误判为 true，草稿保护与空闲回收逻辑失效。
+                create = { session.state.value },
+            )
             session.updateMetadata(update, persist)
         }
     }
@@ -4605,7 +4687,19 @@ class ChatService(
         }
 
         val updatedConversation = conversation.copy()
-        updateConversation(conversationId, updatedConversation)
+        // v323：3.1 的 ConversationSession.update 会 check(isInitialized)，而自动压缩分支
+        // 这类「刚 insert 的新会话」还没被加载 —— 旧写法在这里必抛 "is not loaded yet"，
+        // 用户看到的就是「自动压缩失败，已在原对话中继续」。未加载时只落库即可，
+        // 下次打开对话 initialize 会从库里读到。
+        val session = getOrCreateSession(conversationId)
+        if (session.isInitialized) {
+            updateConversation(conversationId, updatedConversation)
+        } else if (updatedConversation.id == conversationId) {
+            // v323：新会话（自动压缩分支等）还没加载时，必须把**内存态**也设成这份内容。
+            // 只写库不更新内存，紧接着 sendMessage 会在一份空会话上生成 ——
+            // 用户看到的就是「新对话里 AI 看不到任何上文」。
+            session.initialize(load = { updatedConversation })
+        }
 
         if (!exists) {
             conversationRepo.insertConversation(updatedConversation)
@@ -4644,7 +4738,7 @@ class ChatService(
         val updated = update(before)
         val after = if (updated.id != conversationId) before else updated
         if (updated.id == conversationId) {
-            session.updateConversation(updated)
+            session.update { updated }
             checkFilesDelete(after, before)
         }
 
@@ -4808,13 +4902,16 @@ class ChatService(
      * 顶多是群面板这次不出现，所以这里 catch 住并如实写日志，绝不上抛。
      */
     private suspend fun carryOverForkSettings(sourceConversationId: Uuid, newConversationId: Uuid) {
-        val current = settingsStore.settingsFlow.first()
-        val updated = settingsAfterFork(current, sourceConversationId, newConversationId)
-        if (updated === current) return
         // 刻意用显式 try/catch 而不是那个「一把兜住所有异常」的写法：它会连 CancellationException
         // 一起吞掉，用户点停止时就不能立刻生效（手册 §7.1 记过这条）。
         try {
-            settingsStore.update(updated)
+            // v1007：改成 update(transform) 在 DataStore 内部读改写。
+            // 旧写法是「先 first() 拿一份，再 update(整份 Settings)」——两步之间若有别的设置写入，
+            // 这次整份回写会把别人刚改的设置盖回去（审查位指出的竞争窗口）。
+            // 纯函数没变化时返回同一实例，persist 只写变化字段，不会多写盘。
+            settingsStore.update { latest ->
+                settingsAfterFork(latest, sourceConversationId, newConversationId)
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -4980,4 +5077,141 @@ class ChatService(
             finishInterruptedPendingTools(conversationId)
         }
     }
+    // ---- v323 合并 3.1.0：官方新增的会话单列更新入口（适配到现有实现） ----
+
+    suspend fun updateTitle(conversationId: Uuid, title: String) {
+        updateConversationState(conversationId) { it.copy(title = title) }
+        conversationRepo.updateTitle(conversationId, title)
+    }
+
+    suspend fun updateConversationSystemPrompt(conversationId: Uuid, systemPrompt: String?) {
+        updateConversationState(conversationId) { it.copy(customSystemPrompt = systemPrompt) }
+        conversationRepo.updateCustomSystemPrompt(conversationId, systemPrompt)
+    }
+
+    suspend fun updateWorkspaceCwd(conversationId: Uuid, workspaceCwd: String?) {
+        updateConversationState(conversationId) { it.copy(workspaceCwd = workspaceCwd) }
+    }
+
+    suspend fun updateDraftConversationFolder(conversationId: Uuid, folderId: Uuid?) {
+        updateConversationState(conversationId) { it.copy(folderId = folderId) }
+        conversationRepo.updateConversationFolderId(conversationId, folderId)
+    }
+
+    suspend fun updateChatSearch(
+        conversationId: Uuid,
+        enableWebSearch: Boolean? = null,
+        builtInSearch: Boolean? = null,
+    ) {
+        val conversation = getConversationFlow(conversationId).value
+        val config = conversation.config
+        if (config != null) {
+            // v323：会话已固定配置 —— 只写 config 四列，下次打开还生效（官方 3.1 语义）。
+            val updated = conversation.copy(
+                config = config.copy(
+                    enableWebSearch = enableWebSearch ?: config.enableWebSearch,
+                    builtInSearch = builtInSearch ?: config.builtInSearch,
+                )
+            )
+            updateConversation(conversationId, updated)
+            conversationRepo.updateConversationConfig(updated)
+            return
+        }
+        // 会话还没固定配置：改助手/模型本身，不要提前 bind config。
+        // 旧实现在这里无条件 bindConfig，导致「新建对话点一下搜索」就把配置固定死，
+        // 之后换模型只写 config、生成路径却读助手 —— 两套口径打架。
+        val settings = settingsStore.awaitLoaded()
+        val assistant = settings.getAssistantOf(conversation)
+        val model = settings.getChatModelOf(conversation)
+        settingsStore.update { latest ->
+            latest.copy(
+                assistants = if (enableWebSearch == null) {
+                    latest.assistants
+                } else {
+                    latest.assistants.map {
+                        if (it.id == assistant.id) it.copy(enableWebSearch = enableWebSearch) else it
+                    }
+                },
+                providers = if (builtInSearch == null || model == null) {
+                    latest.providers
+                } else {
+                    latest.providers.map { provider ->
+                        provider.copyProvider(
+                            models = provider.models.map { candidate ->
+                                if (candidate.id == model.id) {
+                                    candidate.copy(
+                                        tools = if (builtInSearch) {
+                                            candidate.tools + BuiltInTools.Search
+                                        } else {
+                                            candidate.tools - BuiltInTools.Search
+                                        }
+                                    )
+                                } else {
+                                    candidate
+                                }
+                            }
+                        )
+                    }
+                },
+            )
+        }
+    }
+
+    suspend fun updateChatAssistant(conversationId: Uuid, update: (Assistant) -> Assistant) {
+        // v323：官方 3.1 的语义 —— 聊天页对助手的修改，会话持有的字段只改当前会话，
+        // 其余写回助手设置。旧实现只写 settings.assistants、从不写 conversation.config，
+        // 而 3.1 的 getChatModelOf/getAssistantOf 优先读 config：一旦该会话 bind 过
+        // （在对话里切一次联网搜索就会 bind），换模型/换思考档/换 MCP/技能就不会反映到界面。
+        val settings = settingsStore.awaitLoaded()
+        var storedAssistant: Assistant? = null
+        var mergedAssistant: Assistant? = null
+        updateConversationMetadata(
+            conversationId = conversationId,
+            update = { conversation ->
+                val stored = settings.getStoredAssistantOf(conversation)
+                val updated = update(settings.getAssistantOf(conversation))
+                storedAssistant = stored
+                mergedAssistant = updated.withoutConversationFields(conversation, stored)
+                conversation.withAssistantUpdate(updated, settings)
+            },
+            persist = conversationRepo::updateConversationConfig,
+        )
+        val stored = storedAssistant
+        val merged = mergedAssistant
+        if (stored != null && merged != null && merged != stored) {
+            settingsStore.update { latest ->
+                latest.copy(assistants = latest.assistants.map { if (it.id == merged.id) merged else it })
+            }
+        }
+    }
+
+    suspend fun setNodeFavorite(conversationId: Uuid, nodeId: Uuid, favorite: Boolean) {
+        val session = sessionManager.get(conversationId)?.takeIf { it.isInitialized } ?: return
+        session.update { conversation ->
+            conversation.copy(
+                messageNodes = conversation.messageNodes.map { node ->
+                    if (node.id == nodeId) node.copy(isFavorite = favorite) else node
+                }
+            )
+        }
+    }
+
+    suspend fun deleteConversation(conversationId: Uuid) {
+        conversationRepo.getConversationById(conversationId)?.let { conversationRepo.deleteConversation(it) }
+    }
+
+    suspend fun restoreConversation(conversation: Conversation) {
+        conversationRepo.insertConversation(conversation)
+    }
+
+    suspend fun deleteConversationsOfAssistant(assistantId: Uuid) {
+        conversationRepo.getConversationsOfAssistant(assistantId).first().forEach {
+            conversationRepo.deleteConversation(it)
+        }
+    }
+
+    /** v323：官方 Web 路由需要的只读取会话入口。 */
+    suspend fun getConversation(conversationId: Uuid): Conversation? =
+        getConversationFlow(conversationId).value
+
 }

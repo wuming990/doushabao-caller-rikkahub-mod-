@@ -17,11 +17,13 @@ import io.ktor.server.response.respondText
 import io.ktor.server.routing.get
 import io.ktor.server.routing.routing
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import me.rerere.common.http.await
 import me.rerere.rikkahub.R
 import okhttp3.FormBody
@@ -54,35 +56,45 @@ class GeminiOAuthManager(
 
     fun startLogin() {
         val state = randomUrlSafe(32)
-        try {
-            val port = ensureCallbackServer()
-            val redirect = "http://localhost:$port$CALLBACK_PATH"
-            sessions[state] = redirect
-            _status.value = GeminiOAuthStatus.Waiting
+        // v1016：**整段挪出界面线程**。这个函数是被 Compose 的 onClick 直接调用的
+        // （GeminiProviderConfigure 里 `onClick = oauthManager::startLogin`），而
+        // embeddedServer(CIO).start(wait = false) 内部就是 runBlocking —— 已用 javap 在打包实际
+        // 使用的 ktor-server-cio 3.5.2 字节码里确认：CIOApplicationEngine.start(Z) 调
+        // CoroutineUtilsJvmKt.runBlockingBridge，它会阻塞调用线程直到本地服务起来。
+        // 留在界面线程上的结果就是用户报的现象：点登录 → 界面卡住、浏览器也不一定弹出来；
+        // 因为 ensureCallbackServer 带 @Synchronized，再点几次全部排队等锁，越点越死。
+        // 状态先立刻置成 Waiting，按钮按下去就要有反馈，起服务和开浏览器都在后台做。
+        _status.value = GeminiOAuthStatus.Waiting
+        scope.launch(Dispatchers.IO) {
+            try {
+                val port = ensureCallbackServer()
+                val redirect = "http://localhost:$port$CALLBACK_PATH"
+                sessions[state] = redirect
 
-            val authUrl = Uri.parse(AUTHORIZE_URL).buildUpon()
-                .appendQueryParameter("response_type", "code")
-                .appendQueryParameter("client_id", CLIENT_ID)
-                .appendQueryParameter("redirect_uri", redirect)
-                .appendQueryParameter("scope", SCOPES)
-                .appendQueryParameter("state", state)
-                .appendQueryParameter("access_type", "offline")
-                .appendQueryParameter("prompt", "consent")
-                .build()
-            context.startActivity(
-                Intent(Intent.ACTION_VIEW, authUrl).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-            )
-        } catch (error: Throwable) {
-            sessions.remove(state)
-            _status.value = GeminiOAuthStatus.Error(
-                if (error.message == CALLBACK_PORTS_UNAVAILABLE) {
-                    context.getString(R.string.gemini_oauth_ports_unavailable)
-                } else {
-                    error.message ?: "Unable to open the Google sign-in page"
-                }
-            )
+                val authUrl = Uri.parse(AUTHORIZE_URL).buildUpon()
+                    .appendQueryParameter("response_type", "code")
+                    .appendQueryParameter("client_id", CLIENT_ID)
+                    .appendQueryParameter("redirect_uri", redirect)
+                    .appendQueryParameter("scope", SCOPES)
+                    .appendQueryParameter("state", state)
+                    .appendQueryParameter("access_type", "offline")
+                    .appendQueryParameter("prompt", "consent")
+                    .build()
+                context.startActivity(
+                    Intent(Intent.ACTION_VIEW, authUrl).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                )
+            } catch (error: Throwable) {
+                sessions.remove(state)
+                _status.value = GeminiOAuthStatus.Error(
+                    if (error.message == CALLBACK_PORTS_UNAVAILABLE) {
+                        context.getString(R.string.gemini_oauth_ports_unavailable)
+                    } else {
+                        error.message ?: "Unable to open the Google sign-in page"
+                    }
+                )
+            }
         }
     }
 
@@ -155,6 +167,15 @@ class GeminiOAuthManager(
 
     private suspend fun awaitNetworkUnblocked() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        // v1016：加超时兜底，不再无限期等下去。
+        // onBlockedStatusChanged 只在「阻塞状态发生变化」时回调；网络本来就是通的（绝大多数情况）
+        // 时它可能一次都不来。原来这里是无限挂起：浏览器里早就授权成功了，应用却永远停在
+        // 「等待授权」，这就是"点了登录以后一直卡着没反应"的第二种形态。
+        // 等不到也照样往下走：最坏是这次换 token 失败、给出明确错误，比永久卡住好得多。
+        withTimeoutOrNull(NETWORK_UNBLOCK_WAIT_MS) { waitForNetworkUnblocked() }
+    }
+
+    private suspend fun waitForNetworkUnblocked() {
         val connectivityManager = context.getSystemService(ConnectivityManager::class.java)
         suspendCancellableCoroutine { continuation ->
             lateinit var callback: ConnectivityManager.NetworkCallback
@@ -228,6 +249,9 @@ class GeminiOAuthManager(
     companion object {
         private const val TAG = "GeminiOAuthManager"
         private const val CALLBACK_PORTS_UNAVAILABLE = "OAuth callback ports are unavailable"
+
+        /** v1016：等「网络解除阻塞」的最长时间，超时就照样往下走（见 awaitNetworkUnblocked）。 */
+        private const val NETWORK_UNBLOCK_WAIT_MS = 15_000L
 
         // Google's published Antigravity installed-app credentials, in plaintext on purpose.
         // An installed-app OAuth client cannot hold a confidential secret: every copy of

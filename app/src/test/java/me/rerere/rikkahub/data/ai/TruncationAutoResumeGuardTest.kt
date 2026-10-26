@@ -35,6 +35,8 @@ class TruncationAutoResumeGuardTest {
         "app/src/main/java/me/rerere/rikkahub/data/ai/GenerationLoop.kt"
     private val prefsPath =
         "app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt"
+    private val settingsPath =
+        "app/src/main/java/me/rerere/rikkahub/data/datastore/Settings.kt"
     private val settingUiPath =
         "app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPreferencesGeneralPage.kt"
 
@@ -176,7 +178,7 @@ class TruncationAutoResumeGuardTest {
         // v288：思考回灌（把上一段思考当普通文本塞进 user 消息）做不到真正续接思维链——
         // 原生思考模型需要原样回传带签名的 reasoning 块。实测只造成多段思考堆叠与重复打转，
         // 用户拍板整体换掉。这里用反向断言钉住「不许复活」，同时保证测试数不减。
-        val prefs = source(prefsPath)
+        val prefs = source(prefsPath) + "\n" + source(settingsPath) // v323：官方 3.1 把 Settings 字段拆到 Settings.kt，判据改读两个文件（断言内容未改）
         assertTrue(
             "Settings 不该再有思考回灌字段",
             !prefs.contains("val resumeWithPriorThinking")
@@ -215,7 +217,7 @@ class TruncationAutoResumeGuardTest {
 
     @Test
     fun `对话级模型记忆的四件套与接线(v268)`() {
-        val prefs = source(prefsPath)
+        val prefs = source(prefsPath) + "\n" + source(settingsPath) // v323：官方 3.1 把 Settings 字段拆到 Settings.kt，判据改读两个文件（断言内容未改）
         // 数据层
         assertTrue(
             "Settings 缺字段 rememberModelPerConversation",
@@ -290,7 +292,7 @@ class TruncationAutoResumeGuardTest {
         val page = source("app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatPage.kt")
         assertTrue("ChatPage 缺经典压缩接线 onCompressContextClassic", page.contains("onCompressContextClassic = { additionalPrompt, targetTokens, keepRecentMessages ->"))
         // 设置四件套 + 双语文案
-        val prefs = source(prefsPath)
+        val prefs = source(prefsPath) + "\n" + source(settingsPath) // v323：官方 3.1 把 Settings 字段拆到 Settings.kt，判据改读两个文件（断言内容未改）
         assertTrue("Settings 缺字段 compressUseClassicMode", prefs.contains("val compressUseClassicMode: Boolean = false"))
         assertTrue("缺少读映射 compressUseClassicMode = preferences[COMPRESS_USE_CLASSIC_MODE] == true",
             prefs.contains("compressUseClassicMode = preferences[COMPRESS_USE_CLASSIC_MODE] == true"))
@@ -346,7 +348,7 @@ class TruncationAutoResumeGuardTest {
 
     @Test
     fun `设置四件套完整(字段+存取键+读+写)`() {
-        val src = source(prefsPath)
+        val src = source(prefsPath) + "\n" + source(settingsPath) // v323：官方 3.1 把 Settings 字段拆到 Settings.kt，判据改读两个文件（断言内容未改）
         // 字段声明
         assertTrue(
             "Settings 缺字段 truncationAutoResumeMax",
@@ -464,7 +466,7 @@ class TruncationAutoResumeGuardTest {
         assertTrue("注入必须是条件式的（默认零注入）", tools.contains("if (forceReview)"))
         // 无已开启 skill 时零注入（原有早退逻辑必须还在）
         assertTrue("空清单早退逻辑被改坏", tools.contains("if (available.isEmpty()) return emptyList()"))
-        val prefs = source(prefsPath)
+        val prefs = source(prefsPath) + "\n" + source(settingsPath) // v323：官方 3.1 把 Settings 字段拆到 Settings.kt，判据改读两个文件（断言内容未改）
         assertTrue("DisplaySetting 缺默认关闭的字段", prefs.contains("val forceSkillReview: Boolean = false"))
         // 两处调用点都必须接线
         val factory = source("app/src/main/java/me/rerere/rikkahub/data/ai/tools/ChatToolFactory.kt")
@@ -490,7 +492,7 @@ class TruncationAutoResumeGuardTest {
             "只有主对话显式接线；其余路径不传，行为与改前一致",
             service.contains("highlightKeyPoints = settings.displaySetting.highlightKeyPoints"),
         )
-        val prefs = source(prefsPath)
+        val prefs = source(prefsPath) + "\n" + source(settingsPath) // v323：官方 3.1 把 Settings 字段拆到 Settings.kt，判据改读两个文件（断言内容未改）
         assertTrue("DisplaySetting 缺默认关闭的字段", prefs.contains("val highlightKeyPoints: Boolean = false"))
         val ui = source("app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPreferencesUIPage.kt")
         assertTrue("设置页缺开关", ui.contains("setting_display_page_highlight_key_points_title"))
@@ -526,7 +528,7 @@ class TruncationAutoResumeGuardTest {
 
     @Test
     fun `续跑方式的四件套与接线(v288)`() {
-        val prefs = source(prefsPath)
+        val prefs = source(prefsPath) + "\n" + source(settingsPath) // v323：官方 3.1 把 Settings 字段拆到 Settings.kt，判据改读两个文件（断言内容未改）
         assertTrue(
             "缺枚举 ResumeStrategy（两种续跑方式）",
             prefs.contains("enum class ResumeStrategy")

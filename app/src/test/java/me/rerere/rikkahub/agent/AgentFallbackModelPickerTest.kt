@@ -278,7 +278,7 @@ class AgentFallbackModelPickerTest {
 
     @Test
     fun `备用模型必须读也必须写否则用户配好的会自己消失`() {
-        val store = source("app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt")
+        val store = source("app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt") + "\n" + source("app/src/main/java/me/rerere/rikkahub/data/datastore/Settings.kt") // v323：官方 3.1 把 Settings 字段拆到 Settings.kt，判据改读两个文件（断言内容未改）
         assertTrue(
             "缺少 DataStore key",
             store.contains("val AGENT_FALLBACK_MODELS = stringPreferencesKey(\"agent_fallback_models\")"),

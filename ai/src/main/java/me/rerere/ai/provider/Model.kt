@@ -35,7 +35,9 @@ data class Model(
      * null = 用户没填这一项，不参与估算。
      */
     val requestPrice: Double? = null,
-)
+
+    // 上下文窗口大小(token)
+    val contextLength: Int = 1_000_000,)
 
 @Serializable
 enum class ModelType {

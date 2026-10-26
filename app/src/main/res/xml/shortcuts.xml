@@ -23,14 +23,17 @@
             android:action="me.rerere.rikkahub.action.TRANSLATE"
             android:targetClass="me.rerere.rikkahub.RouteActivity" />
     </shortcut>
+    <!-- v1015：这一块原来还是官方 2.5.6 的 image_gen（发 me.rerere.rikkahub.action.IMAGE_GEN），
+         而官方 3.1 的 Manifest 只注册了 MEDIA_CREATION —— 两边对不上，长按图标的快捷方式点了没反应。
+         现按官方 3.1 对齐；camera 那块里的 rikkahubmod:// 仍是我们自己的 scheme，不许跟着官方改。 -->
     <shortcut
-        android:shortcutId="image_gen"
+        android:shortcutId="media_creation"
         android:enabled="true"
-        android:icon="@drawable/ic_image_generation"
-        android:shortcutShortLabel="@string/imggen_page_title"
-        android:shortcutLongLabel="@string/imggen_page_title">
+        android:icon="@drawable/ic_media_creation"
+        android:shortcutShortLabel="@string/shortcut_media_creation"
+        android:shortcutLongLabel="@string/shortcut_media_creation">
         <intent
-            android:action="me.rerere.rikkahub.action.IMAGE_GEN"
+            android:action="me.rerere.rikkahub.action.MEDIA_CREATION"
             android:targetClass="me.rerere.rikkahub.RouteActivity" />
     </shortcut>
 </shortcuts>

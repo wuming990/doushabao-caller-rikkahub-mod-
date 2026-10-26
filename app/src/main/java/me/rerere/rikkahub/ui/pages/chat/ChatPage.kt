@@ -54,8 +54,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.core.content.FileProvider
 import androidx.core.net.toFile
 import androidx.core.net.toUri
-import com.dokar.sonner.ToastType
-import com.dokar.sonner.ToasterState
+import me.rerere.ui.toast.ToastType
+import me.rerere.ui.toast.ToasterState
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
 import kotlinx.coroutines.CoroutineScope
@@ -65,6 +65,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.provider.BuiltInTools
 import me.rerere.ai.provider.Model
@@ -122,6 +123,7 @@ import me.rerere.rikkahub.ui.hooks.ChatInputState
 import me.rerere.rikkahub.ui.hooks.EditStateContent
 import me.rerere.rikkahub.ui.hooks.useEditState
 import me.rerere.rikkahub.utils.ImageUtils
+import me.rerere.rikkahub.utils.HeifImageCompat
 import me.rerere.rikkahub.utils.base64Decode
 import me.rerere.rikkahub.utils.navigateToChatPage
 import me.rerere.workspace.WorkspaceStorageArea
@@ -158,7 +160,10 @@ fun ChatPage(
     val loadingJob by vm.conversationJob.collectAsStateWithLifecycle()
     val processingStatus by vm.processingStatus.collectAsStateWithLifecycle()
     val currentChatModel by vm.currentChatModel.collectAsStateWithLifecycle()
-    val enableWebSearch by vm.enableWebSearch.collectAsStateWithLifecycle()
+    // v323：会话视角助手（官方 3.1 口径），搜索开关等会话配置以它为准
+    val assistant by vm.assistant.collectAsStateWithLifecycle()
+    // v323：搜索开关改成对话级配置（官方 3.1 的会话模型）
+    val enableWebSearch = conversation.config?.enableWebSearch ?: assistant.enableWebSearch
     val errors by vm.errors.collectAsStateWithLifecycle()
 
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
@@ -340,8 +345,11 @@ private fun ChatPageContent(
     val appScope: AppScope = koinInject()
     var previewMode by rememberSaveable { mutableStateOf(false) }
     val hazeState = rememberHazeState()
-    val assistant = setting.getCurrentAssistant()
-    var showFilesSheet by remember { mutableStateOf(false) }
+    // v323：官方 3.1 的会话视角助手 —— 模型/思考档/MCP/技能以会话配置为准。
+    // 旧写法 setting.getCurrentAssistant() 是「全局当前助手」，bind 过 config 的会话里
+    // 改一次思考档就会把会话选好的模型/MCP/技能覆盖成助手默认值。
+    val assistant by vm.assistant.collectAsStateWithLifecycle()
+        var showFilesSheet by remember { mutableStateOf(false) }
     // v213：圆桌座位状态；控制面板据此显示每个位置由谁负责、跑到哪一步
     val roundTableRun by vm.roundTableRun.collectAsStateWithLifecycle()
     // v313：群讨论状态（与圆桌并列、互不引用）
@@ -425,6 +433,9 @@ private fun ChatPageContent(
                 TopBar(
                     settings = setting,
                     conversation = conversation,
+                    // v323：会话视角（否则切完模型顶栏还显示旧模型）
+                    assistant = assistant,
+                    currentChatModel = currentChatModel,
                     // v297：本对话 token 累计（顶栏小字，可在设置里关掉）
                     tokenStats = vm.conversationTokenStats.collectAsStateWithLifecycle().value,
                     // v301：按自填单价估算的花费（没填过价时为 null，弹窗里整行不出现）
@@ -559,181 +570,129 @@ private fun ChatPageContent(
                         // 走设置 JSON，不动数据库（AppDatabase 必须停在 25）。
                         collapsed = setting.displaySetting.groupPanelCollapsed,
                         onToggleCollapsed = {
-                            vm.updateSettings(
+                            vm.updateSettings { 
                                 setting.copy(
                                     displaySetting = setting.displaySetting.copy(
                                         groupPanelCollapsed = !setting.displaySetting.groupPanelCollapsed
                                     )
                                 )
-                            )
+                             }
                         },
                     )
                     ChatInput(
-                    onStartVoiceMode = if (
-                        setting.getSelectedASRProvider()?.supportsServerVadVoiceMode == true &&
-                        voiceState.phase == VoicePhase.Off
-                    ) {
-                        {
-                            showFilesSheet = false
-                            focusManager.clearFocus(force = true)
-                            keyboardController?.hide()
-                            startVoiceMode()
-                        }
-                    } else null,
-                    voiceState = voiceState,
-                    onStopVoiceMode = vm.voiceSession::stop,
-                    // v314：群面板「我要插话」按钮点了就把光标送进输入框
-                    focusRequestSignal = groupInterjectSignal,
-                    messageQueue = messageQueue,
-                    onRemoveQueuedMessage = vm::removeQueuedMessage,
-                    onBeginEditQueuedMessage = vm::beginEditQueuedMessage,
-                    onFinishEditQueuedMessage = vm::finishEditQueuedMessage,
-                    onResumeMessageQueue = vm::resumeMessageQueue,
-                    state = inputState,
-                    loading = loadingJob != null,
-                    settings = setting,
-                    hazeState = hazeState,
-                    completionProviders = completionProviders,
-                    contextUsage = contextUsage,
-                    onCancelClick = {
-                        vm.stopGeneration()
-                    },
-                    enableSearch = enableWebSearch,
-                    onAddMoreAttachment = {
-                        showFilesSheet = true
-                    },
-                    onRetryPendingAttachment = { uriString ->
-                        retryAttachCopy(
-                            uriString = uriString,
-                            scope = appScope,
-                            filesManager = filesManager,
-                            inputState = inputState,
-                            toaster = toaster,
-                        )
-                    },
-                    onRemovePendingAttachment = { uriString ->
-                        inputState.removePending(uriString)
-                    },
-                    onUpdateSearchMode = { mode ->
-                        val current = setting.getCurrentAssistant()
-                        val model = setting.getCurrentChatModel()
-                        vm.updateSettings(
-                            setting.copy(
-                                assistants = setting.assistants.map { assistant ->
-                                    if (assistant.id == current.id) {
-                                        assistant.copy(enableWebSearch = mode == SearchMode.LOCAL)
-                                    } else {
-                                        assistant
-                                    }
-                                },
-                                providers = if (model == null) {
-                                    setting.providers
-                                } else {
-                                    setting.providers.map { provider ->
-                                        provider.editModel(
-                                            model.copy(
-                                                tools = if (mode == SearchMode.BUILT_IN) {
-                                                    model.tools + BuiltInTools.Search
-                                                } else {
-                                                    model.tools - BuiltInTools.Search
-                                                }
-                                            )
-                                        )
-                                    }
-                                },
-                            )
-                        )
-                    },
-                    onSendClick = {
-                        if (currentChatModel == null) {
-                            toaster.show("请先选择模型", type = ToastType.Error)
-                            return@ChatInput
-                        }
-                        // v255：附件还在处理中 / 有失败附件时不让发送
-                        if (inputState.hasPendingProcessing()) {
-                            toaster.show("附件还在准备中，请稍候", type = ToastType.Warning)
-                            return@ChatInput
-                        }
-                        if (inputState.hasFailedPending()) {
-                            toaster.show("有附件处理失败，请点红色附件重试或移除", type = ToastType.Warning)
-                            return@ChatInput
-                        }
-                        if (inputState.isEditing()) {
-                            vm.handleMessageEdit(
-                                parts = inputState.getContents(),
-                                messageId = inputState.editingMessage!!,
-                            )
-                        } else {
-                            val contents = inputState.getContents()
-                            if (vm.shouldAutoCompressBeforeSend()) {
-                                scope.launch {
-                                    toaster.show(
-                                        context.getString(R.string.chat_page_auto_compress_branching),
-                                        type = ToastType.Info,
-                                    )
-                                    runCatching {
-                                        val fork = vm.autoCompressForkForSend()
-                                        navigateToChatPage(navController, chatId = fork.id)
-                                        vm.sendMessageToConversation(fork.id, contents)
-                                    }.onFailure {
-                                        toaster.show(
-                                            context.getString(R.string.chat_page_auto_compress_failed_fallback),
-                                            type = ToastType.Warning,
-                                        )
-                                        vm.handleMessageSend(contents)
-                                    }
-                                    chatListState.requestScrollToItem(conversation.currentMessages.size + 5)
-                                }
+                        onStartVoiceMode = if (
+                            setting.getSelectedASRProvider()?.supportsServerVadVoiceMode == true &&
+                            voiceState.phase == VoicePhase.Off
+                        ) {
+                            {
+                                showFilesSheet = false
+                                focusManager.clearFocus(force = true)
+                                keyboardController?.hide()
+                                startVoiceMode()
+                            }
+                        } else null,
+                        voiceState = voiceState,
+                        onStopVoiceMode = vm.voiceSession::stop,
+                        // v314：群面板「我要插话」按钮点了就把光标送进输入框
+                        focusRequestSignal = groupInterjectSignal,
+                        messageQueue = messageQueue,
+                        onRemoveQueuedMessage = vm::removeQueuedMessage,
+                        onBeginEditQueuedMessage = vm::beginEditQueuedMessage,
+                        onFinishEditQueuedMessage = vm::finishEditQueuedMessage,
+                        onResumeMessageQueue = vm::resumeMessageQueue,
+                        state = inputState,
+                        loading = loadingJob != null,
+                        settings = setting,
+                        assistant = assistant,
+                        chatModel = currentChatModel,
+                        hazeState = hazeState,
+                        completionProviders = completionProviders,
+                        contextUsage = contextUsage,
+                        onCancelClick = { vm.stopGeneration() },
+                        onSendClick = {
+                            if (currentChatModel == null) {
+                                toaster.show("请先选择模型", type = ToastType.Error)
+                                return@ChatInput
+                            }
+                            // v255/v323：附件还在处理中 / 有失败附件时不让发送。
+                            // 官方 3.1 重做聊天页时丢了这个拦截，附件还在复制就能点发送。
+                            if (inputState.hasPendingProcessing()) {
+                                toaster.show("附件还在准备中，请稍候", type = ToastType.Warning)
+                                return@ChatInput
+                            }
+                            if (inputState.hasFailedPending()) {
+                                toaster.show("有附件处理失败，请点红色附件重试或移除", type = ToastType.Warning)
+                                return@ChatInput
+                            }
+                            if (inputState.isEditing()) {
+                                vm.handleMessageEdit(
+                                    parts = inputState.getContents(),
+                                    messageId = inputState.editingMessage!!,
+                                )
                             } else {
-                                vm.handleMessageSend(contents)
+                                val contents = inputState.getContents()
+                                // v268/v323：发送前「自动压缩分叉」。官方 3.1 重做聊天页时
+                                // 把这段覆盖掉了，ChatVM 里的两个函数变成死代码 —— 用户的
+                                // 自动压缩设置看起来还在，实际从不生效。
+                                if (vm.shouldAutoCompressBeforeSend()) {
+                                    scope.launch {
+                                        toaster.show(
+                                            context.getString(R.string.chat_page_auto_compress_branching),
+                                            type = ToastType.Info,
+                                        )
+                                        runCatching {
+                                            val fork = vm.autoCompressForkForSend()
+                                            navigateToChatPage(navController, chatId = fork.id)
+                                            vm.sendMessageToConversation(fork.id, contents)
+                                        }.onFailure {
+                                            toaster.show(
+                                                context.getString(R.string.chat_page_auto_compress_failed_fallback),
+                                                type = ToastType.Warning,
+                                            )
+                                            vm.handleMessageSend(contents)
+                                        }
+                                        chatListState.requestScrollToItem(conversation.currentMessages.size + 5)
+                                    }
+                                } else {
+                                    vm.handleMessageSend(contents)
+                                    scope.launch {
+                                        delay(100.milliseconds)
+                                        chatListState.requestScrollToItem(conversation.currentMessages.size + 5)
+                                    }
+                                }
+                            }
+                            inputState.clearInput()
+                        },
+                        onLongSendClick = {
+                            if (inputState.isEditing()) {
+                                vm.handleMessageEdit(
+                                    parts = inputState.getContents(),
+                                    messageId = inputState.editingMessage!!,
+                                )
+                            } else {
+                                vm.handleMessageSend(content = inputState.getContents(), answer = false)
                                 scope.launch {
-                                    delay(100.milliseconds)
                                     chatListState.requestScrollToItem(conversation.currentMessages.size + 5)
                                 }
                             }
-                        }
-                        inputState.clearInput()
-                    },
-                    onLongSendClick = {
-                        if (inputState.isEditing()) {
-                            vm.handleMessageEdit(
-                                parts = inputState.getContents(),
-                                messageId = inputState.editingMessage!!,
+                            inputState.clearInput()
+                        },
+                        onUpdateChatModel = vm::setChatModel,
+                        onUpdateAssistant = vm::updateAssistant,
+                        onMoreClick = { showFilesSheet = true },
+                        onAddMoreAttachment = { showFilesSheet = true },
+                        onRetryPendingAttachment = { uriString ->
+                            retryAttachCopy(
+                                uriString = uriString,
+                                scope = appScope,
+                                filesManager = filesManager,
+                                inputState = inputState,
+                                toaster = toaster,
                             )
-                        } else {
-                            vm.handleMessageSend(content = inputState.getContents(), answer = false)
-                            scope.launch {
-                                chatListState.requestScrollToItem(conversation.currentMessages.size + 5)
-                            }
-                        }
-                        inputState.clearInput()
-                    },
-                    onUpdateChatModel = {
-                        vm.setChatModel(assistant = setting.getCurrentAssistant(), model = it)
-                    },
-                    onUpdateAssistant = {
-                        vm.updateSettings(
-                            setting.copy(
-                                assistants = setting.assistants.map { assistant ->
-                                    if (assistant.id == it.id) {
-                                        it
-                                    } else {
-                                        assistant
-                                    }
-                                }
-                            )
-                        )
-                    },
-                    onUpdateSearchService = { index ->
-                        vm.updateSettings(
-                            setting.copy(
-                                searchServiceSelected = index
-                            )
-                        )
-                    },
-                    onMoreClick = {
-                        showFilesSheet = true
-                    },
+                        },
+                        onRemovePendingAttachment = { uriString ->
+                            inputState.removePending(uriString)
+                        },
                     )
                 }
             },
@@ -849,7 +808,7 @@ private fun ChatPageContent(
                 // 不是 groupChatConfigs（所以它不受「彻底删除群配置」影响）。
                 cleanContext = setting.groupChatCleanContext,
                 onCleanContextChange = { on ->
-                    vm.updateSettings(setting.copy(groupChatCleanContext = on))
+                    vm.updateSettings { setting.copy(groupChatCleanContext = on) }
                 },
                 // v319：设置里也能点名 —— 当场生效，不必先保存、再关窗、再点继续。
                 // 提示口径与面板上那条点名条完全一致（审查位 v319 抓的 P1：不许静默）。
@@ -1277,15 +1236,11 @@ private fun ChatFilesPickerSheet(
 
     var cameraOutputUri by remember { mutableStateOf<Uri?>(null) }
     var cameraOutputFile by remember { mutableStateOf<File?>(null) }
-    val (_, launchCameraCrop) = useCropLauncher(
+    // v1017: official 3.1.1 crop launcher manages the cropped output and cleanup internally.
+    val launchCameraCrop = useCropLauncher(
         onCroppedImageReady = { croppedUri ->
             inputState.addImages(filesManager.createChatFilesByContents(listOf(croppedUri)))
             dismissAll()
-        },
-        onCleanup = {
-            cameraOutputFile?.delete()
-            cameraOutputFile = null
-            cameraOutputUri = null
         }
     )
     val cameraLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { captureSuccessful ->
@@ -1318,14 +1273,11 @@ private fun ChatFilesPickerSheet(
     }
 
     var preCropTempFile by remember { mutableStateOf<File?>(null) }
-    val (_, launchImageCrop) = useCropLauncher(
+    // v1017: official 3.1.1 crop launcher manages the picked image itself.
+    val launchImageCrop = useCropLauncher(
         onCroppedImageReady = { croppedUri ->
             attachPickedImages(listOf(croppedUri))
             dismissAll()
-        },
-        onCleanup = {
-            preCropTempFile?.delete()
-            preCropTempFile = null
         }
     )
     val imagePickerLauncher =
@@ -1339,9 +1291,9 @@ private fun ChatFilesPickerSheet(
                     val tempFile = File(context.appTempFolder, "pick_temp_${System.currentTimeMillis()}.jpg")
                     runCatching {
                         val source = selectedUris.first()
-                        // HEIF/HEIC（尤其 HDR HEIF）交给 UCrop 前先解码转为 JPEG，规避裁剪解码失败
-                        val converted = ImageUtils.isHeifImage(context, source) &&
-                            ImageUtils.convertHeifToJpeg(context, source, tempFile)
+                        // HEIF/HEIC（尤其 HDR HEIF）进裁剪器前先解码转为 JPEG，规避裁剪解码失败（v1017：官方删了 ImageUtils 里的这两个函数，改用 HeifImageCompat）
+                        val converted = HeifImageCompat.isHeifImage(context, source) &&
+                            HeifImageCompat.convertHeifToJpeg(context, source, tempFile)
                         if (!converted) {
                             context.contentResolver.openInputStream(source)?.use { input ->
                                 tempFile.outputStream().use { output -> input.copyTo(output) }
@@ -1389,7 +1341,27 @@ private fun ChatFilesPickerSheet(
         sheetState = filesSheetState,
         onDismissRequest = { dismissAll() },
     ) {
+        // v1017 合并官方 3.1.1：联网搜索入口从输入框迁到「+」面板。
+        // 文案必须在 Composable 作用域取（stringResource 不能在普通回调里调），
+        // 再把这两个字符串交给回调里的 toast 用。
+        val webSearchOnMsg = stringResource(R.string.web_search_enabled)
+        val webSearchOffMsg = stringResource(R.string.web_search_disabled)
         FilesPicker(
+            onUpdateSearchMode = { mode ->
+                vm.updateSearch(
+                    enableWebSearch = mode == SearchMode.LOCAL,
+                    builtInSearch = mode == SearchMode.BUILT_IN,
+                )
+                val enabled = mode != SearchMode.OFF
+                toaster.show(
+                    message = if (enabled) webSearchOnMsg else webSearchOffMsg,
+                    duration = 1.seconds,
+                    type = if (enabled) ToastType.Success else ToastType.Normal,
+                )
+            },
+            onUpdateSearchService = { index ->
+                vm.updateSettings { it.copy(searchServiceSelected = index) }
+            },
             conversation = conversation,
             state = inputState,
             assistant = assistant,
@@ -1401,20 +1373,12 @@ private fun ChatFilesPickerSheet(
             onCompressContextClassic = { additionalPrompt, targetTokens, keepRecentMessages ->
                 vm.handleCompressContextClassic(additionalPrompt, targetTokens, keepRecentMessages)
             },
-            onUpdateAssistant = {
-                vm.updateSettings(
-                    setting.copy(
-                        assistants = setting.assistants.map { assistant ->
-                            if (assistant.id == it.id) {
-                                it
-                            } else {
-                                assistant
-                            }
-                        }
-                    )
-                )
-            },
-            onUpdateSettings = { vm.updateSettings(it) },
+            // v323：必须走 VM（ChatService.updateChatAssistant → withoutConversationFields 剥掉会话字段）。
+            // 旧写法直接把「会话视角助手」整份写回 settings.assistants：以前 assistant 是全局助手
+            // 所以无害，改成会话视角后，在 + 面板里改工作区/MCP/技能就会污染该助手的全局默认值，
+            // 影响其它对话与新建对话（审查位抓，本轮引入的 P0）。
+            onUpdateAssistant = vm::updateAssistant,
+            onUpdateSettings = { updated -> vm.updateSettings { updated } },
             onUpdateConversation = {
                 vm.updateConversation(it)
                 vm.saveConversationAsync()
@@ -1490,6 +1454,9 @@ private fun ChatFilesPickerSheet(
 private fun TopBar(
     settings: Settings,
     conversation: Conversation,
+    // v323：会话视角的助手与模型（官方 3.1 口径，顶栏与实际请求必须一致）
+    assistant: Assistant,
+    currentChatModel: Model?,
     // v297：本对话 token 累计（点开展示口径说明；开关关闭时整行不渲染）
     tokenStats: ConversationTokenStats = ConversationTokenStats(),
     // v301：花费估算（用户自己填的单价算出来的）
@@ -1542,18 +1509,19 @@ private fun TopBar(
                 color = Color.Transparent,
             ) {
                 Column {
-                    val assistant = settings.getCurrentAssistant()
-                    val model = settings.getCurrentChatModel()
-                    val provider = model?.findProvider(providers = settings.providers, checkOverwrite = false)
+                    // v323：顶栏必须用会话视角（与 vm.assistant / currentChatModel 同源）。
+                    // 旧写法读 settings.getCurrentAssistant()/getCurrentChatModel()，
+                    // 在 bind 过 config 的会话里切完模型，顶栏还显示旧模型。
+                    val provider = currentChatModel?.findProvider(providers = settings.providers, checkOverwrite = false)
                     Text(
                         text = conversation.title.ifBlank { stringResource(R.string.chat_page_new_chat) },
                         maxLines = 1,
                         style = MaterialTheme.typography.bodyMedium,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    if (model != null && provider != null) {
+                    if (currentChatModel != null && provider != null) {
                         Text(
-                            text = "${assistant.name.ifBlank { stringResource(R.string.assistant_page_default_assistant) }} / ${model.displayName} (${provider.name})",
+                            text = "${assistant.name.ifBlank { stringResource(R.string.assistant_page_default_assistant) }} / ${currentChatModel.displayName} (${provider.name})",
                             overflow = TextOverflow.Ellipsis,
                             maxLines = 1,
                             color = LocalContentColor.current.copy(0.65f),

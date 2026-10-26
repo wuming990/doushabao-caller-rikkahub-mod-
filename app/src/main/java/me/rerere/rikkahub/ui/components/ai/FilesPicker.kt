@@ -128,12 +128,14 @@ internal fun FilesPicker(
     mcpManager: McpManager,
     onCompressContext: (additionalPrompt: String, modelSource: CompressionModelSource, customPrompt: String) -> Job,
     // v268：经典压缩（官方旧版流程）入口
-    onCompressContextClassic: (additionalPrompt: String, targetTokens: Int, keepRecentMessages: Int) -> Job,
+    onCompressContextClassic: (additionalPrompt: String, targetTokens: Int, keepRecentMessages: Int) -> Job = { _, _, _ -> Job() },
     onUpdateAssistant: (Assistant) -> Unit,
-    onUpdateSettings: (Settings) -> Unit,
-    onUpdateConversation: (Conversation) -> Unit,
-    showInjectionSheet: Boolean,
-    onShowInjectionSheetChange: (Boolean) -> Unit,
+    // v323：3.1 的聊天页会传这个回调；我们的工作区切换仍走 onUpdateConversation
+    onUpdateWorkspaceCwd: (String?) -> Unit = {},
+    onUpdateSettings: (Settings) -> Unit = {},
+    onUpdateConversation: (Conversation) -> Unit = {},
+    showInjectionSheet: Boolean = false,
+    onShowInjectionSheetChange: (Boolean) -> Unit = {},
     showCompressDialog: Boolean,
     onShowCompressDialogChange: (Boolean) -> Unit,
     onDismiss: () -> Unit,
@@ -148,6 +150,9 @@ internal fun FilesPicker(
     onSummarizeRoundTable: () -> Unit = {},
     // v313：讨论群组入口。只负责打开设置弹窗，建群与开跑都在弹窗外完成
     onOpenGroupSettings: () -> Unit = {},
+    // v1017 合并官方 3.1.1：联网搜索入口迁到本面板，回调由 ChatPage 传入
+    onUpdateSearchMode: (SearchMode) -> Unit = {},
+    onUpdateSearchService: (Int) -> Unit = {},
     onStartVoiceMode: (() -> Unit)? = null,
 ) {
     val settings = LocalSettings.current
@@ -212,6 +217,7 @@ internal fun FilesPicker(
                 conversation = conversation,
                 workspaces = workspaces,
                 onUpdateAssistant = onUpdateAssistant,
+                // v323：官方 3.1 重做 + 面板时漏传了这个回调，导致「清除工作目录」点了没反应
                 onUpdateConversation = onUpdateConversation,
                 onNavigateToDetail = { id ->
                     onDismiss()
@@ -229,12 +235,65 @@ internal fun FilesPicker(
         }
 
         if (settings.mcpServers.isNotEmpty()) {
+            // v323：官方 3.1 把 MCP 快捷入口改成了独立页面（FilesPickerPage.MCP），
+            // 合并时整块被删掉了。我们的 + 面板还是 v322 的平铺结构，这里用弹层接同一份
+            // McpPicker，保住入口（不是新功能，是恢复被覆盖的旧功能）。
+            var showMcpSheet by remember { mutableStateOf(false) }
             McpPickerListItem(
                 assistant = assistant,
                 servers = settings.mcpServers,
                 mcpManager = mcpManager,
-                onUpdateAssistant = onUpdateAssistant,
+                shapes = ListItemDefaults.segmentedShapes(index = 0, count = 1),
+                onClick = { showMcpSheet = true },
             )
+            if (showMcpSheet) {
+                ModalBottomSheet(onDismissRequest = { showMcpSheet = false }) {
+                    McpPicker(
+                        assistant = assistant,
+                        servers = settings.mcpServers,
+                        onUpdateAssistant = onUpdateAssistant,
+                    )
+                }
+            }
+        }
+
+        // v1017 合并官方 3.1.1：联网搜索入口。官方把这颗按钮从输入框那排迁进了「+」面板，
+        // 我们沿用 v323 给 MCP 入口的「行 + 弹层」模式接住，功能不丢、位置随官方。
+        var showSearchSheet by remember { mutableStateOf(false) }
+        var searchSheetProviderPage by remember { mutableStateOf(false) }
+        SearchPickerListItem(
+            enableSearch = assistant.enableWebSearch,
+            settings = settings,
+            model = currentChatModel,
+            shapes = ListItemDefaults.segmentedShapes(index = 0, count = 1),
+            onClick = {
+                searchSheetProviderPage = false
+                showSearchSheet = true
+            },
+        )
+        if (showSearchSheet) {
+            ModalBottomSheet(onDismissRequest = { showSearchSheet = false }) {
+                if (searchSheetProviderPage) {
+                    SearchProviderPicker(
+                        settings = settings,
+                        onUpdateSearchService = { index ->
+                            onUpdateSearchService(index)
+                            searchSheetProviderPage = false
+                        },
+                        onBack = { searchSheetProviderPage = false },
+                    )
+                } else {
+                    SearchPickerPage(
+                        enableSearch = assistant.enableWebSearch,
+                        settings = settings,
+                        model = currentChatModel,
+                        onUpdateSearchMode = onUpdateSearchMode,
+                        onSelectProvider = { searchSheetProviderPage = true },
+                        onBack = { showSearchSheet = false },
+                        onDismissAll = { showSearchSheet = false },
+                    )
+                }
+            }
         }
 
         // Extensions (Quick Messages + Prompt Injections + Skills)
@@ -1796,6 +1855,7 @@ internal fun FilesPicker(
             if (showCwdSheet) {
                 WorkspaceCwdPickerSheet(
                     workspaceId = boundWorkspace.id,
+                    workspaceDir = boundWorkspace.workspaceDir(),
                     currentCwd = conversation.workspaceCwd,
                     onSelectCwd = { newCwd ->
                         onUpdateConversation(conversation.copy(workspaceCwd = newCwd))
@@ -1945,7 +2005,7 @@ private fun WorkspacePickerListItem(
     conversation: Conversation,
     workspaces: List<WorkspaceEntity>,
     onUpdateAssistant: (Assistant) -> Unit,
-    onUpdateConversation: (Conversation) -> Unit,
+    onUpdateConversation: (Conversation) -> Unit = {},
     onNavigateToDetail: (String) -> Unit,
     onNavigateToTerminal: (String) -> Unit,
     onNavigateToManage: () -> Unit,
@@ -2032,7 +2092,7 @@ private fun InjectionQuickConfigSheet(
     settings: Settings,
     currentModelId: Uuid?,
     onUpdateAssistant: (Assistant) -> Unit,
-    onUpdateConversation: (Conversation) -> Unit,
+    onUpdateConversation: (Conversation) -> Unit = {},
     onDismiss: () -> Unit,
     onDismissAll: () -> Unit,
 ) {
@@ -2053,8 +2113,10 @@ private fun InjectionQuickConfigSheet(
                 assistant = assistant,
                 settings = settings,
                 onUpdate = onUpdateAssistant,
+                // v323：对话级提示词注入需要这两个参数（官方 3.1 重做 + 面板时漏传）
                 conversation = conversation,
                 onUpdateConversation = onUpdateConversation,
+                // v323：这个参数原本就是死参数，导致「按模型自动生效」的注入显示成普通开关
                 currentModelId = currentModelId,
                 modifier = Modifier.weight(1f),
                 onNavigateToQuickMessages = {

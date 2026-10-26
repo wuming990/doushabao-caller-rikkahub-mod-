@@ -610,7 +610,7 @@ class AgentV245IdleTruthTest {
 
     @Test
     fun `工具上限设置项必须五环节齐全`() {
-        val store = source("app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt")
+        val store = source("app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt") + "\n" + source("app/src/main/java/me/rerere/rikkahub/data/datastore/Settings.kt") // v323：官方 3.1 把 Settings 字段拆到 Settings.kt，判据改读两个文件（断言内容未改）
         listOf(
             "val AGENT_TOOL_TIMEOUT = intPreferencesKey(\"agent_tool_timeout_minutes\")",
             "agentToolTimeoutMinutes = (preferences[AGENT_TOOL_TIMEOUT] ?: 10).coerceIn(1, 60)",

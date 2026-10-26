@@ -389,11 +389,14 @@ private fun HtmlParagraphContent(
 @Composable
 private fun HtmlHeading(element: Element, onClickCitation: (String) -> Unit) {
     val level = element.tagName().removePrefix("h").toIntOrNull() ?: 1
-    val headingStyle = HeaderStyle.fromLevel(
-        level = level,
-        fontSizeRatio = LocalSettings.current.displaySetting.fontSizeRatio,
-    )
-    val verticalPadding = HeaderStyle.verticalPadding(level)
+    // v323：3.1 删掉了旧的 HeaderStyle 工具，这里用 Material 排版按级别取
+    val headingStyle = when (level) {
+        1 -> MaterialTheme.typography.headlineSmall
+        2 -> MaterialTheme.typography.titleLarge
+        3 -> MaterialTheme.typography.titleMedium
+        else -> MaterialTheme.typography.titleSmall
+    }
+    val verticalPadding = 4.dp
     ProvideTextStyle(LocalTextStyle.current.merge(headingStyle)) {
         Box(modifier = Modifier.padding(vertical = verticalPadding)) {
             HtmlParagraph(element = element, onClickCitation = onClickCitation)

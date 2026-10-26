@@ -39,10 +39,15 @@ class ClaudePromptCacheRequestTest {
             ProviderSetting.Claude::class.java,
             List::class.java,
             TextGenerationParams::class.java,
-            Boolean::class.javaPrimitiveType!!
+            Boolean::class.javaPrimitiveType!!,
+            // v1013：第 5 个参数从「第几格」换成了 ClaudeRequestFlags。反射签名必须跟着改，
+            // 否则 NoSuchMethodException —— 这已经是第二次踩（v1010 是 buildMessages）。
+            ClaudeRequestFlags::class.java,
         )
         method.isAccessible = true
-        return method.invoke(provider, providerSetting, messages, params, stream) as JsonObject
+        return method.invoke(
+            provider, providerSetting, messages, params, stream, ClaudeRequestFlags(),
+        ) as JsonObject
     }
 
     private fun dummyTool(): Tool {

@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.ContainedLoadingIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
@@ -34,6 +35,7 @@ import me.rerere.rikkahub.R
 import me.rerere.rikkahub.service.CompressionModelSource
 import me.rerere.rikkahub.ui.components.ui.OutlinedNumberInput
 import me.rerere.rikkahub.ui.components.ui.RabbitLoadingIndicator
+import me.rerere.ui.components.OutlinedNumberInput
 
 /**
  * 手动压缩对话框（v268 起双模式）。
@@ -94,7 +96,7 @@ fun CompressContextDialog(
                         horizontalArrangement = Arrangement.Center,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        RabbitLoadingIndicator(
+                        ContainedLoadingIndicator(
                             modifier = Modifier.size(32.dp)
                         )
                         Spacer(modifier = Modifier.width(12.dp))
@@ -146,7 +148,7 @@ fun CompressContextDialog(
                                 }
                             }
                         }
-                        OutlinedNumberInput(
+                        me.rerere.ui.components.OutlinedNumberInput(
                             value = keepRecentMessages,
                             onValueChange = { keepRecentMessages = it },
                             label = stringResource(R.string.chat_page_compress_keep_recent),

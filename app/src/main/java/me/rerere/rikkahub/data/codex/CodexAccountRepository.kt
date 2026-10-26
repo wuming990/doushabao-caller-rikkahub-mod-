@@ -1,5 +1,6 @@
 package me.rerere.rikkahub.data.codex
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -91,7 +92,15 @@ class CodexAccountRepository internal constructor(
             val candidate = state.accounts[index]
             if (!candidate.isAvailable()) return@repeat
             updateState(state.copy(nextAccountIndex = (index + 1) % state.accounts.size))
-            val fresh = runCatching { ensureFreshLocked(candidate) }.getOrNull() ?: return@repeat
+            val fresh = try {
+                ensureFreshLocked(candidate)
+            } catch (e: CancellationException) {
+                // v1009 审查位要求：这里不能吞取消 —— 用户点停止时要立刻停，
+                // 不许被当成「这个号刷新失败，换下一个」继续跑。
+                throw e
+            } catch (_: Exception) {
+                return@repeat
+            }
             return fresh
         }
         error("No available Codex account")
@@ -125,9 +134,29 @@ class CodexAccountRepository internal constructor(
         fetchUsageLocked(fresh)
     }
 
+    /**
+     * v1009：**只换票，不抓用量** —— 给 401 重试用。
+     *
+     * 为什么不能直接用 [refreshAccount]：它 = 换票 + 抓用量，用量接口任何非 2xx 都会抛；
+     * 调用方（官方通道的 authenticator）会把异常当成「刷新失败」，退回旧票重试，
+     * 于是「票其实已经换好了」却被丢掉，用户看到的就是一次白重试。
+     */
+    suspend fun refreshToken(accountId: String): CodexAccount = mutex.withLock {
+        val account = state.accounts.firstOrNull { it.id == accountId }
+            ?: error("Codex account not found")
+        ensureFreshLocked(account, force = true)
+    }
+
     suspend fun refreshAll() {
         accounts.value.forEach { account ->
-            runCatching { refreshAccount(account.id) }
+            // v1009：取消原样上抛（runCatching 会把 CancellationException 一起吞掉）
+            try {
+                refreshAccount(account.id)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // 单个账号刷新失败不影响其它账号，也不该让整个刷新报错
+            }
         }
     }
 

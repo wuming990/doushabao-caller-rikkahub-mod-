@@ -36,9 +36,11 @@ import me.rerere.ai.provider.Model
 import me.rerere.ai.provider.ModelAbility
 import me.rerere.ai.provider.ModelType
 import me.rerere.ai.provider.Provider
+import me.rerere.ai.provider.ProviderQuota
 import me.rerere.ai.provider.ProviderSetting
 import me.rerere.ai.provider.TextGenerationResult
 import me.rerere.ai.provider.TextGenerationParams
+import me.rerere.ai.provider.runQuotaQuery
 import me.rerere.ai.provider.providers.PartGroup
 import me.rerere.ai.provider.providers.google.vertex.ServiceAccountTokenProvider
 import me.rerere.ai.provider.providers.groupPartsByToolBoundary
@@ -68,6 +70,7 @@ import me.rerere.ai.util.stringSafe
 import me.rerere.ai.util.mergeCustomHeaders
 import me.rerere.common.http.await
 import me.rerere.common.http.jsonPrimitiveOrNull
+import me.rerere.common.http.sse.newEventSource
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
@@ -77,7 +80,6 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
-import okhttp3.sse.EventSources
 import org.apache.commons.text.StringEscapeUtils
 import kotlin.time.Clock
 import kotlin.uuid.Uuid
@@ -109,6 +111,11 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
         ServiceAccountTokenProvider(client)
     }
     private val interactionsAPI = InteractionsAPI(client = client, keyRoulette = keyRoulette)
+
+    override suspend fun getQuota(providerSetting: ProviderSetting.Google): ProviderQuota? =
+        client.runQuotaQuery(providerSetting) {
+            keyRoulette.next(providerSetting.apiKey, providerSetting.id.toString())
+        }
 
     // Interactions API 目前只有 Gemini Developer API 提供，Vertex AI 仍走 generateContent
     private fun ProviderSetting.Google.usesInteractionsApi() = useInteractionsApi && !vertexAI
@@ -364,8 +371,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
                     keyRoulette.markFailed(providerId, currentKey)
                     currentKey = keyRoulette.next(providerSetting.apiKey, providerId)
                     Log.e(TAG, "onFailure: key 错误(code=$code)，已切换 key 重试")
-                    activeEventSource = EventSources.createFactory(client)
-                        .newEventSource(
+                    activeEventSource = client.newEventSource(
                             applyApiKey(
                                 providerSetting = providerSetting,
                                 request = baseRequest,
@@ -412,8 +418,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
             }
         }
 
-        activeEventSource = EventSources.createFactory(client)
-                .newEventSource(request, listener)
+        activeEventSource = client.newEventSource(request, listener)
 
         awaitClose {
             println("[awaitClose] 关闭eventSource")

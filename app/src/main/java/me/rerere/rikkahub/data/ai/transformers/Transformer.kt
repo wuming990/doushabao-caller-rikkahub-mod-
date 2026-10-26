@@ -6,17 +6,17 @@ import me.rerere.ai.provider.Model
 import me.rerere.ai.ui.UIMessage
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.model.Assistant
-import kotlin.uuid.Uuid
 
 class TransformerContext(
     val context: Context,
     val model: Model,
     val assistant: Assistant,
     val settings: Settings,
-    val conversationModeInjectionIds: Set<Uuid> = emptySet(),
-    val conversationLorebookIds: Set<Uuid> = emptySet(),
     val processingStatus: MutableStateFlow<String?> = MutableStateFlow(null),
     val workspaceCwd: String? = null,
+    // v323：对话级提示词/世界书绑定（3.1 的上下文类里没有，二改要保留）
+    val conversationModeInjectionIds: Set<kotlin.uuid.Uuid> = emptySet(),
+    val conversationLorebookIds: Set<kotlin.uuid.Uuid> = emptySet(),
 )
 
 interface MessageTransformer {
@@ -67,20 +67,20 @@ suspend fun List<UIMessage>.transforms(
     model: Model,
     assistant: Assistant,
     settings: Settings,
-    conversationModeInjectionIds: Set<Uuid> = emptySet(),
-    conversationLorebookIds: Set<Uuid> = emptySet(),
     processingStatus: MutableStateFlow<String?> = MutableStateFlow(null),
     workspaceCwd: String? = null,
+    conversationModeInjectionIds: Set<kotlin.uuid.Uuid> = emptySet(),
+    conversationLorebookIds: Set<kotlin.uuid.Uuid> = emptySet(),
 ): List<UIMessage> {
     val ctx = TransformerContext(
         context = context,
         model = model,
         assistant = assistant,
         settings = settings,
-        conversationModeInjectionIds = conversationModeInjectionIds,
-        conversationLorebookIds = conversationLorebookIds,
         processingStatus = processingStatus,
         workspaceCwd = workspaceCwd,
+        conversationModeInjectionIds = conversationModeInjectionIds,
+        conversationLorebookIds = conversationLorebookIds,
     )
     return transformers.fold(this) { acc, transformer ->
         transformer.transform(ctx, acc)

@@ -21,9 +21,6 @@ pluginManagement {
         }
     }
 }
-plugins {
-    id("org.gradle.toolchains.foojay-resolver-convention") version "1.0.0"
-}
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
@@ -44,7 +41,9 @@ include(":common")
 include(":document")
 include(":web")
 include(":material3")
+include(":ui")
 include(":workspace")
+include(":terminal")
 include(":app:baselineprofile")
-include(":videogen")
+include(":mediagen")
 include(":oauth")

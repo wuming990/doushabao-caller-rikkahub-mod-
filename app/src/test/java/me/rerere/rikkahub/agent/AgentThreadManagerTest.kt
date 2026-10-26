@@ -68,6 +68,27 @@ class AgentThreadManagerTest {
         }
     }
 
+    /**
+     * 轮询到「上一代运行已经收尾、可以继续输出」为止（最多 2 秒）。
+     *
+     * 只用于 [继续输出功能可让截断线程继续跑并递增 resumeCount]：线程状态先写、`jobs` 句柄在
+     * finally 里后清，产品代码在这段窗口里拒绝 resume 是**有意的并发保护**（同一线程不许同时
+     * 跑两代）。测试要验证的是「点继续输出能接着跑」，不是「在窗口内也能挤进去」，
+     * 所以这里等窗口过去，而不是去拆那道闸。2 秒都等不到 = 门槛真坏了，照常判失败。
+     */
+    private suspend fun awaitResumable(
+        manager: AgentThreadManager,
+        threadId: String,
+    ): AgentThread? {
+        val deadline = System.currentTimeMillis() + 2_000
+        var revived: AgentThread? = null
+        while (revived == null && System.currentTimeMillis() < deadline) {
+            revived = manager.resume(threadId, extraInstruction = "请继续写")
+            if (revived == null) delay(20)
+        }
+        return revived
+    }
+
     @Test
     fun `四个代理可并行运行并全部成功`() = runBlocking {
         val repo = InMemoryAgentThreadRepository()
@@ -178,9 +199,17 @@ class AgentThreadManagerTest {
         assertTrue(firstRun.truncated)
         assertEquals(0, firstRun.resumeCount)
 
-        // 点击继续输出
-        val revived = manager.resume(thread.id, extraInstruction = "请继续写")
-        assertNotNull(revived)
+        // 点击继续输出。
+        // ⚠️ 必须等「这一代运行真正收尾」再点，不能在状态刚写成终态的那一瞬间点。
+        // 线程状态是在协程体内先写的，`jobs` 里的句柄要等 finally 才 remove，两者之间有一个
+        // 极短窗口；产品代码在这个窗口里返回 null 是**刻意的**——那道「是否已在运行」的闸门
+        // 用来防止同一线程同时跑两代，AgentAutoResumeTest:306 与 AgentThreadManager 里
+        // 「自动重试必须先退避等 finally 清理完」的注释都把它当承重结构在守。
+        // 人手点按钮比这个窗口慢好几个数量级，用户撞不到；撞上的是测试自己。
+        // 五模块并行抢 CPU 时这条用例被窗口撞翻过一次，所以修的是**测试的时序假设**，
+        // 不是把那道闸拆掉（拆了会同时打掉两条守卫测试）。
+        val revived = awaitResumable(manager, thread.id)
+        assertNotNull("等满 2 秒仍无法继续输出 —— 那才是 resume 的门槛真的坏了", revived)
         assertEquals(1, revived!!.resumeCount)
 
         // 等第 2 次跑完

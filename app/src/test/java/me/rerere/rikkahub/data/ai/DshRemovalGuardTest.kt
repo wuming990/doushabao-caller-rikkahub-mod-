@@ -132,9 +132,28 @@ class DshRemovalGuardTest {
             "必须仍然点名 workspace_shell",
             transformer.contains("workspace_shell"),
         )
+        // v1017：官方 3.1.1 把这段抽进了 private fun List<UIMessage>.withPrompt(prompt)，
+        // 接收者就是那份列表，所以实物字面从 `messages.indexOfFirst {…}` 变成 `indexOfFirst {…}`。
+        // 语义一字未变（仍是「追加到第一条 system 消息，没有则插一条」），因此换成官方实物的字面，
+        // 并额外钉住 appendText 这个真正的追加动作 —— 不是放宽，是跟着重构走。
         assertTrue(
             "必须仍然追加到 system 消息",
-            transformer.contains("messages.indexOfFirst { it.role == MessageRole.SYSTEM }"),
+            transformer.contains("indexOfFirst { it.role == MessageRole.SYSTEM }"),
+        )
+        // v1017 复核位抓的假绿口子：上面两条钉的是 withPrompt 的内部实现，
+        // 把调用点改成 `return messages`（功能已死）时那两条仍然全绿。
+        // 所以调用点本身必须一起钉住，连远程不可达的兜底那条也钉。
+        assertTrue(
+            "本地分支必须真的调用 withPrompt 把说明挂上去",
+            transformer.contains("messages.withPrompt(prompt)"),
+        )
+        assertTrue(
+            "远程连不上时也必须真的挂上兜底说明（不许静默丢掉）",
+            transformer.contains("messages.withPrompt(buildUnreachablePrompt("),
+        )
+        assertTrue(
+            "追加动作必须仍然是 appendText 到那条 system 消息（不许被整块删掉）",
+            transformer.contains("appendText(\"\\n\\n"),
         )
     }
 

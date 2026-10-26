@@ -51,6 +51,7 @@ import androidx.compose.ui.unit.dp
 import androidx.paging.compose.LazyPagingItems
 import androidx.paging.compose.itemKey
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.data.datastore.ConversationSortOrder
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.ui.theme.extendColors
 import me.rerere.rikkahub.utils.mirrorForRtl
@@ -65,7 +66,8 @@ import kotlin.uuid.Uuid
 sealed class ConversationListItem {
     data class DateHeader(
         val date: LocalDate,
-        val label: String
+        val label: String,
+        val sortOrder: ConversationSortOrder = ConversationSortOrder.UPDATE_TIME,
     ) : ConversationListItem()
     data object PinnedHeader : ConversationListItem()
     data class Item(
@@ -80,6 +82,7 @@ fun ColumnScope.ConversationList(
     conversationJobs: Collection<Uuid>,
     listState: LazyListState,
     modifier: Modifier = Modifier,
+    header: (@Composable () -> Unit)? = null,
     onClick: (Conversation) -> Unit = {},
     onDelete: (Conversation) -> Unit = {},
     onRegenerateTitle: (Conversation) -> Unit = {},
@@ -88,13 +91,16 @@ fun ColumnScope.ConversationList(
     onMoveToFolder: (Conversation) -> Unit = {}
 ) {
     var hasScrolledToCurrent by remember(current.id) { mutableStateOf(false) }
+    // 列表顶部若放了 header，会话项在 LazyColumn 中的位置要往后挪一位
+    val headerCount = if (header != null) 1 else 0
 
     LaunchedEffect(current.id, conversations.itemCount, hasScrolledToCurrent) {
         if (hasScrolledToCurrent) return@LaunchedEffect
-        val currentIndex = conversations.itemSnapshotList.items.indexOfFirst {
+        val itemIndex = conversations.itemSnapshotList.items.indexOfFirst {
             (it as? ConversationListItem.Item)?.conversation?.id == current.id
         }
-        if (currentIndex >= 0) {
+        if (itemIndex >= 0) {
+            val currentIndex = itemIndex + headerCount
             val isVisible = listState.layoutInfo.visibleItemsInfo.any { it.index == currentIndex }
             if (!isVisible) {
                 listState.scrollToItem(currentIndex)
@@ -108,6 +114,12 @@ fun ColumnScope.ConversationList(
         modifier = modifier,
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
+        if (header != null) {
+            item(key = "header", contentType = "header") {
+                header()
+            }
+        }
+
         if (conversations.itemCount == 0) {
             item {
                 Surface(
@@ -131,7 +143,8 @@ fun ColumnScope.ConversationList(
             count = conversations.itemCount,
             key = conversations.itemKey { item ->
                 when (item) {
-                    is ConversationListItem.DateHeader -> "date_${item.date}"
+                    // key 带上排序方式，避免切换排序后列表锚定到另一种排序下的同日期分组而发生跳动
+                    is ConversationListItem.DateHeader -> "date_${item.sortOrder}_${item.date}"
                     is ConversationListItem.PinnedHeader -> "pinned_header"
                     is ConversationListItem.Item -> item.conversation.id.toString()
                 }

@@ -12,7 +12,7 @@ import me.rerere.rikkahub.data.ai.tools.local.LocalTools
 import me.rerere.rikkahub.data.ai.tools.local.providerHostOf
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.findProvider
-import me.rerere.rikkahub.data.files.SkillManager
+import me.rerere.rikkahub.data.skills.SkillManager
 import me.rerere.rikkahub.data.gemini.GeminiSearchClient
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.repository.ConversationRepository
@@ -92,14 +92,8 @@ class ChatToolFactory(
             } else {
                 assistant.id.toString()
             }
-            addAll(
-                buildMemoryTools(
-                    json = json,
-                    onCreation = { content -> memoryRepository.addMemory(memoryAssistantId, content) },
-                    onUpdate = { id, content -> memoryRepository.updateContent(id, content) },
-                    onDelete = { id -> memoryRepository.deleteMemory(id) },
-                )
-            )
+            // v323：改用官方 3.1 的文件式记忆工具（读写路径 + 版本号）
+            addAll(buildMemoryTools(memoryRepository, memoryAssistantId))
         }
         addAll(createSearchToolsForGeneration(settings, assistant, model, geminiSearchClient))
         // v300：把本次生成用的供应商/模型告诉本地工具装配 ——
@@ -119,7 +113,7 @@ class ChatToolFactory(
             )
         }
 
-        val mcpTools = mcpManager.getAllAvailableTools()
+        val mcpTools = mcpManager.getAllAvailableTools(assistant)
         val invalidNames = mcpTools
             .map { it.second }
             .distinct()

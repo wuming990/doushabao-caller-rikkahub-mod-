@@ -241,6 +241,10 @@ internal class GeminiStreamChunkAdapter {
     private var openKind: OpenKind? = null
     private var openId: String = ""
     private var nextId = 0
+    // v1007：Cloud Code Assist（反重力通道）每一块都带 candidate.finishReason，
+    // 但适配器以前把它丢了，收尾永远发 Finish() 不带原因 —— 于是主对话的
+    // 「撞输出上限自动续写」在这条通道上等于空头承诺（isTruncated(null) 恒 false）。
+    private var lastFinishReason: String? = null
 
     private fun startNew(kind: OpenKind): String {
         openKind = kind
@@ -251,6 +255,8 @@ internal class GeminiStreamChunkAdapter {
     fun translate(chunk: MessageChunk): List<StreamChunk> {
         val out = mutableListOf<StreamChunk>()
         val choice = chunk.choices.getOrNull(0)
+        // v1007：把结束原因留下来，交给 finish() 一起发出去（STOP / MAX_TOKENS / SAFETY…）
+        choice?.finishReason?.takeIf { it.isNotBlank() }?.let { lastFinishReason = it }
         val delta = choice?.delta ?: choice?.message
         if (delta != null) {
             // Google never sends an explicit "thought finished" signal; infer it the same way
@@ -344,8 +350,19 @@ internal class GeminiStreamChunkAdapter {
         return out
     }
 
-    /** Sent once, right before the underlying event source closes normally. */
-    fun finish(): StreamChunk = StreamChunk.Finish()
+    /**
+     * Sent once, right before the underlying event source closes normally.
+     *
+     * v1007：`terminatedWithoutSentinel = true` —— 这条通道的 SSE 没有协议级终止标记，
+     * 上游把连接关掉就算收尾。以前一律当作「正常说完」，于是「没报错、没结束原因、
+     * 内容却是半截」这种无声截断永远不会触发续写（用户反复报过这类）。
+     * 上层的判定是「terminatedWithoutSentinel && finishReason 为空」两个条件同时成立，
+     * 正常回答带 STOP 时不会被误判成截断，所以这里置 true 是安全的。
+     */
+    fun finish(): StreamChunk = StreamChunk.Finish(
+        finishReason = lastFinishReason,
+        terminatedWithoutSentinel = true,
+    )
 }
 
 // Errors are small; this only bounds a pathological body, unlike PAYLOAD_LOG_LIMIT above which

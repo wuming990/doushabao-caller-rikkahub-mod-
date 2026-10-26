@@ -41,6 +41,9 @@ val WorkspaceToolDefaultApprovals: Map<String, Boolean> = mapOf(
     "workspace_shell" to true,
 )
 
+/** v1017: official 3.1.1 tool-name set for file-writing capabilities. */
+val WorkspaceFileWriteToolNames: Set<String> = setOf("workspace_write_file", "workspace_edit_file")
+
 fun resolveWorkspaceToolApproval(name: String, overrides: Map<String, Boolean>): Boolean =
     overrides[name] ?: WorkspaceToolDefaultApprovals[name] ?: false
 
@@ -51,18 +54,23 @@ suspend fun createWorkspaceTools(
     defaultTimeoutSeconds: Int = 0,
 ): List<Tool> {
     if (workspaceId.isNullOrBlank()) return emptyList()
-    val approvalOverrides = workspaceRepository.getById(workspaceId)?.toolApprovalOverrides().orEmpty()
+    val workspaceEntity = workspaceRepository.getById(workspaceId)
+    val approvalOverrides = workspaceEntity?.toolApprovalOverrides().orEmpty()
     fun needsApproval(name: String) = resolveWorkspaceToolApproval(name, approvalOverrides)
 
     val shellCwd = cwd?.removePrefix("/workspace/")?.removePrefix("/workspace")
 
+    // v1017 合并官方 3.1.1：按工作区能力装配。远程 SSH 的 fileWriteTools=false ——
+    // SFTP 覆盖写入时服务器打开文件就清空原内容，写到一半断线会留下残缺文件；
+    // 那种工作区里改文件应当走 shell，不该拿到「直接写 / 直接改」两颗工具。
+    val canUseFileWriteTools = workspaceEntity?.capabilities()?.fileWriteTools ?: true
     return listOf(
         createReadFileTool(workspaceId, ::needsApproval, workspaceRepository),
         createWriteFileTool(workspaceId, ::needsApproval, workspaceRepository),
         createEditFileTool(workspaceId, ::needsApproval, workspaceRepository),
         createShellTool(workspaceId, ::needsApproval, workspaceRepository, shellCwd, defaultTimeoutSeconds),
         createPublishFileTool(workspaceId, ::needsApproval, workspaceRepository),
-    )
+    ).filterNot { !canUseFileWriteTools && it.name in WorkspaceFileWriteToolNames }
 }
 
 private val IMAGE_EXTENSIONS = setOf(
@@ -285,7 +293,9 @@ private suspend fun WorkspaceRepository.publishFileInRootfs(
     // 发布走流式拷贝, 上限独立于 MAX_READ_FILE_BYTES:
     // 读文件给模型看必须限制在 8MB (否则会把大文件塞进对话), 但发给用户的附件不需要进对话内容,
     // 因此可以放宽到几百兆, 让 APK 这类安装包能直接出现在消息下面.
-    val size = rootfsFileSize(workspaceId, path)
+    // v1017：改用按环境分发的 absoluteFileSize —— SSH 工作区的文件在远端，
+    // 用 rootfsFileSize 会去本机 rootfs 里找同一个路径（读不到或读到别人）。我方 10GB 发布上限不变。
+    val size = absoluteFileSize(workspaceId, path)
     require(size <= MAX_PUBLISH_FILE_BYTES) {
         "File is too large to publish: $path (${size / 1024 / 1024}MB, max ${MAX_PUBLISH_FILE_BYTES / 1024 / 1024}MB)."
     }
@@ -297,7 +307,7 @@ private suspend fun WorkspaceRepository.publishFileInRootfs(
         displayName = fileName,
         mimeType = mime,
     ) { output ->
-        exportRootfsFile(workspaceId, path, output)
+        exportAbsoluteFile(workspaceId, path, output)   // v1017：远端感知（同上）
     }
     val file = filesManager.getFile(entity)
     // 校验落地大小, 避免中途被截断后发出一个装不上的残缺文件
@@ -432,11 +442,12 @@ private suspend fun WorkspaceRepository.readRootfsBuffer(
     workspaceId: String,
     path: String,
 ): ByteArrayOutputStream {
-    val size = rootfsFileSize(workspaceId, path)
+    // v1017 对齐官方 3.1.1：读文件必须走按环境分发的 absoluteFileSize，SSH 工作区才读得到远端文件
+    val size = absoluteFileSize(workspaceId, path)
     require(size <= MAX_READ_FILE_BYTES) {
         "File is too large to read: $path (${size / 1024 / 1024}MB, max ${MAX_READ_FILE_BYTES / 1024 / 1024}MB). Use shell commands like head, tail, or grep to read parts of it."
     }
-    return ByteArrayOutputStream(size.toInt()).also { exportRootfsFile(workspaceId, path, it) }
+    return ByteArrayOutputStream(size.toInt()).also { exportAbsoluteFile(workspaceId, path, it) }
 }
 
 private suspend fun WorkspaceRepository.readImageInRootfs(

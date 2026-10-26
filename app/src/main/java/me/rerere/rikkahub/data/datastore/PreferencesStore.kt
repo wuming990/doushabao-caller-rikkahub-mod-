@@ -19,7 +19,19 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStoreFile
 import io.pebbletemplates.pebble.PebbleEngine
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
@@ -49,6 +61,8 @@ import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV1Migration
 import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV2Migration
 import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV3Migration
 import me.rerere.rikkahub.data.model.Assistant
+import me.rerere.mediagen.provider.MediaGenerationProviderSetting
+import me.rerere.rikkahub.data.datastore.ConversationSortOrder
 import me.rerere.rikkahub.data.model.Avatar
 import me.rerere.rikkahub.data.model.GroupChatConfig
 import me.rerere.rikkahub.data.model.GroupChatPreset
@@ -102,7 +116,7 @@ private fun decodeProvidersTolerant(raw: String): List<ProviderSetting> {
  *
  * 写法照上面的 [decodeProvidersTolerant]，是本项目 v274 定下的同一套做法。
  */
-private fun decodeGroupPresetsTolerant(raw: String): List<GroupChatPreset> {
+internal fun decodeGroupPresetsTolerant(raw: String): List<GroupChatPreset> {
     if (raw.isBlank()) return emptyList()
     val array = runCatching {
         JsonInstant.parseToJsonElement(raw) as? JsonArray
@@ -163,10 +177,14 @@ private fun createSettingsDataStore(context: Context): DataStore<Preferences> {
     )
 }
 
-class SettingsStore(
-    context: Context,
-    scope: AppScope,
+class SettingsStore internal constructor(
+    private val dataStore: DataStore<Preferences>,
+    scope: CoroutineScope,
 ) : KoinComponent {
+    // v323：主构造只给单元测试注入可控磁盘用（SettingsStoreTest 要卡住写入，验证
+    // 「页面关闭时取消写入后，内存里已改的值仍会落盘」）。生产路径一律走下面这个构造，
+    // context.settingsStore 仍是官方 3.1 的进程内单例，行为与官方完全一致。
+    constructor(context: Context, scope: AppScope) : this(context.settingsStore, scope)
     companion object {
         // 版本号
         val VERSION = intPreferencesKey("data_version")
@@ -185,8 +203,16 @@ class SettingsStore(
         val SELECT_MODEL = stringPreferencesKey("chat_model")
         val FAST_MODEL = stringPreferencesKey("fast_model")
         val FAST_MODEL_REASONING_LEVEL = stringPreferencesKey("fast_model_reasoning_level")
+        val MEMORY_MODEL = stringPreferencesKey("memory_model")
+        val MEMORY_MODEL_REASONING_LEVEL = stringPreferencesKey("memory_model_reasoning_level")
         val TRANSLATE_MODEL = stringPreferencesKey("translate_model")
         val ENABLE_SUGGESTION = booleanPreferencesKey("enable_suggestion")
+        // v323 合并 3.1.0 新增字段的 DataStore key
+        val ENABLE_AUTO_TITLE = booleanPreferencesKey("enable_auto_title")
+        val TRANSLATE_TARGET_LANGUAGE = stringPreferencesKey("translate_target_language")
+        val UPLOAD_S3_CONFIG = stringPreferencesKey("upload_s3_config")
+        val MEDIA_GENERATION_PROVIDERS = stringPreferencesKey("media_generation_providers")
+        val SPONSOR_ALERT_DISMISSED_AT = intPreferencesKey("sponsor_alert_dismissed_at")
         val IMAGE_GENERATION_MODEL = stringPreferencesKey("image_generation_model")
         val TITLE_PROMPT = stringPreferencesKey("title_prompt")
         val TRANSLATION_PROMPT = stringPreferencesKey("translation_prompt")
@@ -395,10 +421,19 @@ class SettingsStore(
         // 圆桌模式（多模型同上文各出方案 + 主模型综合）
         val ROUND_TABLE_SETTING = stringPreferencesKey("round_table_setting")
 
+        // v323：二改字段「工作区命令时长上限」。v322 只有 Settings 字段却没有 key/读写，
+        // 用户调完重启就回到默认（0 = 不限时）；本轮补上。
+        val WORKSPACE_COMMAND_TIMEOUT = intPreferencesKey("workspace_command_timeout_seconds")
+
         // Uses the same DataStore singleton without starting settings flows or requiring Koin.
-        internal suspend fun restoreBeforeInitialization(context: Context, settings: Settings) {
+        internal suspend fun restoreBeforeInitialization(
+            context: Context,
+            settings: Settings,
+            launchCount: Int = 0,
+        ) {
             require(!settings.init) { "Cannot restore uninitialized settings" }
             persistSettings(context.settingsStore, settings)
+            context.settingsStore.edit { it[LAUNCH_COUNT] = launchCount }
         }
 
         // v288 合并上游 2.4.17：官方把落盘逻辑抽成这个函数（备份恢复会在 Koin 之前调用它）。
@@ -416,6 +451,9 @@ class SettingsStore(
                 preferences[SELECT_MODEL] = settings.chatModelId.toString()
                 preferences[FAST_MODEL] = settings.fastModelId.toString()
                 preferences[FAST_MODEL_REASONING_LEVEL] = settings.fastModelReasoningLevel.name
+                // v1017：官方记忆整理模型。留空时删除旧 key，避免把“跟随快速模型”的默认值伪装成用户显式选择。
+                settings.memoryModelId?.let { memoryModelId -> preferences[MEMORY_MODEL] = memoryModelId.toString() } ?: preferences.remove(MEMORY_MODEL)
+                preferences[MEMORY_MODEL_REASONING_LEVEL] = settings.memoryModelReasoningLevel.name
                 preferences[TRANSLATE_MODEL] = settings.translateModeId.toString()
                 preferences[ENABLE_SUGGESTION] = settings.enableSuggestion
                 preferences[IMAGE_GENERATION_MODEL] = settings.imageGenerationModelId.toString()
@@ -505,11 +543,22 @@ class SettingsStore(
                 preferences[AUTO_COMPRESS_MODEL_OVERRIDES] =
                     JsonInstant.encodeToString(settings.autoCompressModelOverrides)
                 preferences[ROUND_TABLE_SETTING] = JsonInstant.encodeToString(settings.roundTableSetting)
+                // v323：工作区命令时长上限也要落盘，否则用户调完下一次发射就恢复默认
+                preferences[WORKSPACE_COMMAND_TIMEOUT] =
+                    settings.workspaceCommandTimeoutSeconds.coerceIn(0, 7200)
+                // v1007：备份恢复走的是这条**手写**写路径（不经过 SETTINGS_FIELDS）。
+                // 少了官方 3.1 这 5 个字段 → 恢复备份后「自动标题开关 / 翻译目标语言 /
+                // 上传 S3 桶 / 画图供应商 / 赞助提示时间」会退回默认或本机旧值。
+                // 读路径在 573-586 行，两边必须成对维护（审查位 C 抓到）。
+                preferences[ENABLE_AUTO_TITLE] = settings.enableAutoTitle
+                preferences[TRANSLATE_TARGET_LANGUAGE] = settings.translateTargetLanguage
+                preferences[UPLOAD_S3_CONFIG] = JsonInstant.encodeToString(settings.uploadS3Config)
+                preferences[MEDIA_GENERATION_PROVIDERS] =
+                    JsonInstant.encodeToString(settings.mediaGenerationProviders)
+                preferences[SPONSOR_ALERT_DISMISSED_AT] = settings.sponsorAlertDismissedAt
             }
         }
     }
-
-    private val dataStore = context.settingsStore
 
     // 读取失败时绝不能回退为空配置, 否则默认值会被当成用户数据写回, 覆盖全部设置
     // 偶发 IO 错误重试, 仍失败则向上抛出 (文件损坏由 corruptionHandler 处理)
@@ -533,9 +582,28 @@ class SettingsStore(
                 fastModelReasoningLevel = preferences[FAST_MODEL_REASONING_LEVEL]
                     ?.let { value -> ReasoningLevel.entries.find { it.name == value } }
                     ?: ReasoningLevel.AUTO,
+                // v1017：官方记忆整理模型的读取路径；缺 key 必须保持 null（跟随快速模型）。
+                memoryModelId = preferences[MEMORY_MODEL]?.let { Uuid.parse(it) },
+                memoryModelReasoningLevel = preferences[MEMORY_MODEL_REASONING_LEVEL]
+                    ?.let { value -> ReasoningLevel.entries.find { it.name == value } }
+                    ?: ReasoningLevel.AUTO,
                 translateModeId = preferences[TRANSLATE_MODEL]?.let { Uuid.parse(it) }
                     ?: DEFAULT_AUTO_MODEL_ID,
                 enableSuggestion = preferences[ENABLE_SUGGESTION] != false,
+                // v323：官方 3.1 新增的 5 个字段。写路径（SETTINGS_FIELDS）有、读路径漏了 ——
+                // 每个进程第一次改设置会整份落盘，把用户已存的画图供应商 / 上传 S3 桶 /
+                // 自动标题开关覆盖成默认值（审查位 A/B 双派都抓到）。
+                enableAutoTitle = preferences[ENABLE_AUTO_TITLE] != false,
+                translateTargetLanguage = preferences[TRANSLATE_TARGET_LANGUAGE] ?: "zh-CN",
+                uploadS3Config = preferences[UPLOAD_S3_CONFIG]?.let {
+                    runCatching { JsonInstant.decodeFromString<S3Config>(it) }.getOrDefault(S3Config())
+                } ?: S3Config(),
+                mediaGenerationProviders = preferences[MEDIA_GENERATION_PROVIDERS]?.let {
+                    runCatching {
+                        JsonInstant.decodeFromString<List<MediaGenerationProviderSetting>>(it)
+                    }.getOrDefault(emptyList())
+                } ?: emptyList(),
+                sponsorAlertDismissedAt = preferences[SPONSOR_ALERT_DISMISSED_AT] ?: 0,
                 imageGenerationModelId = preferences[IMAGE_GENERATION_MODEL]?.let { Uuid.parse(it) } ?: Uuid.random(),
                 titlePrompt = preferences[TITLE_PROMPT] ?: DEFAULT_TITLE_PROMPT,
                 translatePrompt = preferences[TRANSLATION_PROMPT] ?: DEFAULT_TRANSLATION_PROMPT,
@@ -637,7 +705,7 @@ class SettingsStore(
                 selectedASRProviderId = preferences[SELECTED_ASR_PROVIDER]?.let { Uuid.parse(it) },
                 modeInjections = preferences[MODE_INJECTIONS]?.let {
                     JsonInstant.decodeFromString(it)
-                } ?: emptyList(),
+                } ?: DEFAULT_MODE_INJECTIONS,
                 lorebooks = preferences[LOREBOOKS]?.let {
                     JsonInstant.decodeFromString(it)
                 } ?: emptyList(),
@@ -664,6 +732,9 @@ class SettingsStore(
                     runCatching { JsonInstant.decodeFromString<RoundTableSetting>(it) }
                         .getOrDefault(RoundTableSetting())
                 } ?: RoundTableSetting(),
+                // v323：0 = 不限时；夹在 0~7200 秒，避免手改存档把界面撑爆
+                workspaceCommandTimeoutSeconds =
+                    (preferences[WORKSPACE_COMMAND_TIMEOUT] ?: 0).coerceIn(0, 7200),
             )
         }
         .map {
@@ -677,16 +748,9 @@ class SettingsStore(
             // 广告位（见 DefaultProviders 与 v304 FINAL 快照留档），但老用户设备上是把
             // 它们存进过设置数据的，不会自己消失，所以在这里按用户口径清一次。
             providers = providers.filterNot { it.shouldDropRemovedAdProvider() }.toMutableList()
-            providers = providers.map { provider ->
-                val defaultProvider = DEFAULT_PROVIDERS.find { it.id == provider.id }
-                if (defaultProvider != null) {
-                    provider.copyProvider(
-                        builtIn = defaultProvider.builtIn,
-                        description = defaultProvider.description,
-                        shortDescription = defaultProvider.shortDescription,
-                    )
-                } else provider
-            }.toMutableList()
+            // v323：官方 3.1 的 copyProvider 签名收紧了（不再接受这些命名参数）。
+            // 内置条目的角标/说明由界面按 id 现查，这里不再回写，行为不受影响。
+            providers = providers.toMutableList()
             val assistants = it.assistants.ifEmpty { DEFAULT_ASSISTANTS }.toMutableList()
             DEFAULT_ASSISTANTS.forEach { defaultAssistant ->
                 if (assistants.none { it.id == defaultAssistant.id }) {
@@ -696,7 +760,7 @@ class SettingsStore(
             var ttsProviders = it.ttsProviders.ifEmpty { DEFAULT_TTS_PROVIDERS }.toMutableList()
             DEFAULT_TTS_PROVIDERS.forEach { defaultTTSProvider ->
                 if (ttsProviders.none { provider -> provider.id == defaultTTSProvider.id }) {
-                    ttsProviders.add(defaultTTSProvider.copyProvider())
+                    ttsProviders.add(defaultTTSProvider)
                 }
             }
             // v305（用户拍板「一并清掉」）：清掉语音合成表里预置的 AiHubMix 广告位，
@@ -776,6 +840,16 @@ class SettingsStore(
                         is ProviderSetting.GeminiOAuth -> provider.copy(
                             models = dropDeniedGeminiOAuthModels(provider.models)
                         )
+
+                        // v323：Gemini 网页版（cookie 直连）
+                        is ProviderSetting.GeminiWeb -> provider.copy(
+                            models = provider.models.distinctBy { model -> model.id }
+                        )
+
+                        // v323 合并 3.1.0：官方新增的 ChatGPT 账号型提供商
+                        is ProviderSetting.ChatGPT -> provider.copy(
+                            models = provider.models.distinctBy { model -> model.id }
+                        )
                     }
                 },
                 assistants = settings.assistants.distinctBy { it.id }.map { assistant ->
@@ -842,24 +916,99 @@ class SettingsStore(
             )
         }
         .onEach {
-            get<PebbleEngine>().templateCache.invalidateAll()
+            // v323：官方 3.1 新增「设置变化时清模板缓存」。本地单元测试没有启动 Koin，
+            // 直接 get<>() 会抛 "KoinApplication has not been started"，把整个测试进程带崩
+            // （ProviderAccountManagerTest 那次崩溃就是它）。这里取不到就跳过：
+            // 生产环境容器一定在，行为与官方完全一致。
+            runCatching { get<PebbleEngine>().templateCache.invalidateAll() }
         }
 
-    val settingsFlow = settingsFlowRaw
-        .distinctUntilChanged()
-        .toMutableStateFlow(scope, Settings.dummy())
+    private val state = MutableStateFlow(Settings.dummy())
+
+    /** 当前设置。加载完成前是 [Settings.dummy]，需要真实设置时用 [awaitLoaded]。 */
+    val settingsFlow: StateFlow<Settings> = state.asStateFlow()
+
+    init {
+        // v323：官方 3.1 的结构 —— 启动时只读一次盘，之后 state 只由 update 驱动。
+        // 旧实现用 toMutableStateFlow 持续收集 DataStore：每次写盘回流都会把内存里
+        // 「刚改完、还没写完」的值覆盖回旧值（并发更新丢键、打字丢字就是这个原因）。
+        // 整份设置的解码很重，不能放在主线程。
+        scope.launch(Dispatchers.Default) {
+            state.value = try {
+                settingsFlowRaw.first().normalized()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                // 读不出设置就不能带着占位值继续运行：界面上是一份默认设置，而任何修改都落不了盘
+                Log.e(TAG, "Failed to load settings", e)
+                Runtime.getRuntime().halt(1)
+                throw e
+            }
+        }
+    }
+
+    /** v323：官方 3.1 的启动次数流（备份里要用）。 */
+    val launchCountFlow = settingsFlow.map { it.launchCount }
+
+    suspend fun awaitLoaded(): Settings = state.first { !it.init }
+
+    suspend fun setLaunchCount(count: Int) {
+        dataStore.edit { it[LAUNCH_COUNT] = count }
+        update { it.copy(launchCount = count) }
+    }
+
+    suspend fun selectAssistant(assistantId: Uuid) {
+        update { it.copy(assistantId = assistantId) }
+    }
+
+    // 已经落盘的那一份，只在持有 persistMutex 时读写。
+    // 启动后第一次写入前是 null，那一次整份写入：读盘时规整过、补出来的值要固定到盘上。
+    private var persisted: Settings? = null
+    private val persistMutex = Mutex()
+    private val stateLock = Any()
 
     suspend fun update(settings: Settings) {
-        if(settings.init) {
+        if (settings.init) {
             Log.w(TAG, "Cannot update dummy settings")
             return
         }
-        settingsFlow.value = settings
-        persistSettings(dataStore, settings)
+        synchronized(stateLock) { state.value = settings }
+        persist()
     }
 
     suspend fun update(fn: (Settings) -> Settings) {
-        update(fn(settingsFlow.value))
+        // v323：官方 3.1 修好的关键逻辑，合并时被 v322 的旧实现盖掉了 ——
+        // 加载完成前的修改必须等真实设置出来再应用，否则会拿默认值把用户全部设置覆盖掉。
+        // 已加载时这里不能挂起：输入框、slider 依赖修改同步生效。
+        if (settingsFlow.value.init) awaitLoaded()
+        synchronized(stateLock) {
+            val updated = fn(settingsFlow.value)
+            if (updated.init) {
+                Log.w(TAG, "Cannot update dummy settings")
+                return
+            }
+            // 规整会重建提供商、助手等对象，而界面按引用判断它们有没有变：
+            // 规整没改动任何东西时保留传入的实例。
+            val normalized = updated.normalized()
+            state.value = if (normalized == updated) updated else normalized
+        }
+        persist()
+    }
+
+    // v323：连续修改只写最新的一份（官方 3.1 的行为）。旧实现每次都整份重写，
+    // 慢盘时会把「用户输入到一半」的中间值反复写下去，也会把没变的字段重写一遍。
+    // 不跟着调用方取消：页面关闭（viewModelScope 取消）时修改已经在内存里生效，不能只差落盘这一步。
+    private suspend fun persist() {
+        withContext(NonCancellable + Dispatchers.Default) {
+            persistMutex.withLock {
+                val latest = settingsFlow.value
+                val base = persisted
+                if (latest !== base) {
+                    dataStore.edit { preferences -> preferences.putSettings(latest, base) }
+                    persisted = latest
+                }
+            }
+        }
     }
 
     // 只原子地修改单个 key, 不能用 update() 写回整份快照
@@ -869,6 +1018,9 @@ class SettingsStore(
             count = (preferences[LAUNCH_COUNT] ?: 0) + 1
             preferences[LAUNCH_COUNT] = count
         }
+        // v323：同步内存态。launchCount 仍在 SETTINGS_FIELDS 里，下次整份 persist 会拿
+        // state 里的旧值把它覆盖回去；同步后 persisted 才能检测到变化。
+        state.value = state.value.copy(launchCount = count)
         return count
     }
 
@@ -883,7 +1035,7 @@ class SettingsStore(
         // 这里顺手把内存态也同步掉，两条通道从此一致。
         val current = settingsFlow.value
         if (!current.init && current.assistantId != assistantId) {
-            settingsFlow.value = current.copy(assistantId = assistantId)
+            state.value = current.copy(assistantId = assistantId)
         }
         dataStore.edit { preferences ->
             preferences[SELECT_ASSISTANT] = assistantId.toString()
@@ -1063,188 +1215,6 @@ internal fun decodeSkillOrder(raw: String?): List<String> {
 }
 
 @Serializable
-data class Settings(
-    @Transient
-    val init: Boolean = false,
-    val dynamicColor: Boolean = true,
-    val themeId: String = PresetThemes[0].id,
-    val customThemes: List<CustomTheme> = emptyList(),
-    val developerMode: Boolean = false,
-    val displaySetting: DisplaySetting = DisplaySetting(),
-    val networkSetting: NetworkSetting = NetworkSetting(),
-    val favoriteModels: List<Uuid> = emptyList(),
-    val chatModelId: Uuid = Uuid.random(),
-    val fastModelId: Uuid = Uuid.random(),
-    val fastModelReasoningLevel: ReasoningLevel = ReasoningLevel.AUTO,
-    val imageGenerationModelId: Uuid = Uuid.random(),
-    val titlePrompt: String = DEFAULT_TITLE_PROMPT,
-    val translateModeId: Uuid = Uuid.random(),
-    val translatePrompt: String = DEFAULT_TRANSLATION_PROMPT,
-    val translateThinkingBudget: Int = 0,
-    val enableSuggestion: Boolean = true,
-    val suggestionPrompt: String = DEFAULT_SUGGESTION_PROMPT,
-    val ocrModelId: Uuid = Uuid.random(),
-    val ocrPrompt: String = DEFAULT_OCR_PROMPT,
-    val compressModelId: Uuid = Uuid.random(),
-    val compressPrompt: String = DEFAULT_COMPRESS_PROMPT,
-    val assistantId: Uuid = DEFAULT_ASSISTANT_ID,
-    val providers: List<ProviderSetting> = DEFAULT_PROVIDERS,
-    val assistants: List<Assistant> = DEFAULT_ASSISTANTS,
-    val assistantTags: List<Tag> = emptyList(),
-    val searchServices: List<SearchServiceOptions> = listOf(SearchServiceOptions.DEFAULT),
-    val searchCommonOptions: SearchCommonOptions = SearchCommonOptions(),
-    val searchServiceSelected: Int = 0,
-    val mcpServers: List<McpServerConfig> = emptyList(),
-    val webDavConfig: WebDavConfig = WebDavConfig(),
-    val s3Config: S3Config = S3Config(),
-    val ttsProviders: List<TTSProviderSetting> = DEFAULT_TTS_PROVIDERS,
-    val selectedTTSProviderId: Uuid = DEFAULT_SYSTEM_TTS_ID,
-    val defaultTTSPlaybackSpeed: Float = 1.0f,
-    val asrProviders: List<ASRProviderSetting> = emptyList(),
-    val selectedASRProviderId: Uuid? = null,
-    val modeInjections: List<PromptInjection.ModeInjection> = DEFAULT_MODE_INJECTIONS,
-    val lorebooks: List<Lorebook> = emptyList(),
-    val quickMessages: List<QuickMessage> = emptyList(),
-    val webServerEnabled: Boolean = false,
-    val webServerPort: Int = 8080,
-    val webServerJwtEnabled: Boolean = false,
-    val webServerAccessPassword: String = "",
-    val webServerLocalhostOnly: Boolean = false,
-    val sharedStorageTreeUris: List<String> = emptyList(),
-    val backupReminderConfig: BackupReminderConfig = BackupReminderConfig(),
-    val launchCount: Int = 0,
-    // 工作区 shell 命令默认超时(秒)。0 = 不限时(默认)。仅在 AI 未显式指定 timeout 时生效。
-    val workspaceCommandTimeoutSeconds: Int = 0,
-    // 特殊模型的自动压缩触发值。只有列在这里的模型走各自的值，其余模型仍用所在助手的自定义触发值。
-    val autoCompressModelOverrides: List<AutoCompressModelOverride> = emptyList(),
-    // 圆桌模式：多个模型用同一份上文各出一份方案，再由主模型综合。全局生效，换助手也通用。
-    val roundTableSetting: RoundTableSetting = RoundTableSetting(),
-
-    // v219：普通聊天的子代理（Codex 风格）总开关。默认开启；关闭后主模型拿不到 6 个控制工具。
-    val enableAgentTools: Boolean = true,
-
-    // v219：子代理默认模型。null = 跟随主助手（当前助手绑定的模型）。
-    // 优先级：spawn_agent 显式 model_id > agentModelId > 主助手模型。
-    val agentModelId: Uuid? = null,
-
-    // v219：子代理最大并发数（1~8，默认 4）。
-    val agentMaxConcurrent: Int = 4,
-
-    // v238：单个子代理的超时分钟数（1~120，0 = 不限时，默认 10）。
-    // 为什么需要：v237 之前单独派发的子代理完全没有超时，卡住就无限期挂着，
-    // 界面只显示「正在查证...」，用户没法判断它是在干活还是死了（用户真实反馈）。
-    val agentThreadTimeoutMinutes: Int = 10,
-    /**
-     * v246：子代理单个工具最长允许跑多久（1~60 分钟，默认 10）。
-     *
-     * 工具执行期间收不到任何数据，所以不按「多久没动静」判（v245），
-     * 但必须有这条上限兜着，否则挂死的工具会一直挂着。与「卡住判定」相互独立。
-     */
-    val agentToolTimeoutMinutes: Int = 10,
-    /**
-     * v248：**子代理**单次工具返回上限（KB），32~256。
-     *
-     * 一个数管三件事：子代理读文件一次给多少、子代理的工具返回超了截不截、以及分段时的安全线。
-     * 调大 = 一次读到更多、少跑几步；调小 = 对上下文窗口小的模型更安全。
-     *
-     * ⚠️ **主对话与圆桌不读这个字段**（红线：主模型不许被限制或改动）。
-     */
-    val toolOutputLimitKb: Int = TOOL_OUTPUT_LIMIT_DEFAULT_KB,
-    /**
-     * v241：子代理自动续跑次数上限。0 = 完全不自动续跑（一切都等你手动点）。
-     *
-     * 这个数字同时管两种自动续跑：上游报错后的自动重试，和「话没说完」后的自动接着写。
-     */
-    val agentAutoResumeMax: Int = 2,
-    /**
-     * v263：主对话「异常截断自动续跑」次数上限。回复因达到单次输出长度上限被掐断时，
-     * 自动从断点接着写完。0 = 完全不自动续跑；默认 3；v270 上限从 10 提到 99（用户要求）。
-     * ⚠️ 99 意味着最坏情况一个回复最多 99 趟额外计费的完整请求，断线续跑共用此数字。
-     * 只管「输出没写完就被掐断」这一种异常，不影响断网重试（那套是官方 2.4.13 的逻辑）。
-     */
-    val truncationAutoResumeMax: Int = 3,
-    /**
-     * v288：续跑方式（两种，见 [ResumeStrategy]）。默认「发送继续」= 原有行为。
-     * 仅续跑（truncationAutoResumeMax > 0）时生效；撞输出上限那条路强制走「继续」。
-     *
-     * v288 替换了 v267~v272 的「续跑思考模式」：思考回灌做不到真正续接思维链
-     * （原生思考模型需要原样回传带签名的 reasoning 块），
-     * 实测只会造成多段思考堆叠与重复打转，整体废弃。
-     */
-    val resumeStrategy: ResumeStrategy = ResumeStrategy.CONTINUE,
-    /**
-     * v268：对话级模型记忆（照 Chatbox 设计）。开启时每个对话记住自己最后一次使用的模型，
-     * 打开/切回该对话自动恢复；新对话沿用最近使用的模型。关闭 = 所有对话共用助手模型（官方行为）。
-     */
-    val rememberModelPerConversation: Boolean = true,
-    /**
-     * v268：对话 → 模型 映射。已删除对话的残留条目无害（对应模型不存在时自动忽略），
-     * 不做主动清理。
-     */
-    val conversationModelIds: Map<Uuid, Uuid> = emptyMap(),
-    /**
-     * v313：对话 → 群组设置。只有被显式建过群的对话才有 entry，
-     * 没有 entry 的对话与改前完全一致（群功能不会牵连普通聊天）。
-     */
-    val groupChatConfigs: Map<Uuid, GroupChatConfig> = emptyMap(),
-    /**
-     * v316：用户自己存的讨论群方案（全局共享，可在任意对话套用）。
-     * 默认空表 —— 没有方案的对话与改前完全一致（群功能不牵连普通聊天）。
-     */
-    val groupChatPresets: List<GroupChatPreset> = emptyList(),
-    /**
-     * v321：「群讨论只保留发言正文」。默认 false = 与 v320 逐字节一致。
-     *
-     * 打开后，**群讨论期间产生的**思考过程、工具调用与结果、搜索结果
-     * ① 不再进任何成员的上文（每位成员只看大家说过的正文）
-     * ② 解散/暂停群之后，主对话拼上下文时也不再带上这些内容
-     *
-     * 三条不动的东西（用户 v321 明确过）：开群前原对话的上文照旧整份带；
-     * 成员向用户提的问题与用户的回答照旧保留；图片/文件/音视频照旧保留。
-     * 界面上的讨论记录**一个字都不删**，用户仍能回看当时查过什么。
-     */
-    val groupChatCleanContext: Boolean = false,
-    /** v268：手动压缩上次选择的模式（true = 经典压缩，默认智能压缩）。 */
-    val compressUseClassicMode: Boolean = false,
-    /**
-     * v280：允许子代理检索历史对话。默认 false，只有用户在子代理设置里主动打开才生效。
-     * 主对话与圆桌完全不看这个字段。
-     */
-    val allowAgentConversationSearch: Boolean = false,
-    /**
-     * v241：子代理单趟步数上限（只读位）。编程位自动取它的 1.5 倍。
-     *
-     * 「一步」= 一次完整的模型调用（含它这一轮想调的工具）。上限存在的唯一理由是
-     * 防止模型陷进死循环反复烧钱；撞到上限不算失败，会标成「这趟没跑完」并从断点接着跑。
-     */
-    val agentMaxSteps: Int = 32,
-
-    // v219：角色级模型覆盖（role 名 -> 模型 id；null/缺失 = 跟随子代理默认模型）。
-    val agentRoleModelOverrides: Map<String, Uuid?> = emptyMap(),
-
-    // v237：子代理备用模型（最多 3 个，按顺序兜底）。
-    // 插在候选链的「主对话模型」之前：先用你指定的便宜兜底模型，最后才落到主对话模型。
-    val agentFallbackModelIds: List<Uuid> = emptyList(),
-
-    // v304：技能列表显示顺序（技能目录名）。空 = 按目录名排。
-    val skillOrder: List<String> = emptyList(),
-) {
-    /**
-     * v248：子代理单次工具返回的字符上限。界面按 KB 存，这里统一换算，
-     * 让「子代理后端」与「子代理读文件工具」用同一套换算，避免两处各算一遍算出不同结果。
-     *
-     * ⚠️ 只有子代理那条路会读它 —— 生成层（`GenerationLoop`）绝不读，
-     * 否则主对话就被牵连了（有门禁断言钉着这一条）。
-     */
-    val toolOutputCharLimit: Int
-        get() = toolOutputLimitKb
-            .coerceIn(TOOL_OUTPUT_LIMIT_MIN_KB, TOOL_OUTPUT_LIMIT_MAX_KB) * 1024
-
-    companion object {
-        // 构造一个用于初始化的settings, 但它不能用于保存，防止使用初始值存储
-        fun dummy() = Settings(init = true)
-    }
-}
 
 /**
  * v248：**子代理**工具返回上限的档位（KB）。
@@ -1284,143 +1254,6 @@ enum class ResumeStrategy {
  * v250：跟随上游 2.4.11 —— 网络设置（自定义访问标识与代理）。
  * 字段与上游逐字一致，方便以后继续合并上游。
  */
-@Serializable
-data class NetworkSetting(
-    val userAgent: String = "",
-    val proxyUrl: String = "",
-    val proxyUsername: String = "",
-    val proxyPassword: String = "",
-    val enableAutoRetry: Boolean = true,
-)
-
-@Serializable
-enum class ChatFontFamily {
-    @SerialName("default")
-    DEFAULT,
-    @SerialName("serif")
-    SERIF,
-    @SerialName("monospace")
-    MONOSPACE,
-
-    @SerialName("custom")
-    CUSTOM,
-}
-
-@Serializable
-enum class BackgroundEffectType {
-    @SerialName("blur")
-    BLUR,
-
-    @SerialName("glass")
-    GLASS,
-}
-
-@Serializable
-data class DisplaySetting(
-    val userAvatar: Avatar = Avatar.Dummy,
-    val userNickname: String = "",
-    val useAppIconStyleLoadingIndicator: Boolean = true,
-    val showUserAvatar: Boolean = true,
-    val showAssistantBubble: Boolean = false,
-    val bubbleOpacity: Float = 1.0f,
-    val showModelIcon: Boolean = true,
-    val showModelName: Boolean = true,
-    val showDateTimeInMessage: Boolean = false,
-    val showTokenUsage: Boolean = true,
-    /**
-     * v269：消息下方显示「续跑 N 次」（仅真的续跑过、次数 > 0 的消息才渲染）。
-     *
-     * 用户原话：「需要可以关掉，而不是一直显示没法关闭显示」—— 默认开、可关。
-     * DisplaySetting 整体 JSON 序列化，带默认值的新字段对旧数据向下兼容，无需迁移。
-     */
-    val showResumeCount: Boolean = true,
-    /**
-     * v270：重点标色插件开关（默认 false）。
-     *
-     * 用户原话：「不要对主模型参生影响，只是提供给模型一个可额外使用的插件，而不是
-     * 像提示词一样注入影响 ai 自身判断」。关闭 = 零注入，模型全程不知道该功能存在；
-     * 打开 = 系统提示词末尾附加一段中性说明（红/黄/绿标注语法，可用可不用）。
-     * 渲染层零改动（界面对 HTML span 颜色标签的支持是现成的）。
-     * DisplaySetting 整体 JSON 序列化，带默认值新字段对旧数据向下兼容，无需迁移。
-     */
-    val highlightKeyPoints: Boolean = false,
-    /**
-     * v294：强制翻阅 skill 模式。开 = 注入强制指令，模型首次回答前必须对每个已开启
-     * skill 调一次 use_skill 翻阅入口说明（SKILL.md）；关（默认）= 菜单制，模型自判。
-     * 无已开启 skill 时两种模式都零注入。
-     */
-    val forceSkillReview: Boolean = false,
-    /**
-     * v306：思考卡片单步可收起。开 = 思考步骤卡片只要非空就显示折叠控制条
-     * （单步也能收起来），且折叠时全部收起、连最后一条也不留，正文阅读不受影响；
-     * 关（默认）= 官方行为（超过两步才可折叠、折叠时保留尾部两步）。
-     * 只影响 ChainOfThought 渲染，不影响模型输出。
-     */
-    val collapseThinkingCardFully: Boolean = false,
-    // 输入框上方常显「当前上下文占用」，默认开启
-    val showContextUsage: Boolean = true,
-    /**
-     * v297：对话页顶栏显示「本对话 token 累计」，默认开启、可关。
-     *
-     * 与 showTokenUsage（每条消息下方那行）是两件事：这里是对话级累计，
-     * 口径含每次工具调用与续跑重复发送的上下文，不含后台调用与子代理。
-     * DisplaySetting 整体 JSON 序列化，带默认值的新字段对旧数据向下兼容，无需迁移。
-     */
-    val showConversationTokenStats: Boolean = true,
-    /**
-     * v317：讨论群组面板是否收起（用户口径：「这个太占空间了，给我做一个可以折叠起来的」）。
-     *
-     * 存这里而不是 rememberSaveable：用户要的是「收一次之后就一直收着、新对话也默认收」，
-     * 页面级状态做不到（换对话就重置）。DisplaySetting 整块 JSON 序列化，
-     * **带默认值的新字段对旧数据向下兼容、不需要 DataStore key、更不动数据库版本**。
-     *
-     * 默认 false = 首次是展开的（用户拍板「默认展开，你手动收一次之后就一直记住是收着的」）。
-     * ⚠️ 字段名就是「是否收起」，别把默认值写成 true —— 那等于一装上就收着，
-     * 用户根本不知道有这块内容（主模型 v317 自查时抓到过这个自相矛盾）。
-     */
-    val groupPanelCollapsed: Boolean = false,
-    val showThinkingContent: Boolean = true,
-    val autoCloseThinking: Boolean = true,
-    val updateCheckDisabledUntilEpochMillis: Long = 0L,
-    val showMessageJumper: Boolean = true,
-    val messageJumperOnLeft: Boolean = false,
-    val fontSizeRatio: Float = 1.0f,
-    val enableMessageGenerationHapticEffect: Boolean = false,
-    val skipCropImage: Boolean = true,
-    val enableNotificationOnMessageGeneration: Boolean = false,
-    /**
-     * v320：AI 讨论群组**停下来等你**时在后台发一条系统通知（默认开）。
-     *
-     * 用户反馈的原始症状：「弹出提问工具时，已经没有在继续生成了，但我处于后台不会弹出通知」。
-     *
-     * 刻意**不复用**上面那条 `enableNotificationOnMessageGeneration`：
-     * ① 那条默认关，蹭它的话这次「修好」在多数装机上根本看不见效果，等于白修；
-     * ② 含义也不同 —— 主对话那条讲「AI 跑完了」，这条讲「有人等你回话/等你点继续」；
-     * ③ 用户要能单独关掉群通知而不影响主对话（也反过来）。
-     *
-     * 带默认值 → DisplaySetting 整块 JSON 序列化，旧设置自动兼容，**不动数据库版本**。
-     */
-    val notifyGroupChatWaiting: Boolean = true,
-    val enableLiveUpdateNotification: Boolean = false,
-    val codeBlockAutoWrap: Boolean = false,
-    val codeBlockAutoCollapse: Boolean = false,
-    val showLineNumbers: Boolean = false,
-    val ttsOnlyReadQuoted: Boolean = false,
-    val ttsOnlyReadOutsideBrackets: Boolean = false,
-    val autoPlayTTSAfterGeneration: Boolean = false,
-    val pasteLongTextAsFile: Boolean = false,
-    val pasteLongTextThreshold: Int = 1000,
-    val sendOnEnter: Boolean = false,
-    val enableAutoScroll: Boolean = true,
-    val enableLatexRendering: Boolean = true,
-    val enableBlurEffect: Boolean = false,
-    val backgroundEffectType: BackgroundEffectType = BackgroundEffectType.BLUR,
-    val chatFontFamily: ChatFontFamily = ChatFontFamily.DEFAULT,
-    val chatCustomFontPath: String = "",
-    val chatCustomFontName: String = "",
-    val enableVolumeKeyScroll: Boolean = false,
-    val volumeKeyScrollRatio: Float = 1.0f,
-)
 
 /**
  * 特殊模型的自动压缩触发值。
@@ -1468,124 +1301,6 @@ data class RoundTableSetting(
     val rebuttalModelId: Uuid? = null,
 )
 
-@Serializable
-data class WebDavConfig(
-    val url: String = "",
-    val username: String = "",
-    val password: String = "",
-    val path: String = "rikkahub_backups",
-    val items: List<BackupItem> = listOf(
-        BackupItem.DATABASE,
-        BackupItem.FILES
-    ),
-) {
-    @Serializable
-    enum class BackupItem {
-        DATABASE,
-        FILES,
-    }
-}
-
-@Serializable
-data class BackupReminderConfig(
-    val enabled: Boolean = false,
-    val intervalDays: Int = 7,
-    val lastBackupTime: Long = 0L,
-)
-
-fun Settings.isNotConfigured() = providers.all { it.models.isEmpty() }
-
-fun Settings.findModelById(uuid: Uuid?, fallback: Uuid? = null): Model? {
-    if (uuid == null && fallback == null) return null
-    return uuid?.let { this.providers.findModelById(it) }
-        ?: fallback?.let { this.providers.findModelById(it) }
-}
-
-fun List<ProviderSetting>.findModelById(uuid: Uuid): Model? {
-    this.forEach { setting ->
-        setting.models.forEach { model ->
-            if (model.id == uuid) {
-                return model
-            }
-        }
-    }
-    return null
-}
-
-fun Settings.getCurrentChatModel(): Model? {
-    return findModelById(this.getCurrentAssistant().chatModelId ?: this.chatModelId)
-}
-
-fun Settings.getCurrentAssistant(): Assistant {
-    return this.assistants.find { it.id == assistantId } ?: this.assistants.first()
-}
-
-fun Settings.getAssistantById(id: Uuid): Assistant? {
-    return this.assistants.find { it.id == id }
-}
-
-fun Settings.getQuickMessagesOfAssistant(assistant: Assistant) =
-    quickMessages.filter { it.id in assistant.quickMessageIds }
-
-fun Settings.getSelectedTTSProvider(): TTSProviderSetting? {
-    return selectedTTSProviderId?.let { id ->
-        ttsProviders.find { it.id == id }
-    } ?: ttsProviders.firstOrNull()
-}
-
-fun Settings.getSelectedASRProvider(): ASRProviderSetting? {
-    return selectedASRProviderId?.let { id ->
-        asrProviders.find { it.id == id }
-    } ?: asrProviders.firstOrNull()
-}
-
-fun Model.findProvider(providers: List<ProviderSetting>, checkOverwrite: Boolean = true): ProviderSetting? {
-    val provider = findModelProviderFromList(providers) ?: return null
-    val providerOverwrite = this.providerOverwrite
-    if (checkOverwrite && providerOverwrite != null) {
-        return providerOverwrite.copyProvider(models = emptyList())
-    }
-    return provider
-}
-
-private fun Model.findModelProviderFromList(providers: List<ProviderSetting>): ProviderSetting? {
-    providers.forEach { setting ->
-        setting.models.forEach { model ->
-            if (model.id == this.id) {
-                return setting
-            }
-        }
-    }
-    return null
-}
-
-internal val DEFAULT_ASSISTANT_ID = Uuid.parse("0950e2dc-9bd5-4801-afa3-aa887aa36b4e")
-internal val DEFAULT_ASSISTANTS = listOf(
-    Assistant(
-        id = DEFAULT_ASSISTANT_ID,
-        name = "",
-        systemPrompt = ""
-    ),
-    Assistant(
-        id = Uuid.parse("3d47790c-c415-4b90-9388-751128adb0a0"),
-        name = "",
-        systemPrompt = """
-            You are a helpful assistant, called {{char}}, based on model {{model_name}}.
-
-            ## Info
-            - Date: {{cur_date}}
-            - Locale: {{locale}}
-            - Timezone: {{timezone}}
-            - Device Info: {{device_info}}
-            - System Version: {{system_version}}
-            - User Nickname: {{user}}
-
-            ## Hint
-            - If the user does not specify a language, reply in the user's primary language.
-            - Remember to use Markdown syntax for formatting, and use latex for mathematical expressions.
-        """.trimIndent()
-    ),
-)
 
 /**
  * v305：从内置清单移除的推广位供应商 id（AiHubMix / APIMart / 硅基流动 / 小马算力 /
@@ -1619,16 +1334,6 @@ internal fun ProviderSetting.shouldDropRemovedAdProvider(): Boolean {
     }
 }
 
-val DEFAULT_SYSTEM_TTS_ID = Uuid.parse("026a01a2-c3a0-4fd5-8075-80e03bdef200")
-private val DEFAULT_TTS_PROVIDERS = listOf(
-    TTSProviderSetting.SystemTTS(
-        id = DEFAULT_SYSTEM_TTS_ID,
-        name = "",
-    ),
-    // v305（用户拍板「一并清掉」）：原先这里预置了一条 AiHubMix（baseUrl 指向
-    // aihubmix.com），性质与供应商列表里那 7 个广告位相同 —— 预置就是把人往某家弓。
-    // 需要第三方 TTS 仍可在语音合成页手动添加（走随机 id，不受下面的清理影响）。
-)
 
 /**
  * v305：语音合成表里被移除的广告位预置项 id（AiHubMix）。同样只清纯没填过密钥的。
@@ -1650,13 +1355,4 @@ internal fun TTSProviderSetting.shouldDropRemovedAdTtsProvider(): Boolean {
     }
 }
 
-internal val DEFAULT_ASSISTANTS_IDS = DEFAULT_ASSISTANTS.map { it.id }
 
-val DEFAULT_MODE_INJECTIONS = listOf(
-    PromptInjection.ModeInjection(
-        id = Uuid.parse("b87eaf16-f5cd-4ac1-9e4f-b11ae3a61d74"),
-        content = LEARNING_MODE_PROMPT,
-        position = InjectionPosition.AFTER_SYSTEM_PROMPT,
-        name = "Learning Mode"
-    )
-)

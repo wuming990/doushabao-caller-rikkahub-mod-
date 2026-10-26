@@ -121,29 +121,13 @@ class CodexAccountTest {
     }
 
     @Test
-    fun `auto reasoning omits Codex effort`() {
-        assertNull(codexReasoningEffort(ReasoningLevel.AUTO))
-        assertEquals("high", codexReasoningEffort(ReasoningLevel.HIGH))
-    }
-
-    @Test
-    fun `incomplete response exposes its reason`() {
-        val payload = json.parseToJsonElement(
-            """
-                {
-                  "response": {
-                    "incomplete_details": {
-                      "reason": "max_output_tokens"
-                    }
-                  }
-                }
-            """.trimIndent()
-        ).let { it as kotlinx.serialization.json.JsonObject }
-
-        assertEquals(
-            "Codex response incomplete: max_output_tokens",
-            parseCodexIncompleteMessage(payload),
-        )
+    fun `Codex 只认到 xhigh，MAX 必须降档`() {
+        // 官方 ChatGPT 通道会原样把 ReasoningLevel.MAX 的 effort（"max"）发出去；
+        // Codex 后端只到 "xhigh"，不降档会被拒（审查位 v1009 抓到的回归）。
+        assertEquals(ReasoningLevel.XHIGH, codexSafeReasoningLevel(ReasoningLevel.MAX))
+        assertEquals(ReasoningLevel.HIGH, codexSafeReasoningLevel(ReasoningLevel.HIGH))
+        assertEquals(ReasoningLevel.AUTO, codexSafeReasoningLevel(ReasoningLevel.AUTO))
+        assertEquals(ReasoningLevel.OFF, codexSafeReasoningLevel(ReasoningLevel.OFF))
     }
 
     @Test

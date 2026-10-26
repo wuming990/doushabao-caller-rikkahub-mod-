@@ -489,7 +489,7 @@ class AgentV247ReadSliceTest {
 
     @Test
     fun `子代理读取上限必须走完设置五环节`() {
-        val prefs = source("app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt")
+        val prefs = source("app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt") + "\n" + source("app/src/main/java/me/rerere/rikkahub/data/datastore/Settings.kt") // v323：官方 3.1 把 Settings 字段拆到 Settings.kt，判据改读两个文件（断言内容未改）
         assertTrue(
             "1 定义 key",
             prefs.contains("val TOOL_OUTPUT_LIMIT_KB = intPreferencesKey(\"tool_output_limit_kb\")"),

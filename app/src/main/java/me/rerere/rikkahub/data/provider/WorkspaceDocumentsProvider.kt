@@ -1,3 +1,5 @@
+// v1015 提示：AndroidManifest 注册的是 me.rerere.rikkahub.service.WorkspaceDocumentsProvider，
+// 本文件已不被系统实例化（旧包残留）。要改生效的那份，别改这里。
 package me.rerere.rikkahub.data.provider
 
 import android.database.Cursor

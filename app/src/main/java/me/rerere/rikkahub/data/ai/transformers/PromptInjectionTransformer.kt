@@ -1,4 +1,5 @@
 package me.rerere.rikkahub.data.ai.transformers
+import kotlin.uuid.Uuid
 
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.ui.UIMessage
@@ -10,7 +11,6 @@ import me.rerere.rikkahub.data.model.automaticTargetModelIds
 import me.rerere.rikkahub.data.model.Lorebook
 import me.rerere.rikkahub.data.model.extractContextForMatching
 import me.rerere.rikkahub.data.model.isTriggered
-import kotlin.uuid.Uuid
 
 /**
  * 提示词注入转换器
@@ -22,6 +22,9 @@ object PromptInjectionTransformer : InputMessageTransformer {
         ctx: TransformerContext,
         messages: List<UIMessage>,
     ): List<UIMessage> {
+        // v323：助手级 + 对话级绑定合并（对话级是二改能力，3.1 没有）
+        val effectiveModeInjectionIds = ctx.assistant.modeInjectionIds + ctx.conversationModeInjectionIds
+
         return transformMessages(
             messages = messages,
             assistant = ctx.assistant,
@@ -83,16 +86,6 @@ internal fun collectInjections(
     currentModelId: Uuid? = null,
 ): List<PromptInjection> {
     val injections = mutableListOf<PromptInjection>()
-    val effectiveModeInjectionIds = if (assistant.allowConversationPromptInjection) {
-        conversationModeInjectionIds
-    } else {
-        assistant.modeInjectionIds
-    }
-    val effectiveLorebookIds = if (assistant.allowConversationPromptInjection) {
-        conversationLorebookIds
-    } else {
-        assistant.lorebookIds
-    }
 
     // 1. 获取模式注入：
     // - 指定了一个或多个目标模型：当前模型命中任意一个就自动开启；
@@ -103,14 +96,14 @@ internal fun collectInjections(
             injection.enabled && if (automaticTargetModelIds.isNotEmpty()) {
                 currentModelId != null && currentModelId in automaticTargetModelIds
             } else {
-                effectiveModeInjectionIds.contains(injection.id)
+                (assistant.modeInjectionIds + conversationModeInjectionIds).contains(injection.id)
             }
         }
         .forEach { injections.add(it) }
 
     // 2. 获取关联的 Lorebook 中被触发的 RegexInjection
     val enabledLorebooks = lorebooks.filter {
-        it.enabled && effectiveLorebookIds.contains(it.id)
+        it.enabled && assistant.lorebookIds.contains(it.id)
     }
     if (enabledLorebooks.isNotEmpty()) {
         // 提取上下文用于匹配（只取非 SYSTEM 消息）
@@ -292,3 +285,7 @@ internal fun findSafeInsertIndex(messages: List<UIMessage>, targetIndex: Int): I
  */
 private fun PromptInjection.appliesToModel(currentModelId: Uuid?): Boolean =
     targetModelId == null || (currentModelId != null && targetModelId == currentModelId)
+
+/** v323：助手级 + 对话级绑定合并（对话级是二改能力，3.1 的上下文里没有）。 */
+private val TransformerContext.effectiveModeInjectionIds: Set<kotlin.uuid.Uuid>
+    get() = assistant.modeInjectionIds + conversationModeInjectionIds

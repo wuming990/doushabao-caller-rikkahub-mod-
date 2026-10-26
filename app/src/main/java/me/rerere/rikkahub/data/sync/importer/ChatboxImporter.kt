@@ -672,18 +672,22 @@ object ChatboxImporter {
         is ProviderSetting.Google -> "google|${provider.baseUrl.trimEnd('/')}|${provider.apiKey}"
         is ProviderSetting.Claude -> "claude|${provider.baseUrl.trimEnd('/')}|${provider.apiKey}"
         // v274：三套官方账号 OAuth 登录（无 apiKey/baseUrl，按 id 区分）
+        is ProviderSetting.ChatGPT -> "chatgpt|${provider.id}"
         is ProviderSetting.Codex -> "codex|${provider.id}"
         is ProviderSetting.Grok -> "grok|${provider.id}"
         is ProviderSetting.GeminiOAuth -> "gemini_oauth|${provider.id}"
+        is ProviderSetting.GeminiWeb -> "gemini_web|${provider.id}"
     }
 
     private fun ProviderSetting.providerTypeName(): String = when (this) {
         is ProviderSetting.OpenAI -> "openai"
         is ProviderSetting.Google -> "gemini"
         is ProviderSetting.Claude -> "claude"
+        is ProviderSetting.ChatGPT -> "chatgpt"
         is ProviderSetting.Codex -> "codex"
         is ProviderSetting.Grok -> "grok"
         is ProviderSetting.GeminiOAuth -> "gemini_oauth"
+        is ProviderSetting.GeminiWeb -> "gemini_web"
     }
 
     private fun String.toMessageRole(): MessageRole? = when (this) {

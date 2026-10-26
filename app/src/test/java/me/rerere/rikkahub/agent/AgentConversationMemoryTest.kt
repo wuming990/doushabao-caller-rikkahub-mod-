@@ -78,7 +78,7 @@ class AgentConversationMemoryTest {
     @Test
     fun `开关默认必须是关的（隐私相关，不能默认外发历史）`() {
         assertFalse(Settings().allowAgentConversationSearch)
-        val store = source(storePath)
+        val store = source(storePath) + "\n" + source("app/src/main/java/me/rerere/rikkahub/data/datastore/Settings.kt") // v323：官方 3.1 把 Settings 字段拆到 Settings.kt，判据改读两个文件（断言内容未改）
         assertTrue(
             "读设置必须用 == true，缺 key 时才会落到 false；用 ?: false 也行但别写成 != false",
             store.contains("preferences[AGENT_CONVERSATION_SEARCH] == true"),
@@ -297,13 +297,16 @@ class AgentConversationMemoryTest {
     }
 
     @Test
-    fun `子代理拿到的两把工具就是主对话那两把，没有夹带写能力`() {
+    fun `子代理拿到的历史工具都是只读的，没有夹带写能力`() {
         val tools = source(toolsPath)
         assertTrue(tools.contains("name = \"recent_chats\""))
         assertTrue(tools.contains("name = \"conversation_search\""))
+        // v323：官方 3.1 新增了第三把只读工具 conversation_read（按对话 id 读全文）。
+        // 判据跟着改成 3，但仍然要求每一把都是只读的（下面的反向断言不变）。
+        assertTrue(tools.contains("name = \"conversation_read\""))
         assertEquals(
-            "这个文件只该提供这两把工具",
-            2,
+            "这个文件只该提供这三把只读工具",
+            3,
             Regex("Tool\\(\\s*\\n\\s*name = ").findAll(tools).count(),
         )
         assertFalse(

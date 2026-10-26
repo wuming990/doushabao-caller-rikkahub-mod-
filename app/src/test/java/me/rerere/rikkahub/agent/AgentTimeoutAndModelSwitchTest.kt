@@ -203,7 +203,7 @@ class AgentTimeoutAndModelSwitchTest {
 
     @Test
     fun `超时设置必须读也必须写否则用户配好的会自己消失`() {
-        val store = source(storePath)
+        val store = source(storePath) + "\n" + source("app/src/main/java/me/rerere/rikkahub/data/datastore/Settings.kt") // v323：官方 3.1 把 Settings 字段拆到 Settings.kt，判据改读两个文件（断言内容未改）
         assertTrue(
             "缺少 DataStore key",
             store.contains("val AGENT_THREAD_TIMEOUT = intPreferencesKey(\"agent_thread_timeout_minutes\")"),

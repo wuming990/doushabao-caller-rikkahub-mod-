@@ -2,12 +2,10 @@ package me.rerere.rikkahub.ui.pages.setting
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material3.LargeFlexibleTopAppBar
 import androidx.compose.material3.Scaffold
@@ -15,7 +13,6 @@ import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Slider
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
@@ -30,18 +27,21 @@ import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlin.math.roundToInt
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.datastore.BackgroundEffectType
 import me.rerere.rikkahub.data.datastore.DisplaySetting
 import me.rerere.rikkahub.data.datastore.ResumeStrategy
 import me.rerere.rikkahub.ui.components.nav.BackButton
 import me.rerere.rikkahub.ui.components.ui.CardGroup
-import me.rerere.rikkahub.ui.components.ui.Select
+import me.rerere.rikkahub.ui.components.ui.CardGroupValue
+import me.rerere.rikkahub.ui.components.ui.ConnectedChoiceButtons
+import me.rerere.rikkahub.ui.components.ui.ConnectedChoiceLabel
+import me.rerere.rikkahub.ui.components.ui.switchItem
 import me.rerere.rikkahub.ui.hooks.rememberSharedPreferenceBoolean
 import me.rerere.rikkahub.ui.theme.CustomColors
 import me.rerere.rikkahub.utils.plus
 import org.koin.androidx.compose.koinViewModel
-import kotlin.math.roundToInt
 
 @Composable
 fun SettingPreferencesGeneralPage(vm: SettingVM = koinViewModel()) {
@@ -53,7 +53,7 @@ fun SettingPreferencesGeneralPage(vm: SettingVM = koinViewModel()) {
 
     fun updateDisplaySetting(setting: DisplaySetting) {
         displaySetting = setting
-        vm.updateSettings(settings.copy(displaySetting = setting))
+        vm.updateSettings { it.copy(displaySetting = setting) }
     }
 
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
@@ -76,7 +76,7 @@ fun SettingPreferencesGeneralPage(vm: SettingVM = koinViewModel()) {
     ) { contentPadding ->
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
-            contentPadding = contentPadding + PaddingValues(8.dp),
+            contentPadding = contentPadding + PaddingValues(horizontal = 16.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             item {
@@ -84,432 +84,331 @@ fun SettingPreferencesGeneralPage(vm: SettingVM = koinViewModel()) {
                     "create_new_conversation_on_start",
                     true
                 )
-                CardGroup(
-                    modifier = Modifier.padding(horizontal = 8.dp),
-                ) {
-                    item(
-                        headlineContent = { Text(stringResource(R.string.setting_display_page_create_new_conversation_on_start_title)) },
+                CardGroup {
+                    switchItem(
+                        checked = createNewConversationOnStart,
+                        onCheckedChange = { createNewConversationOnStart = it },
                         supportingContent = { Text(stringResource(R.string.setting_display_page_create_new_conversation_on_start_desc)) },
-                        trailingContent = {
-                            Switch(
-                                checked = createNewConversationOnStart,
-                                onCheckedChange = { createNewConversationOnStart = it }
-                            )
-                        },
+                        headlineContent = { Text(stringResource(R.string.setting_display_page_create_new_conversation_on_start_title)) },
                     )
-                    item(
-                        headlineContent = { Text(stringResource(R.string.setting_display_page_send_on_enter_title)) },
+                    switchItem(
+                        checked = displaySetting.sendOnEnter,
+                        onCheckedChange = { updateDisplaySetting(displaySetting.copy(sendOnEnter = it)) },
                         supportingContent = { Text(stringResource(R.string.setting_display_page_send_on_enter_desc)) },
-                        trailingContent = {
-                            Switch(
-                                checked = displaySetting.sendOnEnter,
-                                onCheckedChange = {
-                                    updateDisplaySetting(displaySetting.copy(sendOnEnter = it))
-                                }
-                            )
-                        },
+                        headlineContent = { Text(stringResource(R.string.setting_display_page_send_on_enter_title)) },
                     )
-                    item(
-                        headlineContent = { Text(stringResource(R.string.setting_display_page_show_message_jumper_title)) },
+                }
+            }
+
+            item {
+                CardGroup {
+                    switchItem(
+                        checked = displaySetting.showMessageJumper,
+                        onCheckedChange = { updateDisplaySetting(displaySetting.copy(showMessageJumper = it)) },
                         supportingContent = { Text(stringResource(R.string.setting_display_page_show_message_jumper_desc)) },
-                        trailingContent = {
-                            Switch(
-                                checked = displaySetting.showMessageJumper,
-                                onCheckedChange = {
-                                    updateDisplaySetting(displaySetting.copy(showMessageJumper = it))
-                                }
-                            )
-                        },
+                        headlineContent = { Text(stringResource(R.string.setting_display_page_show_message_jumper_title)) },
                     )
                     if (displaySetting.showMessageJumper) {
-                        item(
-                            headlineContent = { Text(stringResource(R.string.setting_display_page_message_jumper_position_title)) },
+                        switchItem(
+                            checked = displaySetting.messageJumperOnLeft,
+                            onCheckedChange = { updateDisplaySetting(displaySetting.copy(messageJumperOnLeft = it)) },
                             supportingContent = { Text(stringResource(R.string.setting_display_page_message_jumper_position_desc)) },
-                            trailingContent = {
-                                Switch(
-                                    checked = displaySetting.messageJumperOnLeft,
-                                    onCheckedChange = {
-                                        updateDisplaySetting(displaySetting.copy(messageJumperOnLeft = it))
-                                    }
-                                )
-                            },
+                            headlineContent = { Text(stringResource(R.string.setting_display_page_message_jumper_position_title)) },
                         )
                     }
-                    item(
-                        headlineContent = { Text(stringResource(R.string.setting_display_page_enable_auto_scroll_title)) },
+                    switchItem(
+                        checked = displaySetting.enableAutoScroll,
+                        onCheckedChange = { updateDisplaySetting(displaySetting.copy(enableAutoScroll = it)) },
                         supportingContent = { Text(stringResource(R.string.setting_display_page_enable_auto_scroll_desc)) },
-                        trailingContent = {
-                            Switch(
-                                checked = displaySetting.enableAutoScroll,
-                                onCheckedChange = {
-                                    updateDisplaySetting(displaySetting.copy(enableAutoScroll = it))
+                        headlineContent = { Text(stringResource(R.string.setting_display_page_enable_auto_scroll_title)) },
+                    )
+                }
+            }
+
+            item {
+                CardGroup {
+                    switchItem(
+                        checked = displaySetting.enableBlurEffect,
+                        onCheckedChange = { updateDisplaySetting(displaySetting.copy(enableBlurEffect = it)) },
+                        supportingContent = { Text(stringResource(R.string.setting_display_page_background_effect_desc)) },
+                        headlineContent = { Text(stringResource(R.string.setting_display_page_background_effect_title)) },
+                    )
+                    if (displaySetting.enableBlurEffect) {
+                        formItem(
+                            headlineContent = { Text(stringResource(R.string.setting_display_page_background_effect_type)) },
+                        ) {
+                            ConnectedChoiceButtons(
+                                options = BackgroundEffectType.entries,
+                                selected = displaySetting.backgroundEffectType,
+                                onSelect = { updateDisplaySetting(displaySetting.copy(backgroundEffectType = it)) },
+                            ) { type, selected ->
+                                ConnectedChoiceLabel(
+                                    text = when (type) {
+                                        BackgroundEffectType.BLUR -> stringResource(R.string.setting_display_page_background_effect_blur)
+                                        BackgroundEffectType.GLASS -> stringResource(R.string.setting_display_page_background_effect_glass)
+                                    },
+                                    selected = selected,
+                                )
+                            }
+                        }
+                    }
+                    switchItem(
+                        checked = displaySetting.enableMessageGenerationHapticEffect,
+                        onCheckedChange = {
+                            updateDisplaySetting(displaySetting.copy(enableMessageGenerationHapticEffect = it))
+                        },
+                        supportingContent = { Text(stringResource(R.string.setting_display_page_enable_message_generation_haptic_effect_desc)) },
+                        headlineContent = { Text(stringResource(R.string.setting_display_page_enable_message_generation_haptic_effect_title)) },
+                    )
+                }
+            }
+
+            item {
+                CardGroup {
+                    switchItem(
+                        checked = displaySetting.skipCropImage,
+                        onCheckedChange = { updateDisplaySetting(displaySetting.copy(skipCropImage = it)) },
+                        supportingContent = { Text(stringResource(R.string.setting_display_page_skip_crop_image_desc)) },
+                        headlineContent = { Text(stringResource(R.string.setting_display_page_skip_crop_image_title)) },
+                    )
+                    switchItem(
+                        checked = displaySetting.pasteLongTextAsFile,
+                        onCheckedChange = { updateDisplaySetting(displaySetting.copy(pasteLongTextAsFile = it)) },
+                        supportingContent = { Text(stringResource(R.string.setting_display_page_paste_long_text_as_file_desc)) },
+                        headlineContent = { Text(stringResource(R.string.setting_display_page_paste_long_text_as_file_title)) },
+                    )
+                    if (displaySetting.pasteLongTextAsFile) {
+                        formItem(
+                            headlineContent = { Text(stringResource(R.string.setting_display_page_paste_long_text_threshold_title)) },
+                            trailingContent = { CardGroupValue("${displaySetting.pasteLongTextThreshold}") },
+                        ) {
+                            Slider(
+                                value = displaySetting.pasteLongTextThreshold.toFloat(),
+                                onValueChange = {
+                                    updateDisplaySetting(displaySetting.copy(pasteLongTextThreshold = it.toInt()))
+                                },
+                                valueRange = 100f..10000f,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                    }
+                }
+            }
+
+            item {
+                CardGroup {
+                    switchItem(
+                        checked = displaySetting.enableVolumeKeyScroll,
+                        onCheckedChange = { updateDisplaySetting(displaySetting.copy(enableVolumeKeyScroll = it)) },
+                        supportingContent = { Text(stringResource(R.string.setting_display_page_volume_key_scroll_desc)) },
+                        headlineContent = { Text(stringResource(R.string.setting_display_page_volume_key_scroll_title)) },
+                    )
+                    if (displaySetting.enableVolumeKeyScroll) {
+                        formItem(
+                            headlineContent = { Text(stringResource(R.string.setting_display_page_volume_key_scroll_ratio)) },
+                            trailingContent = { CardGroupValue("${(displaySetting.volumeKeyScrollRatio * 100).toInt()}%") },
+                        ) {
+                            Slider(
+                                value = displaySetting.volumeKeyScrollRatio,
+                                onValueChange = {
+                                    updateDisplaySetting(displaySetting.copy(volumeKeyScrollRatio = it))
+                                },
+                                valueRange = 0.25f..1.0f,
+                                steps = 2,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                    }
+                }
+            }
+
+            item {
+                CardGroup(
+                    title = { Text(stringResource(R.string.setting_page_tts_settings)) },
+                ) {
+                    formItem(
+                        headlineContent = { Text(stringResource(R.string.setting_tts_page_default_playback_speed)) },
+                        supportingContent = { Text(stringResource(R.string.setting_tts_page_default_playback_speed_description)) },
+                        trailingContent = { CardGroupValue("x${"%.1f".format(ttsPlaybackSpeed)}") },
+                    ) {
+                        Slider(
+                            value = ttsPlaybackSpeed,
+                            onValueChange = {
+                                ttsPlaybackSpeed = (it * 10).roundToInt() / 10f
+                            },
+                            onValueChangeFinished = {
+                                vm.updateSettings {
+                                    it.copy(defaultTTSPlaybackSpeed = ttsPlaybackSpeed)
+                                }
+                            },
+                            valueRange = 0.5f..2.0f,
+                            steps = 14,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                    switchItem(
+                        checked = displaySetting.ttsOnlyReadQuoted,
+                        onCheckedChange = { updateDisplaySetting(displaySetting.copy(ttsOnlyReadQuoted = it)) },
+                        supportingContent = { Text(stringResource(R.string.setting_display_page_tts_only_read_quoted_desc)) },
+                        headlineContent = { Text(stringResource(R.string.setting_display_page_tts_only_read_quoted_title)) },
+                    )
+                    switchItem(
+                        checked = displaySetting.ttsOnlyReadOutsideBrackets,
+                        onCheckedChange = { updateDisplaySetting(displaySetting.copy(ttsOnlyReadOutsideBrackets = it)) },
+                        supportingContent = { Text(stringResource(R.string.setting_display_page_tts_read_outside_brackets_desc)) },
+                        headlineContent = { Text(stringResource(R.string.setting_display_page_tts_read_outside_brackets_title)) },
+                    )
+                    switchItem(
+                        checked = displaySetting.autoPlayTTSAfterGeneration,
+                        onCheckedChange = { updateDisplaySetting(displaySetting.copy(autoPlayTTSAfterGeneration = it)) },
+                        supportingContent = { Text(stringResource(R.string.setting_display_page_auto_play_tts_desc)) },
+                        headlineContent = { Text(stringResource(R.string.setting_display_page_auto_play_tts_title)) },
+                    )
+                    switchItem(
+                        checked = displaySetting.voiceModeListenWhileReplying,
+                        onCheckedChange = { updateDisplaySetting(displaySetting.copy(voiceModeListenWhileReplying = it)) },
+                        supportingContent = { Text(stringResource(R.string.setting_display_page_voice_listen_while_replying_desc)) },
+                        headlineContent = { Text(stringResource(R.string.setting_display_page_voice_listen_while_replying_title)) },
+                    )
+                }
+            }
+
+            // 二改：工作区命令时长上限（0 = 不限时，可自主调整）。3.1 重做设置页时丢的入口。
+            item {
+                CardGroup {
+                    formItem(
+                        headlineContent = { Text(stringResource(R.string.setting_workspace_command_timeout_title)) },
+                        supportingContent = { Text(stringResource(R.string.setting_workspace_command_timeout_desc)) },
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Slider(
+                                value = settings.workspaceCommandTimeoutSeconds.toFloat(),
+                                onValueChange = { value ->
+                                    vm.updateSettings {
+                                        it.copy(workspaceCommandTimeoutSeconds = snapTimeoutSeconds(value))
+                                    }
+                                },
+                                valueRange = 0f..7200f,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Text(
+                                text = if (settings.workspaceCommandTimeoutSeconds <= 0) {
+                                    stringResource(R.string.setting_workspace_command_timeout_unlimited)
+                                } else {
+                                    formatTimeoutSeconds(settings.workspaceCommandTimeoutSeconds)
                                 }
                             )
+                        }
+                    }
+                }
+            }
+
+            // v263/v323：回复被截断时自动续写（0 = 关闭）。合并 3.1.0 时官方重做了设置页，
+            // 这一段被整覆盖掉了，但数据层 truncationAutoResumeMax 一直还在 —— 必须补回 UI，
+            // 否则用户找不到续跑次数（守卫测试 TruncationAutoResumeGuardTest 也钉着这个入口）。
+            item {
+                CardGroup {
+                    formItem(
+                        headlineContent = { Text(stringResource(R.string.setting_truncation_auto_resume_title)) },
+                        supportingContent = { Text(stringResource(R.string.setting_truncation_auto_resume_desc)) },
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Slider(
+                                value = settings.truncationAutoResumeMax.toFloat(),
+                                onValueChange = { value ->
+                                    vm.updateSettings {
+                                        it.copy(truncationAutoResumeMax = value.toInt().coerceIn(0, 99))
+                                    }
+                                },
+                                valueRange = 0f..99f,
+                                steps = 98,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Text(
+                                text = if (settings.truncationAutoResumeMax <= 0) {
+                                    stringResource(R.string.setting_truncation_auto_resume_off)
+                                } else {
+                                    settings.truncationAutoResumeMax.toString()
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+
+            // v288/v323：续跑方式（发送「继续」 / 重新生成最后一次输出）。
+            // 同样是官方 3.1 重做设置页时被整覆盖掉的入口。
+            item {
+                CardGroup {
+                    formItem(
+                        headlineContent = { Text(stringResource(R.string.setting_resume_strategy_title)) },
+                        supportingContent = { Text(stringResource(R.string.setting_resume_strategy_desc)) },
+                    ) {
+                        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                            ResumeStrategy.entries.forEachIndexed { index, strategy ->
+                                SegmentedButton(
+                                    selected = settings.resumeStrategy == strategy,
+                                    onClick = {
+                                        vm.updateSettings { it.copy(resumeStrategy = strategy) }
+                                    },
+                                    shape = SegmentedButtonDefaults.itemShape(
+                                        index = index,
+                                        count = ResumeStrategy.entries.size,
+                                    ),
+                                ) {
+                                    Text(
+                                        text = when (strategy) {
+                                            ResumeStrategy.CONTINUE ->
+                                                stringResource(R.string.setting_resume_strategy_continue)
+
+                                            ResumeStrategy.REGENERATE ->
+                                                stringResource(R.string.setting_resume_strategy_regenerate)
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // v268/v323：对话级模型记忆（每个对话记住自己最后用的模型，切回自动恢复）。
+            // 3.1 设置页重做时丢的，数据层字段仍在。
+            item {
+                CardGroup {
+                    switchItem(
+                        checked = settings.rememberModelPerConversation,
+                        onCheckedChange = { checked ->
+                            vm.updateSettings { it.copy(rememberModelPerConversation = checked) }
                         },
+                        supportingContent = { Text(stringResource(R.string.setting_remember_model_desc)) },
+                        headlineContent = { Text(stringResource(R.string.setting_remember_model_title)) },
                     )
-                    item(
-                        headlineContent = { Text(stringResource(R.string.setting_display_page_use_app_icon_style_loading_indicator_title)) },
+                }
+            }
+            // 二改：是否使用 App 图标样式的加载指示器（官方 3.1 重做设置页时丢的入口）
+            item {
+                CardGroup {
+                    switchItem(
+                        checked = displaySetting.useAppIconStyleLoadingIndicator,
+                        onCheckedChange = {
+                            updateDisplaySetting(
+                                displaySetting.copy(useAppIconStyleLoadingIndicator = it)
+                            )
+                        },
                         supportingContent = {
                             Text(stringResource(R.string.setting_display_page_use_app_icon_style_loading_indicator_desc))
                         },
-                        trailingContent = {
-                            Switch(
-                                checked = displaySetting.useAppIconStyleLoadingIndicator,
-                                onCheckedChange = {
-                                    updateDisplaySetting(displaySetting.copy(useAppIconStyleLoadingIndicator = it))
-                                }
-                            )
-                        },
-                    )
-                    item(
-                        headlineContent = { Text(stringResource(R.string.setting_display_page_background_effect_title)) },
-                        supportingContent = { Text(stringResource(R.string.setting_display_page_background_effect_desc)) },
-                        trailingContent = {
-                            Switch(
-                                checked = displaySetting.enableBlurEffect,
-                                onCheckedChange = {
-                                    updateDisplaySetting(displaySetting.copy(enableBlurEffect = it))
-                                }
-                            )
-                        },
-                    )
-                    if (displaySetting.enableBlurEffect) {
-                        item(
-                            headlineContent = { Text(stringResource(R.string.setting_display_page_background_effect_type)) },
-                            supportingContent = {
-                                Select(
-                                    options = BackgroundEffectType.entries,
-                                    selectedOption = displaySetting.backgroundEffectType,
-                                    onOptionSelected = {
-                                        updateDisplaySetting(displaySetting.copy(backgroundEffectType = it))
-                                    },
-                                    modifier = Modifier.padding(top = 4.dp).fillMaxWidth(),
-                                    optionToString = {
-                                        when (it) {
-                                            BackgroundEffectType.BLUR -> stringResource(R.string.setting_display_page_background_effect_blur)
-                                            BackgroundEffectType.GLASS -> stringResource(R.string.setting_display_page_background_effect_glass)
-                                        }
-                                    },
-                                )
-                            },
-                        )
-                    }
-                    item(
-                        headlineContent = { Text(stringResource(R.string.setting_display_page_enable_message_generation_haptic_effect_title)) },
-                        supportingContent = { Text(stringResource(R.string.setting_display_page_enable_message_generation_haptic_effect_desc)) },
-                        trailingContent = {
-                            Switch(
-                                checked = displaySetting.enableMessageGenerationHapticEffect,
-                                onCheckedChange = {
-                                    updateDisplaySetting(displaySetting.copy(enableMessageGenerationHapticEffect = it))
-                                }
-                            )
-                        },
-                    )
-                    item(
-                        headlineContent = { Text(stringResource(R.string.setting_display_page_skip_crop_image_title)) },
-                        supportingContent = { Text(stringResource(R.string.setting_display_page_skip_crop_image_desc)) },
-                        trailingContent = {
-                            Switch(
-                                checked = displaySetting.skipCropImage,
-                                onCheckedChange = {
-                                    updateDisplaySetting(displaySetting.copy(skipCropImage = it))
-                                }
-                            )
-                        },
-                    )
-                    item(
-                        headlineContent = { Text(stringResource(R.string.setting_display_page_paste_long_text_as_file_title)) },
-                        supportingContent = { Text(stringResource(R.string.setting_display_page_paste_long_text_as_file_desc)) },
-                        trailingContent = {
-                            Switch(
-                                checked = displaySetting.pasteLongTextAsFile,
-                                onCheckedChange = {
-                                    updateDisplaySetting(displaySetting.copy(pasteLongTextAsFile = it))
-                                }
-                            )
-                        },
-                    )
-                    if (displaySetting.pasteLongTextAsFile) {
-                        item(
-                            headlineContent = { Text(stringResource(R.string.setting_display_page_paste_long_text_threshold_title)) },
-                            supportingContent = {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                ) {
-                                    Slider(
-                                        value = displaySetting.pasteLongTextThreshold.toFloat(),
-                                        onValueChange = {
-                                            updateDisplaySetting(displaySetting.copy(pasteLongTextThreshold = it.toInt()))
-                                        },
-                                        valueRange = 100f..10000f,
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                    Text(text = "${displaySetting.pasteLongTextThreshold}")
-                                }
-                            },
-                        )
-                    }
-                    item(
-                        headlineContent = { Text(stringResource(R.string.setting_display_page_volume_key_scroll_title)) },
-                        supportingContent = { Text(stringResource(R.string.setting_display_page_volume_key_scroll_desc)) },
-                        trailingContent = {
-                            Switch(
-                                checked = displaySetting.enableVolumeKeyScroll,
-                                onCheckedChange = {
-                                    updateDisplaySetting(displaySetting.copy(enableVolumeKeyScroll = it))
-                                }
-                            )
-                        },
-                    )
-                    if (displaySetting.enableVolumeKeyScroll) {
-                        item(
-                            headlineContent = { Text(stringResource(R.string.setting_display_page_volume_key_scroll_ratio)) },
-                            supportingContent = {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                ) {
-                                    Slider(
-                                        value = displaySetting.volumeKeyScrollRatio,
-                                        onValueChange = {
-                                            updateDisplaySetting(displaySetting.copy(volumeKeyScrollRatio = it))
-                                        },
-                                        valueRange = 0.25f..1.0f,
-                                        steps = 2,
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                    Text(text = "${(displaySetting.volumeKeyScrollRatio * 100).toInt()}%")
-                                }
-                            }
-                        )
-                    }
-                }
-            }
-
-            item {
-                CardGroup(
-                    modifier = Modifier.padding(horizontal = 8.dp),
-                    title = { Text(stringResource(R.string.setting_page_tts_settings)) },
-                ) {
-                    item(
                         headlineContent = {
-                            Text(stringResource(R.string.setting_tts_page_default_playback_speed))
-                        },
-                        supportingContent = {
-                            Column {
-                                Text(stringResource(R.string.setting_tts_page_default_playback_speed_description))
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                ) {
-                                    Slider(
-                                        value = ttsPlaybackSpeed,
-                                        onValueChange = {
-                                            ttsPlaybackSpeed = (it * 10).roundToInt() / 10f
-                                        },
-                                        onValueChangeFinished = {
-                                            vm.updateSettings(
-                                                settings.copy(defaultTTSPlaybackSpeed = ttsPlaybackSpeed)
-                                            )
-                                        },
-                                        valueRange = 0.5f..2.0f,
-                                        steps = 14,
-                                        modifier = Modifier.weight(1f),
-                                    )
-                                    Text(text = "x${"%.1f".format(ttsPlaybackSpeed)}")
-                                }
-                            }
-                        },
-                    )
-                    item(
-                        headlineContent = { Text(stringResource(R.string.setting_display_page_tts_only_read_quoted_title)) },
-                        supportingContent = { Text(stringResource(R.string.setting_display_page_tts_only_read_quoted_desc)) },
-                        trailingContent = {
-                            Switch(
-                                checked = displaySetting.ttsOnlyReadQuoted,
-                                onCheckedChange = {
-                                    updateDisplaySetting(displaySetting.copy(ttsOnlyReadQuoted = it))
-                                }
-                            )
-                        },
-                    )
-                    item(
-                        headlineContent = { Text(stringResource(R.string.setting_display_page_tts_read_outside_brackets_title)) },
-                        supportingContent = { Text(stringResource(R.string.setting_display_page_tts_read_outside_brackets_desc)) },
-                        trailingContent = {
-                            Switch(
-                                checked = displaySetting.ttsOnlyReadOutsideBrackets,
-                                onCheckedChange = {
-                                    updateDisplaySetting(displaySetting.copy(ttsOnlyReadOutsideBrackets = it))
-                                }
-                            )
-                        },
-                    )
-                    item(
-                        headlineContent = { Text(stringResource(R.string.setting_display_page_auto_play_tts_title)) },
-                        supportingContent = { Text(stringResource(R.string.setting_display_page_auto_play_tts_desc)) },
-                        trailingContent = {
-                            Switch(
-                                checked = displaySetting.autoPlayTTSAfterGeneration,
-                                onCheckedChange = {
-                                    updateDisplaySetting(displaySetting.copy(autoPlayTTSAfterGeneration = it))
-                                }
-                            )
-                        },
-                    )
-                }
-            }
-
-            // 工作区命令时长上限 (二改新增): 0 = 不限时
-            item {
-                CardGroup(
-                    modifier = Modifier.padding(horizontal = 8.dp),
-                ) {
-                    item(
-                        headlineContent = { Text(stringResource(R.string.setting_workspace_command_timeout_title)) },
-                        supportingContent = {
-                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Text(stringResource(R.string.setting_workspace_command_timeout_desc))
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                ) {
-                                    Slider(
-                                        value = settings.workspaceCommandTimeoutSeconds.toFloat(),
-                                        onValueChange = { value ->
-                                            vm.updateSettings(
-                                                settings.copy(
-                                                    workspaceCommandTimeoutSeconds = snapTimeoutSeconds(value)
-                                                )
-                                            )
-                                        },
-                                        valueRange = 0f..7200f,
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                    Text(
-                                        text = if (settings.workspaceCommandTimeoutSeconds <= 0) {
-                                            stringResource(R.string.setting_workspace_command_timeout_unlimited)
-                                        } else {
-                                            formatTimeoutSeconds(settings.workspaceCommandTimeoutSeconds)
-                                        }
-                                    )
-                                }
-                            }
-                        },
-                    )
-                }
-            }
-
-            // 回复被截断时自动续写 (v263 二改新增): 0 = 关闭, 默认 3, 范围 0~10
-            item {
-                CardGroup(
-                    modifier = Modifier.padding(horizontal = 8.dp),
-                ) {
-                    item(
-                        headlineContent = { Text(stringResource(R.string.setting_truncation_auto_resume_title)) },
-                        supportingContent = {
-                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Text(stringResource(R.string.setting_truncation_auto_resume_desc))
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                ) {
-                                    Slider(
-                                        value = settings.truncationAutoResumeMax.toFloat(),
-                                        onValueChange = { value ->
-                                            vm.updateSettings(
-                                                settings.copy(
-                                                    truncationAutoResumeMax = value.toInt().coerceIn(0, 99)
-                                                )
-                                            )
-                                        },
-                                        valueRange = 0f..99f,
-                                        steps = 98,
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                    Text(
-                                        text = if (settings.truncationAutoResumeMax <= 0) {
-                                            stringResource(R.string.setting_truncation_auto_resume_off)
-                                        } else {
-                                            settings.truncationAutoResumeMax.toString()
-                                        }
-                                    )
-                                }
-                            }
-                        },
-                    )
-                }
-            }
-
-            // 续跑方式 (v288 二改新增): 发送「继续」 / 重新生成最后一次输出
-            // 替换了 v267~v272 的「续跑思考模式」(思考回灌，问题多已整体废弃)
-            item {
-                CardGroup(
-                    modifier = Modifier.padding(horizontal = 8.dp),
-                ) {
-                    item(
-                        headlineContent = { Text(stringResource(R.string.setting_resume_strategy_title)) },
-                        supportingContent = {
-                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Text(stringResource(R.string.setting_resume_strategy_desc))
-                                SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-                                    ResumeStrategy.entries.forEachIndexed { index, strategy ->
-                                        SegmentedButton(
-                                            selected = settings.resumeStrategy == strategy,
-                                            onClick = {
-                                                vm.updateSettings(
-                                                    settings.copy(resumeStrategy = strategy)
-                                                )
-                                            },
-                                            shape = SegmentedButtonDefaults.itemShape(
-                                                index = index,
-                                                count = ResumeStrategy.entries.size,
-                                            ),
-                                        ) {
-                                            Text(
-                                                text = when (strategy) {
-                                                    ResumeStrategy.CONTINUE ->
-                                                        stringResource(R.string.setting_resume_strategy_continue)
-
-                                                    ResumeStrategy.REGENERATE ->
-                                                        stringResource(R.string.setting_resume_strategy_regenerate)
-                                                }
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        },
-                    )
-                }
-            }
-
-            // 对话级模型记忆 (v268 二改新增): 开=每个对话记住自己最后用的模型, 切回自动恢复
-            item {
-                CardGroup(
-                    modifier = Modifier.padding(horizontal = 8.dp),
-                ) {
-                    item(
-                        headlineContent = { Text(stringResource(R.string.setting_remember_model_title)) },
-                        supportingContent = {
-                            Text(stringResource(R.string.setting_remember_model_desc))
-                        },
-                        trailingContent = {
-                            Switch(
-                                checked = settings.rememberModelPerConversation,
-                                onCheckedChange = { checked ->
-                                    vm.updateSettings(
-                                        settings.copy(rememberModelPerConversation = checked)
-                                    )
-                                },
-                            )
+                            Text(stringResource(R.string.setting_display_page_use_app_icon_style_loading_indicator_title))
                         },
                     )
                 }
@@ -518,7 +417,7 @@ fun SettingPreferencesGeneralPage(vm: SettingVM = koinViewModel()) {
     }
 }
 
-/** 把滑块值吸附到常用档位: 0(不限) / 30s / 1m / 5m / 10m / 30m / 1h / 2h */
+/** 二改：工作区超时滑块只落在这些档位上，避免滑出一个没法读的秒数。 */
 private fun snapTimeoutSeconds(value: Float): Int {
     val options = intArrayOf(0, 30, 60, 300, 600, 1800, 3600, 7200)
     return options.minByOrNull { kotlin.math.abs(it - value) } ?: 0

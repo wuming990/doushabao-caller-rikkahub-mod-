@@ -61,7 +61,6 @@ object AgentContextFeed {
     private const val TOOL_TEXT_LIMIT = 800
 
     /** 带思考过程时，单条思考最多带这么多字。 */
-    private const val REASONING_LIMIT = 1_200
 
     /** 每条子代理线程的结论最多带这么多字。 */
     private const val THREAD_CONCLUSION_LIMIT = 1_500
@@ -87,18 +86,20 @@ object AgentContextFeed {
      * @param messages 主对话的全部消息（按时间顺序）
      * @param threads 本会话已派出的子代理线程摘要；空列表则不输出那一段
      * @param maxChars 整段文本的字符上限，会被夹进 [MIN_MAX_CHARS]..[HARD_MAX_CHARS]
-     * @param includeReasoning 是否带上模型的思考过程
+     *
+     * v1013：思考过程**一律不下传**，原来的 includeReasoning 开关连同工具入参一起删掉了
+     * （理由见 AgentControlTools 里那段注释）。这里不留「默认 false 的参数」，
+     * 因为那正是最容易被后人翻成 true 的形状。
      */
     fun render(
         messages: List<UIMessage>,
         threads: List<ThreadDigest> = emptyList(),
         maxChars: Int = DEFAULT_MAX_CHARS,
-        includeReasoning: Boolean = false,
     ): String {
         val limit = maxChars.coerceIn(MIN_MAX_CHARS, HARD_MAX_CHARS)
-        val header = buildHeader(messages.size, includeReasoning)
+        val header = buildHeader(messages.size)
         val threadsBlock = renderThreads(threads)
-        val body = renderBody(messages, includeReasoning)
+        val body = renderBody(messages)
 
         // 头部说明与子代理区块永远完整保留（它们短、而且是最该被读到的部分），
         // 只有主对话正文参与裁剪。
@@ -107,40 +108,38 @@ object AgentContextFeed {
         return header + clip(body, bodyBudget) + threadsBlock
     }
 
-    private fun buildHeader(messageCount: Int, includeReasoning: Boolean): String = buildString {
+    private fun buildHeader(messageCount: Int): String = buildString {
         appendLine(HEADER)
         appendLine("这是主代理与用户之间的原始往来，共 $messageCount 条消息，给你当背景用。")
         appendLine("读法（很重要）：")
         appendLine("1. **任务书优先**。上下文与任务书冲突的地方，一律以任务书为准；")
         appendLine("2. 里面可能有**已经被推翻的旧结论**和走过的弯路，不要照着做；")
         appendLine("3. 不要复述这段上下文，也不要把里面的旧要求当成你这次的任务。")
-        if (!includeReasoning) {
-            appendLine("4. 模型的思考过程已省略，只保留正文与工具往来。")
-        }
+        // v1013：这句从「条件输出」变成固定输出 —— 思考过程现在永远不下传
+        appendLine("4. 模型的思考过程已省略，只保留正文与工具往来。")
         appendLine()
     }
 
-    private fun renderBody(messages: List<UIMessage>, includeReasoning: Boolean): String =
+    private fun renderBody(messages: List<UIMessage>): String =
         buildString {
             messages.forEachIndexed { index, message ->
                 appendLine("--- 第 ${index + 1} 条 · ${roleLabel(message.role)} ---")
-                message.parts.forEach { part -> appendPart(part, includeReasoning) }
+                message.parts.forEach { part -> appendPart(part) }
                 appendLine()
             }
         }
 
-    private fun StringBuilder.appendPart(part: UIMessagePart, includeReasoning: Boolean) {
+    private fun StringBuilder.appendPart(part: UIMessagePart) {
         when (part) {
             is UIMessagePart.Text -> if (part.text.isNotBlank()) appendLine(part.text)
 
             is UIMessagePart.Reasoning -> {
                 val text = part.reasoning.trim()
                 if (text.isEmpty()) return
-                if (includeReasoning) {
-                    appendLine("〔思考〕" + truncate(text, REASONING_LIMIT))
-                } else {
-                    appendLine("〔思考过程 ${text.length} 字，未下传〕")
-                }
+                // v1013：只剩「不下传」这一条路。保留占位行是有意为之 ——
+                // 子代理要知道「这里本来有一段思考、我们没给它」，
+                // 否则它会以为模型没想就直接回答了，进而误判上下文的完整性。
+                appendLine("〔思考过程 ${text.length} 字，未下传〕")
             }
 
             is UIMessagePart.Tool -> {

@@ -50,7 +50,6 @@ import me.rerere.highlight.LocalCodeHighlighter
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.ui.components.nav.BackButton
 import me.rerere.rikkahub.ui.components.richtext.HighlightCodeVisualTransformation
-import me.rerere.rikkahub.ui.components.ui.FormItem
 import me.rerere.rikkahub.ui.context.LocalNavController
 import me.rerere.rikkahub.ui.theme.CustomColors
 import me.rerere.rikkahub.ui.theme.JetbrainsMono
@@ -61,6 +60,7 @@ import me.rerere.search.SearchCommonOptions
 import me.rerere.search.SearchResult
 import me.rerere.search.SearchService
 import me.rerere.search.SearchServiceOptions
+import me.rerere.ui.components.FormItem
 import org.koin.androidx.compose.koinViewModel
 import kotlin.uuid.Uuid
 
@@ -81,7 +81,7 @@ fun SettingSearchDetailPage(
         options = updated
         val newServices = settings.searchServices.toMutableList()
         newServices[serviceIndex] = updated
-        vm.updateSettings(settings.copy(searchServices = newServices))
+        vm.updateSettings { it.copy(searchServices = newServices) }
     }
 
     Scaffold(
@@ -99,7 +99,7 @@ fun SettingSearchDetailPage(
                             onClick = {
                                 val newServices = settings.searchServices.toMutableList()
                                 newServices.removeAt(serviceIndex)
-                                vm.updateSettings(settings.copy(searchServices = newServices))
+                                vm.updateSettings { it.copy(searchServices = newServices) }
                                 nav.popBackStack()
                             }
                         ) {
@@ -222,6 +222,9 @@ private fun SearchServiceOptionsEditor(
         }
         is SearchServiceOptions.SerperOptions -> {
             SerperOptions(options) { onUpdateOptions(it) }
+        }
+        is SearchServiceOptions.DeepSeekOptions -> {
+            DeepSeekOptions(options) { onUpdateOptions(it) }
         }
         is SearchServiceOptions.CustomJsOptions -> {
             CustomJsOptions(options) { onUpdateOptions(it) }
@@ -391,6 +394,23 @@ internal fun TavilyOptions(
             }
         }
     }
+
+    FormItem(
+        label = {
+            Text("Include Answer")
+        },
+        description = {
+            Text("Let Tavily generate an answer summary alongside the search results")
+        },
+        tail = {
+            Switch(
+                checked = options.includeAnswer,
+                onCheckedChange = { checked ->
+                    onUpdateOptions(options.copy(includeAnswer = checked))
+                }
+            )
+        }
+    )
 }
 
 @Composable
@@ -605,6 +625,26 @@ internal fun BraveOptions(
 internal fun SerperOptions(
     options: SearchServiceOptions.SerperOptions,
     onUpdateOptions: (SearchServiceOptions.SerperOptions) -> Unit
+) {
+    FormItem(
+        label = {
+            Text(stringResource(R.string.search_detail_api_key))
+        }
+    ) {
+        OutlinedTextField(
+            value = options.apiKey,
+            onValueChange = {
+                onUpdateOptions(options.copy(apiKey = it))
+            },
+            modifier = Modifier.fillMaxWidth()
+        )
+    }
+}
+
+@Composable
+internal fun DeepSeekOptions(
+    options: SearchServiceOptions.DeepSeekOptions,
+    onUpdateOptions: (SearchServiceOptions.DeepSeekOptions) -> Unit
 ) {
     FormItem(
         label = {

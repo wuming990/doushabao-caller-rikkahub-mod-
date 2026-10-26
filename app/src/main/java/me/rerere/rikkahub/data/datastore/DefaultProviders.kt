@@ -8,8 +8,8 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.withStyle
-import me.rerere.ai.provider.BalanceOption
 import me.rerere.ai.provider.ProviderSetting
+import me.rerere.ai.provider.QuotaQuery
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.ui.components.richtext.MarkdownBlock
 import kotlin.uuid.Uuid
@@ -19,6 +19,8 @@ val DEFAULT_AUTO_MODEL_ID = Uuid.parse("b7055fb4-39f9-4042-a88a-0d80ed76cf08")
 val DEFAULT_CODEX_PROVIDER_ID = Uuid.parse("7ce7e322-b995-4b0c-9d48-42e08dcfcdda")
 val DEFAULT_GROK_PROVIDER_ID = Uuid.parse("8f3e1d20-4b6a-4c9e-a1f2-9d5c7e0b3a44")
 val DEFAULT_GEMINI_OAUTH_PROVIDER_ID = Uuid.parse("2b6c1f84-73ad-4e35-b0c7-1a9e4d5f8c21")
+// v323：Gemini 网页版（浏览器 Cookie 直连，非官方接口）
+val DEFAULT_GEMINI_WEB_PROVIDER_ID = Uuid.parse("d8f3a1c2-5b47-4e9a-9c61-2f0e7a4b8d35")
 
 val DEFAULT_PROVIDERS = listOf(
     ProviderSetting.OpenAI(
@@ -50,6 +52,17 @@ val DEFAULT_PROVIDERS = listOf(
             Text(stringResource(R.string.gemini_provider_short_description))
         },
     ),
+    // v323：Gemini 网页版（浏览器 Cookie 直连 gemini.google.com，非官方接口）。
+    // 默认关闭；用户在配置页粘贴 Cookie 后再启用。
+    ProviderSetting.GeminiWeb(
+        id = DEFAULT_GEMINI_WEB_PROVIDER_ID,
+        name = "Gemini 网页版",
+        enabled = false,
+        builtIn = true,
+        shortDescription = {
+            Text("用浏览器 Cookie 登录，不需要 API Key；非官方接口，可能随 Google 改版失效")
+        },
+    ),
     ProviderSetting.Google(
         id = Uuid.parse("6ab18148-c138-4394-a46f-1cd8c8ceaa6d"),
         name = "Gemini",
@@ -63,9 +76,9 @@ val DEFAULT_PROVIDERS = listOf(
         baseUrl = "https://api.deepseek.com/v1",
         apiKey = "",
         builtIn = true,
-        balanceOption = BalanceOption(
+        quotaQuery = QuotaQuery(
             enabled = true,
-            apiPath = "/user/balance",
+            url = "{{baseUrl}}/user/balance",
             resultPath = "balance_infos[0].total_balance"
         )
     ),
@@ -76,9 +89,9 @@ val DEFAULT_PROVIDERS = listOf(
         apiKey = "",
         enabled = true,
         builtIn = true,
-        balanceOption = BalanceOption(
+        quotaQuery = QuotaQuery(
             enabled = true,
-            apiPath = "/users/me/balance",
+            url = "{{baseUrl}}/users/me/balance",
             resultPath = "data.available_balance"
         )
     ),
@@ -88,9 +101,9 @@ val DEFAULT_PROVIDERS = listOf(
         baseUrl = "https://openrouter.ai/api/v1",
         apiKey = "",
         builtIn = true,
-        balanceOption = BalanceOption(
+        quotaQuery = QuotaQuery(
             enabled = true,
-            apiPath = "/credits",
+            url = "{{baseUrl}}/credits",
             resultPath = "data.total_credits - data.total_usage",
         )
     ),
@@ -101,9 +114,9 @@ val DEFAULT_PROVIDERS = listOf(
         apiKey = "",
         enabled = false,
         builtIn = true,
-        balanceOption = BalanceOption(
+        quotaQuery = QuotaQuery(
             enabled = true,
-            apiPath = "/credits",
+            url = "{{baseUrl}}/credits",
             resultPath = "balance",
         )
     ),

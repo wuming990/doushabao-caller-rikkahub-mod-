@@ -396,17 +396,30 @@ internal class GroupChatRun(
      */
     fun requestSpeaker(modelId: Uuid): Boolean {
         val current = _state.value
-        if (current.status == GroupRunStatus.STOPPED || current.status == GroupRunStatus.FINISHED) {
-            return false
-        }
-        _state.value = current.copy(nextSpeakerOverride = modelId)
-        return true
+        val blocked = current.status == GroupRunStatus.STOPPED || current.status == GroupRunStatus.FINISHED
+        // v1009：**无论这一场停没停，名字都要记下来**。
+        //
+        // 真机症状（用户原话）：「轮到 B 模型讨论，我想开始就让 C 先，点击 C 后没有直接从 C 开始，
+        // 还是从 B 开始；需要开始之后再点一次 C 才能切过来」。
+        // 根因就在这里：旧写法在 STOPPED / FINISHED 时直接 return false，名字没存，
+        // 而调用方紧接着就开新一批 —— 新的一批于是按轮流从 B 开始，用户看到的就是「点了没用」。
+        // 状态该不该被点名改回可跑，仍由返回值表达（调用方据此决定要不要开新一批），
+        // 但「记名字」这件事跟状态无关。
+        //
+        // ⚠️ 必须用 `update`（CAS 循环）而不是 `_state.value = current.copy(...)`：
+        // 后者会把中间发生的 markTurnDone / touch 一起回滚（同一人连说两条、批次多跑一条）。
+        _state.update { it.copy(nextSpeakerOverride = modelId) }
+        return !blocked
     }
 
     /** v319：取走点名并清空（引擎每轮开头调一次；没人被点名返回 null） */
     fun takeRequestedSpeaker(): Uuid? {
-        val pending = _state.value.nextSpeakerOverride ?: return null
-        _state.value = _state.value.copy(nextSpeakerOverride = null)
+        var pending: Uuid? = null
+        // 同上：读-改-写必须原子，否则可能把别的字段一起写回旧值。
+        _state.update { state ->
+            pending = state.nextSpeakerOverride
+            state.copy(nextSpeakerOverride = null)
+        }
         return pending
     }
 

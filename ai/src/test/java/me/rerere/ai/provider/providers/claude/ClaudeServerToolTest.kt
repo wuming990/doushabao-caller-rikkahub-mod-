@@ -410,10 +410,13 @@ class ClaudeServerToolTest {
             List::class.java,
             TextGenerationParams::class.java,
             Boolean::class.javaPrimitiveType,
+            // v1013：第 5 个参数现在是 ClaudeRequestFlags（不再是档位下标）。
+            ClaudeRequestFlags::class.java,
         )
         method.isAccessible = true
-        return method.invoke(provider, providerSetting, messages, params, false)
-            as kotlinx.serialization.json.JsonObject
+        return method.invoke(
+            provider, providerSetting, messages, params, false, ClaudeRequestFlags(),
+        ) as kotlinx.serialization.json.JsonObject
     }
 
     private fun buildMessages(messages: List<UIMessage>): JsonArray {

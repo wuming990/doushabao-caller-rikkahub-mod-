@@ -66,6 +66,7 @@ import me.rerere.common.http.await
 import me.rerere.common.http.jsonArrayOrNull
 import me.rerere.common.http.jsonObjectOrNull
 import me.rerere.common.http.jsonPrimitiveOrNull
+import me.rerere.common.http.sse.newEventSource
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -74,7 +75,6 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
-import okhttp3.sse.EventSources
 import kotlin.time.Clock
 
 private const val TAG = "ChatCompletionsAPI"
@@ -214,7 +214,7 @@ class ChatCompletionsAPI(
             currentKey = keyRoulette.next(providerSetting.apiKey, providerId)
             Log.w(TAG, "$reason，已切换 key 重试（第 $keySwitchCount 把 / 池共 $keyPoolSize 把）")
             activeEventSource =
-                EventSources.createFactory(client).newEventSource(buildRequest(currentKey), source)
+                client.newEventSource(buildRequest(currentKey), source)
             return true
         }
 
@@ -282,8 +282,7 @@ class ChatCompletionsAPI(
             }
         }
 
-        activeEventSource = EventSources.createFactory(client)
-            .newEventSource(buildRequest(currentKey), listener)
+        activeEventSource = client.newEventSource(buildRequest(currentKey), listener)
 
         awaitClose {
             println("[awaitClose] 关闭eventSource ")
@@ -300,6 +299,18 @@ class ChatCompletionsAPI(
     ): JsonObject {
         val host = providerSetting.baseUrl.toHttpUrl().host
         val isOpenRouter = host == "openrouter.ai"
+        // v1010：DeepSeek 思考模式 + 带 tools 时，官方要求历史里**每一条 assistant 消息**都带回
+        // reasoning_content，缺字段就 400，而且这条消息已经进了会话历史 —— 之后每一句都会失败
+        // （用户看到的正是「旧对话升级后一直报、新开对话才好」）。
+        // 官方文档 + 社区实测：上游偶尔就是会给出一轮**零思考**的工具调用（reasoning_tokens = 0），
+        // 这种轮次客户端造不出思考，唯一正确的做法是把字段带上、值为空串。
+        // qwen-code / langchain / openclaw / hermes 全是同一招，本处照抄，不自创清理逻辑。
+        val needsReasoningReplay = requiresReasoningContentReplay(
+            modelId = params.model.modelId,
+            // 与请求体里**实际输出 tools 的条件**保持一致（:515 那条），否则会出现
+            // 「补了字段却没带 tools」的不对称形状（审查位 v1010 P1-3）
+            hasTools = params.model.abilities.contains(ModelAbility.TOOL) && params.tools.isNotEmpty(),
+        )
         return buildJsonObject {
             put("model", params.model.modelId)
             put(
@@ -309,6 +320,7 @@ class ChatCompletionsAPI(
                     includeHistoryReasoning = providerSetting.includeHistoryReasoning,
                     includeOpenRouterReasoningDetails = isOpenRouter,
                     supportInputModalities = params.model.inputModalities,
+                    alwaysIncludeReasoning = needsReasoningReplay,
                 )
             )
 
@@ -540,6 +552,7 @@ class ChatCompletionsAPI(
         includeHistoryReasoning: Boolean = true,
         includeOpenRouterReasoningDetails: Boolean = false,
         supportInputModalities: List<Modality> = listOf(Modality.TEXT, Modality.IMAGE),
+        alwaysIncludeReasoning: Boolean = false,
     ) = buildJsonArray {
         val filteredMessages = messages.filter { it.isValidToUpload() }
 
@@ -550,6 +563,7 @@ class ChatCompletionsAPI(
                     includeReasoning = includeHistoryReasoning,
                     includeOpenRouterReasoningDetails = includeOpenRouterReasoningDetails,
                     supportInputModalities = supportInputModalities,
+                    alwaysIncludeReasoning = alwaysIncludeReasoning,
                 )
             } else {
                 addNonAssistantMessage(message)
@@ -562,6 +576,7 @@ class ChatCompletionsAPI(
         includeReasoning: Boolean,
         includeOpenRouterReasoningDetails: Boolean,
         supportInputModalities: List<Modality>,
+        alwaysIncludeReasoning: Boolean = false,
     ) {
         val groups = groupPartsByToolBoundary(message.parts)
         val contentBuffer = mutableListOf<UIMessagePart>()
@@ -588,6 +603,7 @@ class ChatCompletionsAPI(
                         tools = group.tools,
                         reasoningPart = reasoningPart,
                         includeOpenRouterReasoningDetails = includeOpenRouterReasoningDetails,
+                        alwaysIncludeReasoning = alwaysIncludeReasoning,
                     )?.let { assistantMessage ->
                         add(assistantMessage)
                     }
@@ -617,6 +633,7 @@ class ChatCompletionsAPI(
                 tools = emptyList(),
                 reasoningPart = reasoningPart,
                 includeOpenRouterReasoningDetails = includeOpenRouterReasoningDetails,
+                alwaysIncludeReasoning = alwaysIncludeReasoning,
             )?.let { assistantMessage ->
                 add(assistantMessage)
             }
@@ -628,6 +645,7 @@ class ChatCompletionsAPI(
         tools: List<UIMessagePart.Tool>,
         reasoningPart: UIMessagePart.Reasoning?,
         includeOpenRouterReasoningDetails: Boolean,
+        alwaysIncludeReasoning: Boolean = false,
     ): JsonObject? {
         val hasUsableContent = contentParts.any { part ->
             when (part) {
@@ -656,6 +674,10 @@ class ChatCompletionsAPI(
                 } else {
                     put("reasoning_content", reasoningPart?.reasoning.orEmpty())
                 }
+            } else if (alwaysIncludeReasoning) {
+                // v1010：DeepSeek 带 tools 时字段必须存在，**空串就能过校验**（社区多方实测）。
+                // 不补就会让整条会话从此每句都 400，且无法自愈。
+                put("reasoning_content", "")
             }
 
             // content
@@ -915,3 +937,14 @@ class ChatCompletionsAPI(
         return gonnaSend == texts && texts == 1
     }
 }
+
+/**
+ * v1010：DeepSeek 系在**带 tools** 的请求里，要求历史每条 assistant 都带回 reasoning_content。
+ *
+ * 判据刻意放宽（不看模型有没有标推理能力、不看用户选的档位）：
+ * ① DeepSeek V4 的思考模式**默认就是开的**，中转站还常常不透传 `thinking` 参数，
+ *    按档位判会漏；② 多带一个空串字段对不思考的情况无害（官方文档：不带 tools 时该字段被忽略）。
+ * 其它模型一律不受影响。
+ */
+internal fun requiresReasoningContentReplay(modelId: String, hasTools: Boolean): Boolean =
+    hasTools && modelId.contains("deepseek", ignoreCase = true)

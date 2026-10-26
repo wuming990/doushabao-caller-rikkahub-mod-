@@ -52,7 +52,8 @@ class GroupChatWiringGuardTest {
     private val mainModel = source(base + "data/model/GroupChat.kt")
     private val chatPage = source(base + "ui/pages/chat/ChatPage.kt")
     private val chatVM = source(base + "ui/pages/chat/ChatVM.kt")
-    private val store = source(base + "data/datastore/PreferencesStore.kt")
+    private val store = source(base + "data/datastore/PreferencesStore.kt") +
+        "\n" + source(base + "data/datastore/Settings.kt") // v323：官方 3.1 把 Settings 字段拆到 Settings.kt，判据改读两个文件（断言内容未改）
 
     // ---- P0-1：主持人挑人不得写进对话 ----
 
@@ -527,7 +528,7 @@ class GroupChatWiringGuardTest {
 
         // 数据库版本没动
         val db = source(base + "data/db/AppDatabase.kt")
-        assertTrue("AppDatabase 必须保持 25", db.contains("version = 25,"))
+        assertTrue("AppDatabase 必须保持 32（v1017 用户授权31升32）", db.contains("version = 32,"))
         val agentDb = source(base + "agent/db/AgentDatabase.kt")
         assertTrue("AgentDatabase 必须保持 3", agentDb.contains("version = 3,"))
     }
@@ -854,7 +855,7 @@ class GroupChatWiringGuardTest {
         // 就有它，而反向断言连注释一起算（手册 §7.3 记过两次同类事故，本轮第三次差点再踩）。
         // 要看就看数据库定义文件本身。
         val appDbSource = source(base + "data/db/AppDatabase.kt")
-        assertTrue("AppDatabase 必须仍是 25", appDbSource.contains("version = 25,"))
+        assertTrue("AppDatabase 必须仍是 32（v1017 用户授权31升32）", appDbSource.contains("version = 32,"))
         // 审查位 v317 抓的 P2-3：原先这条「面板文件里不许出现 @Entity/Migration」近似恒真
         // （界面文件本来就不会有 Room 注解），只会给人"已经防住了"的错觉。
         // 换成直接钉两个数据库文件的版本号 —— 这才是「没动数据库」的权威判据。
@@ -907,8 +908,15 @@ class GroupChatWiringGuardTest {
         // ⚠️ 必须与**注册处**比，不能与硬编码字面量比 —— 后者只证明我抄对了抄本，
         // 工具改名时三处都会安静地跟着错（审查位 v318 抓的假绿）。
         val toolSource = source(base + "data/ai/tools/local/AskUserTool.kt")
-        val registeredName = Regex("""name = "([^"]+)"""").find(toolSource)?.groupValues?.get(1)
-        assertNotNull("找不到 ask_user 的注册处", registeredName)
+        // v1017：官方 3.1.1 把注册名提成了常量（`const val ASK_USER_TOOL_NAME = "ask_user"`
+        // + `name = ASK_USER_TOOL_NAME`），旧字面 `name = "…"` 在这份文件里已不存在。
+        // 这里**不放宽判据**，而是跟着改成两步核：
+        //   ① 常量的值必须就是 ask_user（等价于原来读的"注册处真名"）；
+        //   ② 注册处必须真的用这个常量，不许偷偷退回硬编码字面量（退回就会两边漂移）。
+        val registeredName = Regex("""ASK_USER_TOOL_NAME = "([^"]+)"""").find(toolSource)?.groupValues?.get(1)
+        assertNotNull("找不到 ask_user 的注册名常量（注册处必须给出真实名字）", registeredName)
+        assertTrue("注册处必须使用该常量，不许退回硬编码 name = \"ask_user\"",
+            toolSource.contains("name = ASK_USER_TOOL_NAME"))
         assertEquals("必须与工具注册时的名字一致", registeredName, promptName)
     }
 
@@ -1014,11 +1022,24 @@ class GroupChatWiringGuardTest {
         )
         assertTrue(
             "搬运必须走可单测的纯函数",
-            carryFn.contains("settingsAfterFork(current, sourceConversationId, newConversationId)"),
+            // v1007：写法从「先 first() 拿快照、再 update(整份)」改成 update(transform)，
+            // 由 DataStore 内部读改写 —— 消掉两步之间被别的设置写入插队的窗口。
+            // 纯函数本身没变，只是变量名从 current 变 latest。
+            carryFn.contains("settingsAfterFork(latest, sourceConversationId, newConversationId)"),
         )
         assertTrue(
-            "没东西可搬时不许落盘（避免每次分支都全量写盘）",
-            carryFn.contains("if (updated === current) return"),
+            "搬运必须走 update(transform)，不许拿旧快照整份回写",
+            carryFn.contains("settingsStore.update { latest ->"),
+        )
+        assertTrue(
+            // v1007：原先这条断言钉的是调用方自己写的 `if (updated === current) return`。
+            // 现在「没变化就不写盘」由 PreferencesStore.update/persist 负责：
+            // transform 返回同一实例时 `latest === persisted`，persist 直接跳过。
+            // 所以判据改成「必须走那个带引用判断的 update」，不是把这条需求删掉。
+            "没东西可搬时不许落盘（改由 PreferencesStore.update 的引用判断保证）",
+            source(base + "data/datastore/PreferencesStore.kt").let {
+                it.contains("if (latest !== base)") && it.contains("suspend fun update(fn: (Settings) -> Settings)")
+            },
         )
         // 手册 §7.1：包裹挂起调用的兜底不许用 runCatching —— 它会吞掉取消异常，
         // 用户点停止就不能立刻生效。这里必须显式 catch 并原样上抛。
@@ -1149,7 +1170,8 @@ class GroupChatWiringGuardTest {
         assertEquals("两个批次收尾处都必须调用（继续讨论 / 回答提问后续写）", 2, Regex("notifyGroupAwaitingUser\\(run\\.snapshot\\(\\)\\)").findAll(chatService).count())
 
         // 手册 v313 教训：界面开关必须与底层行为**同一次落地**，否则就是骗人的开关
-        val prefs = source(base + "data/datastore/PreferencesStore.kt")
+        val prefs = source(base + "data/datastore/PreferencesStore.kt") +
+            "\n" + source(base + "data/datastore/Settings.kt") // v323：官方 3.1 把 Settings 字段拆到 Settings.kt，判据改读两个文件（断言内容未改）
         assertTrue("开关默认必须是开（默认关会让这次修复在多数装机上看不见效果）", prefs.contains("val notifyGroupChatWaiting: Boolean = true"))
         val settingPage = source(base + "ui/pages/setting/SettingPreferencesNotificationPage.kt")
         assertTrue("界面必须写回同一个字段", settingPage.contains("updateDisplaySetting(displaySetting.copy(notifyGroupChatWaiting = it))"))

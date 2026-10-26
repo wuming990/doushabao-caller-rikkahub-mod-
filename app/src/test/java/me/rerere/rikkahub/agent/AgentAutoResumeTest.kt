@@ -552,7 +552,7 @@ class AgentAutoResumeTest {
 
     @Test
     fun `门禁：两个新设置项必须五环节齐全`() {
-        val store = source("app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt")
+        val store = source("app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt") + "\n" + source("app/src/main/java/me/rerere/rikkahub/data/datastore/Settings.kt") // v323：官方 3.1 把 Settings 字段拆到 Settings.kt，判据改读两个文件（断言内容未改）
         listOf(
             "val AGENT_AUTO_RESUME_MAX = intPreferencesKey(\"agent_auto_resume_max\")",
             "agentAutoResumeMax = (preferences[AGENT_AUTO_RESUME_MAX] ?: 2).coerceIn(0, 10)",

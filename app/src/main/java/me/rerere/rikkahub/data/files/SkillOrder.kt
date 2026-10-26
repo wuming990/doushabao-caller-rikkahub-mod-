@@ -1,4 +1,5 @@
 package me.rerere.rikkahub.data.files
+import me.rerere.rikkahub.data.skills.SkillMetadata
 
 /**
  * v304：技能列表的显示顺序。

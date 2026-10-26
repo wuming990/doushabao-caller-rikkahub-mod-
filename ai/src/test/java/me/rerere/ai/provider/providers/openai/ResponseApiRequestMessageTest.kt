@@ -24,6 +24,7 @@ import me.rerere.ai.ui.ServerToolStatus
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.ai.ui.toMetadata
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -59,7 +60,8 @@ class ResponseApiRequestMessageTest {
         params: TextGenerationParams,
         stream: Boolean = false
     ): JsonObject {
-        return api.buildRequestBody(providerSetting, listOf(UIMessage.user("hello")), params, stream)
+        val capabilities = resolveResponseProviderCapabilities(providerSetting.baseUrl.toHttpUrl().host)
+        return api.buildRequestBody(capabilities, listOf(UIMessage.user("hello")), params, stream)
     }
 
     private fun createReasoningParams(reasoningLevel: ReasoningLevel = ReasoningLevel.OFF): TextGenerationParams {
@@ -316,10 +318,15 @@ class ResponseApiRequestMessageTest {
             if (item["type"]?.jsonPrimitive?.content == "function_call") {
                 assertTrue("function_call should not be last", i < result.size - 1)
                 val next = result[i + 1].jsonObject
-                assertEquals("function_call_output should follow",
-                    "function_call_output", next["type"]?.jsonPrimitive?.content)
-                assertTrue("call_id should match",
-                    item["call_id"]?.jsonPrimitive?.content == next["call_id"]?.jsonPrimitive?.content)
+                assertEquals(
+                    "function_call_output should follow",
+                    "function_call_output",
+                    next["type"]?.jsonPrimitive?.content
+                )
+                assertTrue(
+                    "call_id should match",
+                    item["call_id"]?.jsonPrimitive?.content == next["call_id"]?.jsonPrimitive?.content
+                )
                 assertTrue("Order should be maintained", i > lastCallIndex)
                 lastCallIndex = i
             }
@@ -461,6 +468,17 @@ class ResponseApiRequestMessageTest {
         assertEquals(1, tools?.size)
         assertEquals("function", tools!![0].jsonObject["type"]?.jsonPrimitive?.content)
         assertEquals("get_weather", tools[0].jsonObject["name"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `function tools should disable strict mode so optional fields stay optional`() {
+        val requestBody = invokeBuildRequestBody(
+            providerSetting = ProviderSetting.OpenAI(baseUrl = "https://api.openai.com/v1"),
+            params = createToolParams(tools = listOf(createFunctionTool("get_weather")))
+        )
+
+        val tool = requestBody["tools"]!!.jsonArray[0].jsonObject
+        assertEquals("false", tool["strict"]?.jsonPrimitive?.content)
     }
 
     @Test

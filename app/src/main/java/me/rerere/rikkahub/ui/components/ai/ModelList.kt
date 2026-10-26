@@ -21,6 +21,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Card
@@ -87,11 +88,11 @@ import me.rerere.rikkahub.data.datastore.findProvider
 import me.rerere.rikkahub.ui.components.ui.AutoAIIcon
 import me.rerere.rikkahub.ui.components.ui.Tag
 import me.rerere.rikkahub.ui.components.ui.TagType
-import me.rerere.rikkahub.ui.components.ui.icons.HeartIcon
 import me.rerere.rikkahub.ui.context.LocalNavController
 import me.rerere.rikkahub.ui.hooks.rememberSharedPreferenceString
 import me.rerere.rikkahub.ui.theme.extendColors
 import me.rerere.rikkahub.utils.toDp
+import me.rerere.ui.icons.HeartIcon
 import org.koin.compose.koinInject
 import sh.calvin.reorderable.ReorderableItem
 import sh.calvin.reorderable.rememberReorderableLazyListState
@@ -261,13 +262,67 @@ internal fun ModelSelectorButton(
     }
 }
 
+// 显示当前模型的胶囊按钮，样式和 Select 保持一致，点击后由调用方打开模型列表
+// v1017: official placeholder/clear support, while preserving all existing custom callers.
+@Composable
+internal fun ModelField(
+    model: Model?,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    placeholder: String = stringResource(R.string.model_list_select_model),
+    onClear: (() -> Unit)? = null,
+) {
+    Surface(
+        onClick = onClick,
+        tonalElevation = 4.dp,
+        shape = CircleShape,
+        modifier = modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.padding(vertical = 8.dp, horizontal = 16.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (model != null) {
+                AutoAIIcon(
+                    name = model.modelId,
+                    modifier = Modifier.size(24.dp),
+                    color = Color.Transparent,
+                )
+            }
+            Text(
+                text = model?.displayName ?: placeholder,
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
+            if (onClear != null && model != null) {
+                Icon(
+                    imageVector = HugeIcons.Cancel01,
+                    contentDescription = "Clear",
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .clickable(onClick = onClear),
+                )
+            } else {
+                Icon(
+                    imageVector = HugeIcons.ArrowDown01,
+                    contentDescription = null,
+                )
+            }
+        }
+    }
+}
+
 @Composable
 fun ModelListSheet(
 state: ModelListState,
-onSelect: (Model) -> Unit,
 // 二改：多选模式下保持列表打开，由调用方负责切换集合；单选调用保持原行为。
 selectedModelIds: Set<Uuid> = emptySet(),
 dismissOnSelect: Boolean = true,
+// onSelect 放最后：官方的调用点都用尾随 lambda，只有函数类型在最后才能这样写。
+onSelect: (Model) -> Unit,
 ) {
     if (!state.visible) return
 
@@ -329,7 +384,9 @@ private fun ColumnScope.ModelList(
     val settings = settingsStore.settingsFlow
         .collectAsStateWithLifecycle()
 
-    val favoriteModels = settings.value.favoriteModels.mapNotNull { modelId ->
+    // v1017: official favorite drag stabilization; our multi-select behavior remains unchanged.
+    var draggingFavoriteOrder by remember { mutableStateOf<List<Uuid>?>(null) }
+    val favoriteModels = (draggingFavoriteOrder ?: settings.value.favoriteModels).mapNotNull { modelId ->
         val model = settings.value.providers.findModelById(modelId) ?: return@mapNotNull null
         if (model.type != modelType) return@mapNotNull null
         val provider = model.findProvider(providers = settings.value.providers, checkOverwrite = false) ?: return@mapNotNull null
@@ -422,30 +479,13 @@ private fun ColumnScope.ModelList(
         initialFirstVisibleItemIndex = selectedModelPosition
     )
     val reorderableState = rememberReorderableLazyListState(lazyListState) { from, to ->
-        // 计算favorite models在列表中的位置偏移
-        var favoriteStartIndex = 0
-        if (providers.isEmpty()) {
-            favoriteStartIndex = 1 // no providers item
-        }
-        if (favoriteModels.isNotEmpty()) {
-            favoriteStartIndex += 1 // favorite header
-        }
-
-        val fromIndex = from.index - favoriteStartIndex
-        val toIndex = to.index - favoriteStartIndex
-
-        // 只处理favorite models范围内的拖拽
-        if (fromIndex >= 0 && toIndex >= 0 &&
-            fromIndex < favoriteModels.size && toIndex < favoriteModels.size
-        ) {
-            val newFavoriteModels = settings.value.favoriteModels.toMutableList().apply {
-                add(toIndex, removeAt(fromIndex))
-            }
-            coroutineScope.launch {
-                settingsStore.update { oldSettings ->
-                    oldSettings.copy(favoriteModels = newFavoriteModels)
-                }
-            }
+        // v1017: official key-based favorite drag fix; custom multi-selection remains outside this state.
+        val ids = (draggingFavoriteOrder ?: settings.value.favoriteModels).toMutableList()
+        val fromPos = ids.indexOfFirst { "favorite:$it" == from.key }
+        val toPos = ids.indexOfFirst { "favorite:$it" == to.key }
+        if (fromPos >= 0 && toPos >= 0) {
+            ids.add(toPos, ids.removeAt(fromPos))
+            draggingFavoriteOrder = ids
         }
     }
     val haptic = LocalHapticFeedback.current
@@ -576,6 +616,11 @@ private fun ColumnScope.ModelList(
                                     },
                                     onDragStopped = {
                                         haptic.performHapticFeedback(HapticFeedbackType.GestureEnd)
+                                        val order = draggingFavoriteOrder ?: return@longPressDraggableHandle
+                                        coroutineScope.launch {
+                                            settingsStore.update { it.copy(favoriteModels = order) }
+                                            if (draggingFavoriteOrder === order) draggingFavoriteOrder = null
+                                        }
                                     }
                                 )
                             )
@@ -613,7 +658,7 @@ private fun ColumnScope.ModelList(
 
                     Spacer(modifier = Modifier.weight(1f))
 
-                    ProviderBalanceText(
+                    ProviderQuotaText(
                         providerSetting = providerSetting,
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.primary,
