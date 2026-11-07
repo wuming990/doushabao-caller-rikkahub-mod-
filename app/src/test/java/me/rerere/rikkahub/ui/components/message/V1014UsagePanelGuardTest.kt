@@ -52,9 +52,11 @@ class V1014UsagePanelGuardTest {
     // ── 1. 读数优先级（行为断言） ──
 
     @Test
-    fun `底部小字优先取纯吐字口径，取不到才退回响应口径`() {
-        assertEquals(136.7f, SpeedReadout(136.7f, 76.6f, 81.6f).headlineTps!!, 0.001f)
+    fun `底部小字显示响应口径，缺响应计时时不拿纯吐字速度冒充`() {
+        // v1018：用户明确改成响应速度；展开面板仍保留生成速度。
+        assertEquals(76.6f, SpeedReadout(136.7f, 76.6f, 81.6f).headlineTps!!, 0.001f)
         assertEquals(76.6f, SpeedReadout(null, 76.6f, 81.6f).headlineTps!!, 0.001f)
+        assertNull(SpeedReadout(136.7f, null, 81.6f).headlineTps)
     }
 
     @Test
@@ -103,7 +105,7 @@ class V1014UsagePanelGuardTest {
             "底部又单独算一套的话，就会再出现 8.9 与 136.7 并排",
             text.contains("usage.completionTokens.toFloat() / it * 1000"),
         )
-        assertTrue(text.contains("tps = SpeedReadout.of(this, usage)?.headlineTps"))
+        assertTrue(text.contains("tps = SpeedReadout.of(this, total)?.headlineTps"))
         assertTrue(text.contains("val readout = SpeedReadout.of(message, total)"))
     }
 

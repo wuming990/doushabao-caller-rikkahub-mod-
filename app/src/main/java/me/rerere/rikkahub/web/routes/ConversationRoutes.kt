@@ -158,6 +158,8 @@ fun Route.conversationRoutes(
             val uuid = call.parameters["id"].toUuid("conversation id")
             val conversation = conversationRepo.getConversationById(uuid) ?: throw NotFoundException("Conversation not found")
 
+            // v1024：网页删除也要先取消原对话压缩，不能删除后仍留下后台请求。
+            chatService.cancelManualCompression(uuid)
             conversationRepo.deleteConversation(conversation)
             // v318：与 App 内删除同一口径 —— 释放讨论群运行态与状态转发订阅
             chatService.releaseGroupStateOnDelete(uuid)

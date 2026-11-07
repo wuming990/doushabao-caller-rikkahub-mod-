@@ -1,5 +1,8 @@
 package me.rerere.rikkahub.ui.pages.setting
 
+import me.rerere.rikkahub.data.gemini.geminiWebPickerLabel
+import me.rerere.rikkahub.data.gemini.loadGeminiWebModelsForUi
+
 import androidx.annotation.StringRes
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -470,15 +473,31 @@ private fun ModelList(
     onUpdateProvider: (ProviderSetting) -> Unit
 ) {
     val providerManager = koinInject<ProviderManager>()
-    val modelList by produceState(emptyList(), providerSetting) {
-        runCatching {
-            println("loading models...")
-            value = providerManager.getProviderByType(providerSetting)
-                .listModels(providerSetting)
-                .sortedBy { it.modelId }
-                .toList()
-        }.onFailure {
-            it.printStackTrace()
+    var webLoadError by remember(providerSetting) { mutableStateOf<String?>(null) }
+    var webLoading by remember(providerSetting) { mutableStateOf(false) }
+    var webRetryKey by remember(providerSetting.id) { mutableStateOf(0) }
+    val modelList by produceState(emptyList<Model>(), providerSetting, webRetryKey) {
+        if (providerSetting is ProviderSetting.GeminiWeb) {
+            // v1020：网页目录读取失败必须看得见，换账号/重试时先清掉旧目录。
+            value = emptyList()
+            webLoadError = null
+            webLoading = true
+            val loaded = loadGeminiWebModelsForUi {
+                providerManager.getProviderByType(providerSetting).listModels(providerSetting)
+            }
+            value = loaded.models.sortedBy { it.modelId }
+            webLoadError = loaded.error
+            webLoading = false
+        } else {
+            runCatching {
+                println("loading models...")
+                value = providerManager.getProviderByType(providerSetting)
+                    .listModels(providerSetting)
+                    .sortedBy { it.modelId }
+                    .toList()
+            }.onFailure {
+                it.printStackTrace()
+            }
         }
     }
     var expanded by rememberSaveable { mutableStateOf(true) }
@@ -536,6 +555,9 @@ private fun ModelList(
                 .offset(y = -ScreenOffset),
         ) {
             AddModelButton(
+                modelLoadError = webLoadError,
+                modelsLoading = webLoading,
+                onRetryModels = { if (providerSetting is ProviderSetting.GeminiWeb) webRetryKey += 1 },
                 models = modelList,
                 selectedModels = providerSetting.models,
                 onAddModel = {
@@ -760,7 +782,10 @@ private fun AddModelButton(
     onAddModel: (Model) -> Unit,
     onRemoveModel: (Model) -> Unit,
     parentProvider: ProviderSetting,
-    onUpdateProvider: (ProviderSetting) -> Unit
+    onUpdateProvider: (ProviderSetting) -> Unit,
+    modelLoadError: String? = null,
+    modelsLoading: Boolean = false,
+    onRetryModels: () -> Unit = {},
 ) {
     val dialogState = useEditState<Model> {
         onAddModel(it.copy(displayName = it.displayName.trim()))
@@ -772,6 +797,11 @@ private fun AddModelButton(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         ModelPicker(
+            showDisplayNames = parentProvider is ProviderSetting.GeminiWeb,
+            iconProvider = parentProvider,
+            modelLoadError = modelLoadError,
+            modelsLoading = modelsLoading,
+            onRetryModels = onRetryModels,
             models = models,
             selectedModels = selectedModels,
             onModelSelected = { model ->
@@ -921,7 +951,12 @@ private fun ModelPicker(
     onModelSelected: (Model) -> Unit,
     onModelDeselected: (Model) -> Unit,
     onAllModelSelected: (List<Model>) -> Unit,
-    onAllModelDeselected: (List<Model>) -> Unit
+    onAllModelDeselected: (List<Model>) -> Unit,
+    showDisplayNames: Boolean = false,
+    iconProvider: ProviderSetting? = null, // v1021: opaque directory IDs still need their actual brand.
+    modelLoadError: String? = null,
+    modelsLoading: Boolean = false,
+    onRetryModels: () -> Unit = {},
 ) {
     var showModal by remember { mutableStateOf(false) }
     if (showModal) {
@@ -949,6 +984,14 @@ private fun ModelPicker(
                     .imePadding(),
                 verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
+                // v1020：网页版拉取中/失败原因与重试入口，不再用空名单掩盖异常。
+                if (showDisplayNames && modelsLoading) {
+                    Text("正在从当前 Google 账号拉取模型…")
+                }
+                if (showDisplayNames && modelLoadError != null) {
+                    Text(text = modelLoadError, color = MaterialTheme.colorScheme.error)
+                    TextButton(onClick = onRetryModels) { Text("重新拉取模型") }
+                }
                 // 标题栏和添加所有按钮
                 Row(
                     modifier = Modifier
@@ -1007,7 +1050,8 @@ private fun ModelPicker(
                             ) {
                                 AutoAIIcon(
                                     it.modelId,
-                                    Modifier.size(32.dp)
+                                    Modifier.size(32.dp),
+                                    providerSetting = it.providerOverwrite ?: iconProvider,
                                 )
                                 Column(
                                     verticalArrangement = Arrangement.spacedBy(
@@ -1016,9 +1060,17 @@ private fun ModelPicker(
                                     modifier = Modifier.weight(1f),
                                 ) {
                                     Text(
-                                        text = it.modelId,
+                                        text = geminiWebPickerLabel(it, showDisplayNames),
                                         style = MaterialTheme.typography.titleSmall,
                                     )
+                                    // v1020：网页目录显示真实名称，opaque ID仍可见以区分同名模型。
+                                    if (showDisplayNames && it.displayName.isNotBlank() && it.displayName != it.modelId) {
+                                        Text(
+                                            text = it.modelId,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
 
                                     Row(
                                         verticalAlignment = Alignment.CenterVertically,
@@ -1369,6 +1421,7 @@ private fun ModelCard(
                 AutoAIIcon(
                     name = model.modelId,
                     modifier = Modifier.size(36.dp),
+                    providerSetting = model.providerOverwrite ?: parentProvider, // v1021: real type, never a model alias.
                 )
             }
             Column(

@@ -184,6 +184,10 @@ class ChatVM(
         chatService
             .getProcessingStatusFlow(_conversationId)
 
+    // v1024：页面只观察应用级任务，不拥有它的生命周期。
+    val manualCompressionJob: StateFlow<Job?> = chatService.getManualCompressionJobFlow(_conversationId)
+        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+
     val conversationJobs = chatService
         .getConversationJobs()
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyMap())
@@ -262,6 +266,10 @@ class ChatVM(
         // 生成结束（job 变 null）后刷一次：这一趟的工具轮与续跑轮都已计入 cumulativeUsage
         viewModelScope.launch {
             conversationJob.collect { job -> if (job == null) refreshConversationTokenStats() }
+        }
+        // v1024：后台手动压缩结束后刷新原对话统计，页面不存在时下次打开仍会初始化。
+        viewModelScope.launch {
+            manualCompressionJob.collect { if (it == null) refreshConversationTokenStats() }
         }
         // v300（用户反馈）：原来只在「整趟生成结束」刷一次，一轮长回答要看几分钟前的旧数字。
         // 现在改成「每轮一刷」：触发条件是**用量签名变化** —— 服务商报出用量的那一刻签
@@ -810,29 +818,16 @@ class ChatVM(
         modelSource: CompressionModelSource,
         customPrompt: String,
     ): Job {
-        return viewModelScope.launch {
-            // 先保存压缩提示词（留空=恢复内置默认；填写=完全覆盖默认），再执行压缩。
-            // v268：同时记住用户选择了智能模式，下次打开对话框默认停在智能。
-            settingsStore.update { current ->
-                current.copy(
-                    compressPrompt = customPrompt.trim().ifBlank { DEFAULT_COMPRESS_PROMPT },
-                    compressUseClassicMode = false,
-                )
-            }
-            chatService.compressConversation(
-                _conversationId,
-                conversation.value,
-                additionalPrompt,
-                modelSource,
-            ).onFailure {
-                chatService.addError(it, title = context.getString(R.string.error_title_compress_conversation))
-            }
-            // v299：压缩会整批替换本对话的消息节点，统计随之重算（智能压缩几乎归零；
-            // 经典压缩只保留最近若干条，会留下那几条的用量）。但顶栏那行只在
-            // 「打开对话」与「这趟生成结束」两个时点刷新 —— 不主动刷一次，
-            // 用户看到的还是压缩前那个数，像是「压缩后没重新计算、还在叠加」。
-            refreshConversationTokenStats()
-        }
+        // v1024：下面保留旧流程备注；任务与写设置已迁到服务，统计由任务状态订阅刷新。
+        // 先保存压缩提示词（留空=恢复内置默认；填写=完全覆盖默认），再执行压缩。
+        // v268：同时记住用户选择了智能模式，下次打开对话框默认停在智能。
+        // v299：压缩会整批替换本对话的消息节点，统计随之重算（智能压缩几乎归零；
+        // 经典压缩只保留最近若干条，会留下那几条的用量）。但顶栏那行只在
+        // 「打开对话」与「这趟生成结束」两个时点刷新 —— 不主动刷一次，
+        // 用户看到的还是压缩前那个数，像是「压缩后没重新计算、还在叠加」。
+        return chatService.startManualCompression(
+            _conversationId, additionalPrompt, modelSource, customPrompt,
+        )
     }
 
     /**
@@ -841,29 +836,18 @@ class ChatVM(
      */
     fun handleCompressContextClassic(
         additionalPrompt: String,
-        targetTokens: Int,
         keepRecentMessages: Int,
     ): Job {
-        return viewModelScope.launch {
-            // v268：记住用户选择了经典模式，下次打开对话框默认停在经典。
-            settingsStore.update { current ->
-                current.copy(compressUseClassicMode = true)
-            }
-            chatService.compressConversationClassic(
-                _conversationId,
-                conversation.value,
-                additionalPrompt,
-                targetTokens,
-                keepRecentMessages,
-            ).onFailure {
-                chatService.addError(it, title = context.getString(R.string.error_title_compress_conversation))
-            }
-            // v299：压缩会整批替换本对话的消息节点，统计随之重算（智能压缩几乎归零；
-            // 经典压缩只保留最近若干条，会留下那几条的用量）。但顶栏那行只在
-            // 「打开对话」与「这趟生成结束」两个时点刷新 —— 不主动刷一次，
-            // 用户看到的还是压缩前那个数，像是「压缩后没重新计算、还在叠加」。
-            refreshConversationTokenStats()
-        }
+        // v1024：下面保留旧流程备注；任务与写设置已迁到服务，统计由任务状态订阅刷新。
+        // v268：记住用户选择了经典模式，下次打开对话框默认停在经典。
+        // v299：压缩会整批替换本对话的消息节点，统计随之重算（智能压缩几乎归零；
+        // 经典压缩只保留最近若干条，会留下那几条的用量）。但顶栏那行只在
+        // 「打开对话」与「这趟生成结束」两个时点刷新 —— 不主动刷一次，
+        // 用户看到的还是压缩前那个数，像是「压缩后没重新计算、还在叠加」。
+        // v1019：经典已改为保留原节点，真实累计花费仍保留；上下文占用由检查点重新估算。
+        return chatService.startManualClassicCompression(
+            _conversationId, additionalPrompt, keepRecentMessages,
+        )
     }
 
     suspend fun forkMessage(message: UIMessage): Conversation {
@@ -925,6 +909,8 @@ class ChatVM(
 
     fun deleteConversation(conversation: Conversation): Job =
         viewModelScope.launch {
+            // v1024：先等原压缩取消/提交收尾，再删除，避免删除后请求继续或提交复活数据。
+            chatService.cancelManualCompression(conversation.id)
             conversationRepo.deleteConversation(conversation)
             // v318：对话没了就要停掉它的讨论群与状态转发订阅。
             // v317 之前这里只是两张表里留个无用条目；v318 加了订阅之后不取消就是

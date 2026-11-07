@@ -85,7 +85,6 @@ import dev.chrisbanes.haze.HazeState
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.collectLatest
 import me.rerere.ai.provider.Model
-import me.rerere.ai.provider.ModelAbility
 import me.rerere.ai.provider.ModelType
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.asr.ASRStatus
@@ -99,6 +98,7 @@ import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.datastore.BackgroundEffectType
 import me.rerere.rikkahub.service.ContextUsageInfo
 import me.rerere.rikkahub.data.datastore.Settings
+import me.rerere.rikkahub.data.datastore.supportsReasoning
 import me.rerere.rikkahub.data.datastore.getQuickMessagesOfAssistant
 import me.rerere.rikkahub.data.files.FilesManager
 import me.rerere.rikkahub.data.model.Assistant
@@ -342,7 +342,7 @@ fun ChatInput(
                             )
 
                             // Reasoning
-                            if (chatModel?.abilities?.contains(ModelAbility.REASONING) == true) {
+                            if (chatModel?.supportsReasoning(settings.providers) == true) {
                                 ReasoningButton(
                                     reasoningLevel = assistant.reasoningLevel,
                                     onUpdateReasoningLevel = {

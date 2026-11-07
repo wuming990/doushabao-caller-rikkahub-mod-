@@ -1,8 +1,14 @@
 package me.rerere.rikkahub.utils
 
+import me.rerere.ai.provider.ProviderSetting
+
 private val iconCache = mutableMapOf<String, String>()
 
 // https://lobehub.com/zh/icons
+// v1021: Real web model IDs are opaque; provider identity must win before name matching/cache.
+fun computeAIIconByName(name: String, providerSetting: ProviderSetting?): String? =
+    if (providerSetting is ProviderSetting.GeminiWeb) "gemini-color.svg" else computeAIIconByName(name)
+
 fun computeAIIconByName(name: String): String? {
     iconCache[name]?.let { return it }
 

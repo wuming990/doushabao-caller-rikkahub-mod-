@@ -43,6 +43,7 @@ import me.rerere.rikkahub.data.ai.transformers.onGenerationFinish
 import me.rerere.rikkahub.data.ai.transformers.transforms
 import me.rerere.rikkahub.data.ai.transformers.visualTransforms
 import me.rerere.rikkahub.data.ai.prompts.withoutGroupChatToolParts
+import me.rerere.rikkahub.data.ai.prompts.withoutRoundTableToolParts
 import me.rerere.rikkahub.agent.model.AgentFinishReason
 import me.rerere.rikkahub.data.datastore.ResumeStrategy
 import me.rerere.rikkahub.data.datastore.Settings
@@ -531,6 +532,15 @@ class GenerationLoop(
          */
         stripGroupReasoningParts: Boolean = false,
         /**
+         * v1029：圆桌「讨论只保留发言正文」打开时，拼请求视图时剥掉圆桌页里的
+         * 搜索、工具与思考 part。
+         *
+         * 与 stripGroupToolParts 同一套隔离规矩：默认 false，只有 ChatService 主对话
+         * 路径按设置显式传 true。**必须做在 internalMessages 请求视图上**，绝不能裁
+         * 传入的 messages —— 那份同时是生成回写基线，裁了会把对话记录永久改掉。
+         */
+        stripRoundTableToolParts: Boolean = false,
+        /**
          * v1011：主对话「一个字都没有却正常收尾」不再装死。
          *
          * 起因（用户真机口径）：「claude兼容格式好像有问题，输出会被截断导致空回」
@@ -622,6 +632,7 @@ class GenerationLoop(
                     highlightKeyPoints = highlightKeyPoints,
                     stripGroupToolParts = stripGroupToolParts,
                     stripGroupReasoningParts = stripGroupReasoningParts,
+                    stripRoundTableToolParts = stripRoundTableToolParts,
                     reportEmptyReplyAsError = reportEmptyReplyAsError,
                 )
                 messages = messages.visualTransforms(
@@ -843,6 +854,8 @@ class GenerationLoop(
         stripGroupToolParts: Boolean = false,
         /** v321：见 generateText 处 KDoc（「只保留发言正文」时连群发言的思考过程一起剥） */
         stripGroupReasoningParts: Boolean = false,
+        /** v1029：见 generateText 处 KDoc（剥掉圆桌页的搜索/工具/思考，只影响请求） */
+        stripRoundTableToolParts: Boolean = false,
         /** v1011：见 generateText 处 KDoc（主对话「零产出定格」不再装死；默认关） */
         reportEmptyReplyAsError: Boolean = false,
     ) {
@@ -889,6 +902,15 @@ class GenerationLoop(
                         // 本身就是主对话专用），所以两者共用同一个 if，不另开分支。
                         if (stripGroupToolParts) {
                             it.withoutGroupChatToolParts(dropReasoning = stripGroupReasoningParts)
+                        } else {
+                            it
+                        }
+                    }
+                    .let {
+                        // v1029：圆桌「讨论只保留发言正文」——与群聊同一位置、同一隔离规矩，
+                        // 只裁这份发给模型的请求视图；传入的 messages 与对话记录一个字不动。
+                        if (stripRoundTableToolParts) {
+                            it.withoutRoundTableToolParts()
                         } else {
                             it
                         }

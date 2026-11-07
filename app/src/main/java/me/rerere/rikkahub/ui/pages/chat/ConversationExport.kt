@@ -79,6 +79,7 @@ import me.rerere.common.android.appTempFolder
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.ai.tools.MemoryToolNames
 import me.rerere.rikkahub.data.datastore.Settings
+import me.rerere.rikkahub.data.datastore.findProvider
 import me.rerere.rikkahub.data.datastore.findModelById
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.ui.components.message.MessagePartBlock
@@ -665,6 +666,7 @@ private fun ExportedChatMessage(
         ) {
             AutoAIIcon(
                 name = iconLabel,
+                providerSetting = model?.providerOverwrite ?: model?.findProvider(settings.providers), // v1021: export uses the same real provider brand.
                 modifier = Modifier
                     .padding(top = 8.dp)
                     .size(36.dp)

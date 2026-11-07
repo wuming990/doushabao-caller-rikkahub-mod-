@@ -214,11 +214,12 @@ private fun createSearchTextTool(
  * 转义膨胀率随内容变化，固定比例靠不住，必须实测回缩。
  */
 internal fun agentReadBudgetChars(limitChars: Int): Int =
-    (limitChars * 3 / 4).coerceAtLeast(1024)
+    (limitChars.toLong() * 3L / 4L).coerceAtLeast(1024L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
 
 /** v248：序列化后的安全线 —— 比上限留 1KB 余量。 */
 internal fun agentReadSafeChars(limitChars: Int): Int =
-    (limitChars - 1024).coerceAtLeast(2048)
+    // v1024：1KB也可手填，不能强给2KB安全线后再被外层静默截断。
+    (limitChars - minOf(1024, maxOf(64, limitChars / 16))).coerceAtLeast(128)
 
 /**
  * v247：读文件分段结果。
@@ -362,7 +363,7 @@ private fun createReadFileTool(
     limitChars: Int,
 ) = Tool(
     name = "workspace_read_file",
-    description = "Read a text file inside the workspace files area. One call returns a chunk cut at a line boundary (up to about ${agentReadBudgetChars(limitChars)} characters, automatically shrunk when needed so the reply is never cut off by the transport). If the reply contains next_start_line, the file has more content: call again with the same path and start_line set to that number to continue. To jump straight to a known place, search first and pass the line number you got. Read-only.",
+    description = "Read a text file inside the workspace files area. One call returns a chunk cut at a line boundary (configured limit: ${if (limitChars == Int.MAX_VALUE) "unlimited" else "about ${agentReadBudgetChars(limitChars)} characters"}; payload is cut at safe line boundaries when a finite limit is configured). If the reply contains next_start_line, the file has more content: call again with the same path and start_line set to that number to continue. To jump straight to a known place, search first and pass the line number you got. Read-only.",
     parameters = {
         InputSchema.Obj(
             properties = buildJsonObject {

@@ -170,7 +170,9 @@ class AgentAutoResumeTest {
         assertTrue("必须提供 resume_agent，否则主模型无法自救", names.contains("resume_agent"))
         // v236：新增 run_agent_pipeline（一次跑完整条流水线）
         assertTrue("必须提供 run_agent_pipeline", names.contains("run_agent_pipeline"))
-        assertEquals("控制工具应为 8 个", 8, names.size)
+        // v1029：新增 list_agent_models（主模型据此用 model_ref 点名备用模型）
+        assertTrue("必须提供 list_agent_models", names.contains("list_agent_models"))
+        assertEquals("控制工具应为 9 个", 9, names.size)
     }
 
     @Test
@@ -258,8 +260,11 @@ class AgentAutoResumeTest {
         assertTrue(
             // v241：总上限跟着「自动续跑次数」放宽，否则用户设到 10 也会在第 8 次被挡下来
             "resume 必须检查续跑总上限",
-            manager.contains("if (thread.resumeCount >= totalMax) return null") &&
-                manager.contains("AGENT_RESUME_TOTAL_MAX,"),
+            // v1024：宽整数运算改变了常量字面，核查真实统一计算入口及resume里的判据。
+            manager.contains("val totalMax = resumeTotalMax()") &&
+                manager.contains("if (thread.resumeCount >= totalMax) return null") &&
+                manager.contains("effectiveResumeTotalMax(runCatching { autoResumeMax() }") &&
+                manager.contains("AGENT_RESUME_TOTAL_MAX.toLong()"),
         )
         assertTrue("成功后必须清零自动重试预算", manager.contains("autoRetryCount.remove(threadId)"))
     }
@@ -555,12 +560,12 @@ class AgentAutoResumeTest {
         val store = source("app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt") + "\n" + source("app/src/main/java/me/rerere/rikkahub/data/datastore/Settings.kt") // v323：官方 3.1 把 Settings 字段拆到 Settings.kt，判据改读两个文件（断言内容未改）
         listOf(
             "val AGENT_AUTO_RESUME_MAX = intPreferencesKey(\"agent_auto_resume_max\")",
-            "agentAutoResumeMax = (preferences[AGENT_AUTO_RESUME_MAX] ?: 2).coerceIn(0, 10)",
-            "preferences[AGENT_AUTO_RESUME_MAX] = settings.agentAutoResumeMax.coerceIn(0, 10)",
+            "agentAutoResumeMax = normalizeAgentLimit((preferences[AGENT_AUTO_RESUME_MAX] ?: 2), 2, true)",
+            "preferences[AGENT_AUTO_RESUME_MAX] = normalizeAgentLimit(settings.agentAutoResumeMax, 2, true)",
             "val agentAutoResumeMax: Int = 2",
             "val AGENT_MAX_STEPS = intPreferencesKey(\"agent_max_steps_readonly\")",
-            "agentMaxSteps = (preferences[AGENT_MAX_STEPS] ?: 32).coerceIn(16, 96)",
-            "preferences[AGENT_MAX_STEPS] = settings.agentMaxSteps.coerceIn(16, 96)",
+            "agentMaxSteps = normalizeAgentLimit((preferences[AGENT_MAX_STEPS] ?: 32), 32, true)",
+            "preferences[AGENT_MAX_STEPS] = normalizeAgentLimit(settings.agentMaxSteps, 32, true)",
             "val agentMaxSteps: Int = 32",
         ).forEach { needle ->
             assertTrue("PreferencesStore 缺少：$needle", store.contains(needle))
@@ -680,7 +685,7 @@ class AgentAutoResumeTest {
         assertEquals(20, effectiveResumeTotalMax(10))
         // 越界输入不许把闸门算歪（设置层夹不住时的兜底：负数按 0、超过 10 按 10）
         assertEquals(8, effectiveResumeTotalMax(-5))
-        assertEquals(20, effectiveResumeTotalMax(999))
+        assertEquals(1998, effectiveResumeTotalMax(999))
     }
 
     @Test

@@ -168,6 +168,9 @@ fun ProviderConnectionTester(
                                     flow.collect { chunk ->
                                         if (chunk is StreamChunk.TextDelta) {
                                             streamingText += chunk.text
+                                        } else if (chunk is StreamChunk.TextSnapshot) {
+                                            // v1020：连接测试也显示最新全文，不能重复追加网页草稿。
+                                            streamingText = chunk.text
                                         }
                                     }
                                     streamingState = UiState.Success("")

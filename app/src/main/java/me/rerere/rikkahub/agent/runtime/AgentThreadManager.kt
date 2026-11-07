@@ -17,6 +17,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import me.rerere.rikkahub.agent.model.AGENT_EVENT_TYPE_MODEL_ACTIVE
 import me.rerere.rikkahub.agent.model.AGENT_EVENT_TYPE_RESUME_CHECKPOINT
 import me.rerere.rikkahub.agent.model.AgentEvent
 import me.rerere.rikkahub.agent.model.AgentErrorKind
@@ -36,6 +37,7 @@ import me.rerere.rikkahub.agent.repo.AgentThreadRepository
 import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.uuid.Uuid
+import me.rerere.rikkahub.data.datastore.agentHasCapacity
 
 /** 并发代理数达到上限时抛出 */
 class AgentLimitReachedException(val maxConcurrent: Int) :
@@ -71,7 +73,9 @@ internal const val AGENT_RESUME_TOTAL_MAX = 8
  * 设成 0（完全不自动续跑）时总上限仍按 8 算：手动点「继续输出」不该被自己的设置管死。
  */
 internal fun effectiveResumeTotalMax(autoResumeMax: Int): Int =
-    maxOf(AGENT_RESUME_TOTAL_MAX, autoResumeMax.coerceIn(0, 10) * 2)
+    // v1024：用户自填次数没有10次封顶；宽中间值保证不会溢出变成更小预算。
+    maxOf(AGENT_RESUME_TOTAL_MAX.toLong(), autoResumeMax.coerceAtLeast(0).toLong() * 2L)
+        .coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
 
 /**
  * v241：中途换模型时，最多等这么久让当前那次生成停下来。
@@ -438,6 +442,20 @@ class AgentThreadManager(
         }
     }
 
+    /**
+     * v1028：把「现在用的是哪个模型」写进实时信号。
+     *
+     * 独立于 [noteStageEvent]：这里只更新 modelLabel，不动 lastEventType / pendingTools，
+     * 免得一条模型事件把「工具执行中」或「正在换备用模型」的阶段判断冲掉。
+     */
+    private fun noteStageModel(threadId: String, label: String) {
+        if (label.isBlank()) return
+        liveStage.update { map ->
+            val cur = map[threadId] ?: AgentStageSignal()
+            if (cur.modelLabel == label) map else map + (threadId to cur.copy(modelLabel = label))
+        }
+    }
+
     /** v242：开启新一代运行，返回本次的代次号 */
     private fun nextRunEpoch(threadId: String): Long =
         runEpoch.compute(threadId) { _, old -> (old ?: 0L) + 1L } ?: 1L
@@ -493,7 +511,7 @@ class AgentThreadManager(
      */
     suspend fun spawn(request: AgentSpawnRequest): AgentThread {
         mutex.withLock {
-            if (repository.activeCount() >= maxConcurrent) {
+            if (!agentHasCapacity(repository.activeCount(), maxConcurrent)) {
                 throw AgentLimitReachedException(maxConcurrent)
             }
             val thread = AgentThread(
@@ -621,7 +639,7 @@ class AgentThreadManager(
             val totalMax = resumeTotalMax()
             if (thread.resumeCount >= totalMax) return null
             if (jobs.containsKey(threadId)) return null
-            if (repository.activeCount() >= maxConcurrent) {
+            if (!agentHasCapacity(repository.activeCount(), maxConcurrent)) {
                 throw AgentLimitReachedException(maxConcurrent)
             }
             extraInstruction?.takeIf { it.isNotBlank() }?.let {
@@ -809,8 +827,9 @@ class AgentThreadManager(
         threadIds: List<String>,
         timeoutMillis: Long,
     ): List<AgentThread> {
-        val deadline = System.currentTimeMillis() + timeoutMillis
-        while (System.currentTimeMillis() < deadline) {
+        // v1024：不能把大预算加到epoch时间戳上；使用单调已耗时，Long.MAX_VALUE也不溢出。
+        val waitStarted = kotlin.time.TimeSource.Monotonic.markNow()
+        while (timeoutMillis > 0L && waitStarted.elapsedNow().inWholeMilliseconds < timeoutMillis) {
             val threads = threadIds.mapNotNull { repository.thread(it) }
             // v242：只看「是不是终态」不够 —— 如果它马上会自己接着跑（自动续跑，
             // 或截断后自动接着写），现在返回等于把一条正要复活的线程报成
@@ -1582,6 +1601,11 @@ class AgentThreadManager(
                     if (it.type != AGENT_EVENT_TYPE_RESUME_CHECKPOINT) {
                         noteStageEvent(threadId, it.type)
                     }
+                    // v1028：模型一确定就把名字写进实时信号（第一个模型与换备用模型都会发）。
+                    // 必须在 RESUME_CHECKPOINT 判断之外单独处理：模型名与阶段是两回事。
+                    if (it.type == AGENT_EVENT_TYPE_MODEL_ACTIVE) {
+                        noteStageModel(threadId, it.detail)
+                    }
                 },
             )
             // v242：跑到这里可能已经过了好几分钟，中途可能有人「换模型接着跑」，
@@ -1833,20 +1857,24 @@ internal fun pipelineStageWaitMillis(
     autoResumeMax: Int,
     backoffMillis: Long = AGENT_AUTO_RETRY_BACKOFF_MILLIS,
 ): Long {
-    val resumes = autoResumeMax.coerceAtLeast(0)
-    val attempts = resumes + 1
+    // v1024：下列v244备注保留历史。现用任意精度中间值后收敛至Long API边界，不再90分钟封顶。
     // v244：一趟的时长上限已经不是「总超时」了（那条闸只剩 2 小时的防死循环兜底）。
     // 真正决定一趟什么时候被打断的是静默阈值，而一趟正常任务的实际时长通常是它的若干倍
     // —— 每产出一次就重新计时。这里按 3 倍估：既不至于把还在干活的一棒掐掉，
     // 也不会在一棒真挂死时等到天荒地老（上面还有硬上限兜着）。
-    val perAttempt =
-        (if (idleTimeoutMillis > 0L) idleTimeoutMillis else AGENT_IDLE_TIMEOUT_DEFAULT_MILLIS) * 3
     // 退避是递增的（第 n 次等 backoff×n），总和 = backoff × n(n+1)/2
-    val backoffTotal = backoffMillis * resumes * (resumes + 1) / 2
-    val floor = perAttempt * attempts + backoffTotal + 60_000L
     // v244 自查补强：上限也要保证「至少够跑完一趟」。
     // 静默阈值最大可设到 120 分钟，那时一趟的预算就超过 90 分钟的硬上限 ——
     // 若死夹在 90 分钟，又会退回「等待方先到点、被等的一方连一趟都跑不完」。
-    val cap = maxOf(AGENT_PIPELINE_STAGE_WAIT_MAX_MILLIS, perAttempt + backoffTotal + 60_000L)
-    return maxOf(requestedMillis, floor).coerceAtMost(cap)
+    val resumes = autoResumeMax.coerceAtLeast(0).toLong()
+    val attempts = java.math.BigInteger.valueOf(resumes + 1L)
+    val perAttempt = java.math.BigInteger.valueOf(
+        if (idleTimeoutMillis > 0L) idleTimeoutMillis else AGENT_IDLE_TIMEOUT_DEFAULT_MILLIS,
+    ).multiply(java.math.BigInteger.valueOf(3L))
+    val triangular = java.math.BigInteger.valueOf(resumes).multiply(attempts)
+        .divide(java.math.BigInteger.valueOf(2L))
+    val backoffTotal = java.math.BigInteger.valueOf(backoffMillis.coerceAtLeast(0L)).multiply(triangular)
+    val floor = perAttempt.multiply(attempts).add(backoffTotal).add(java.math.BigInteger.valueOf(60_000L))
+    return floor.max(java.math.BigInteger.valueOf(requestedMillis.coerceAtLeast(0L)))
+        .min(java.math.BigInteger.valueOf(Long.MAX_VALUE)).toLong()
 }

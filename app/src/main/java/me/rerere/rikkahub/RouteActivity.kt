@@ -595,6 +595,24 @@ class RouteActivity : ComponentActivity() {
                                 SettingMcpPage()
                             }
 
+                            // v1026：补回合并上游时丢掉的路由注册。
+                            //
+                            // 崩溃现场：设置 → MCP → 点某个服务器详情，Navigation3 在路由表里
+                            // 找不到 SettingMcpDetail，直接抛 IllegalStateException: Unknown screen
+                            // 把 App 打挂。Screen 定义（本文件 SettingMcpDetail）与页面函数
+                            // SettingMcpDetailPage 一直都在，import 也在，唯独少了这条 entry。
+                            //
+                            // 归属：官方 3.1.1 本来有这条注册（RouteActivity.kt:524），
+                            // 我们 v1024 快照里就已经丢了 —— 不是本轮联网修复引入的，
+                            // 是更早某次合并上游时漏掉的官方增量。SettingMcpDetailPage.kt
+                            // 与官方逐字节一致、不带二改，所以这里照官方原样补回即可。
+                            //
+                            // 刻意**不**补 SettingDonate：那是用户明确要求删掉的赞助页，
+                            // 属于有意的二改，不是丢失。
+                            entry<Screen.SettingMcpDetail> { key ->
+                                SettingMcpDetailPage(id = Uuid.parse(key.serverId))
+                            }
+
                             entry<Screen.SettingFiles> {
                                 SettingFilesPage()
                             }

@@ -128,7 +128,9 @@ internal fun FilesPicker(
     mcpManager: McpManager,
     onCompressContext: (additionalPrompt: String, modelSource: CompressionModelSource, customPrompt: String) -> Job,
     // v268：经典压缩（官方旧版流程）入口
-    onCompressContextClassic: (additionalPrompt: String, targetTokens: Int, keepRecentMessages: Int) -> Job = { _, _, _ -> Job() },
+    onCompressContextClassic: (additionalPrompt: String, keepRecentMessages: Int) -> Job = { _, _ -> Job() },
+    // v1024：离开后重新打开时附着原对话的应用级压缩任务。
+    runningCompressionJob: Job? = null,
     onUpdateAssistant: (Assistant) -> Unit,
     // v323：3.1 的聊天页会传这个回调；我们的工作区切换仍走 onUpdateConversation
     onUpdateWorkspaceCwd: (String?) -> Unit = {},
@@ -1133,6 +1135,15 @@ internal fun FilesPicker(
                     },
                 )
 
+                RoundTableSwitchRow(
+                    title = stringResource(R.string.round_table_body_only_title),
+                    desc = stringResource(R.string.round_table_body_only_desc),
+                    checked = roundTable.keepOnlySpeechBody,
+                    onCheckedChange = { checked ->
+                        updateRoundTable { it.copy(keepOnlySpeechBody = checked) }
+                    },
+                )
+
                 var roundTableSummaryPromptDraft by remember {
                     mutableStateOf(roundTable.summaryPrompt)
                 }
@@ -1239,7 +1250,7 @@ internal fun FilesPicker(
                 // v219：子代理总开关（与圆桌完全独立；关闭后主模型拿不到控制工具）
                 RoundTableSwitchRow(
                     title = stringResource(R.string.agent_tools_switch_title),
-                    desc = stringResource(R.string.agent_tools_switch_desc),
+                    desc = null,
                     checked = settings.enableAgentTools,
                     onCheckedChange = { checked ->
                         onUpdateSettings(settings.copy(enableAgentTools = checked))
@@ -1253,10 +1264,7 @@ internal fun FilesPicker(
                 val agentAssistant = settings.getCurrentAssistant()
                 RoundTableSwitchRow(
                     title = stringResource(R.string.agent_tools_assistant_switch_title),
-                    desc = stringResource(
-                        R.string.agent_tools_assistant_switch_desc,
-                        agentAssistant.name.trim().ifEmpty { "—" },
-                    ),
+                    desc = null,
                     checked = agentAssistant.enableAgentTools,
                     onCheckedChange = { checked ->
                         onUpdateSettings(
@@ -1277,10 +1285,23 @@ internal fun FilesPicker(
                 // 这是隐私相关的开关，不能让用户在不知情的情况下打开。
                 RoundTableSwitchRow(
                     title = stringResource(R.string.agent_tools_memory_title),
-                    desc = stringResource(R.string.agent_tools_memory_desc),
+                    desc = null,
                     checked = settings.allowAgentConversationSearch,
                     onCheckedChange = { checked ->
                         onUpdateSettings(settings.copy(allowAgentConversationSearch = checked))
+                    },
+                )
+
+                // v1027：允许子代理调用 MCP（默认关）。这是**放权**开关 —— MCP 工具会真实
+                // 调用外部服务，可能写文件、改外部数据、产生费用，而且不受子代理那层
+                // 「不能执行命令/编译/删除」的约束。所以文案必须把这层风险写在脸上，
+                // 不能让用户在不知情的情况下打开。
+                RoundTableSwitchRow(
+                    title = stringResource(R.string.agent_tools_mcp_title),
+                    desc = null,
+                    checked = settings.allowAgentMcp,
+                    onCheckedChange = { checked ->
+                        onUpdateSettings(settings.copy(allowAgentMcp = checked))
                     },
                 )
 
@@ -1308,32 +1329,19 @@ internal fun FilesPicker(
                         )
                     },
                     trailingContent = {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            TextButton(
-                                onClick = {
-                                    onUpdateSettings(
-                                        settings.copy(agentMaxConcurrent = (settings.agentMaxConcurrent - 1).coerceAtLeast(1))
-                                    )
-                                },
-                                enabled = settings.agentMaxConcurrent > 1,
-                            ) {
-                                Text("−")
-                            }
-                            Text(
-                                text = settings.agentMaxConcurrent.toString(),
-                                style = MaterialTheme.typography.titleMedium,
-                            )
-                            TextButton(
-                                onClick = {
-                                    onUpdateSettings(
-                                        settings.copy(agentMaxConcurrent = (settings.agentMaxConcurrent + 1).coerceAtMost(8))
-                                    )
-                                },
-                                enabled = settings.agentMaxConcurrent < 8,
-                            ) {
-                                Text("+")
-                            }
-                        }
+                        AgentNumberInput(
+                            title = stringResource(R.string.agent_tools_concurrent_title),
+                            value = settings.agentMaxConcurrent,
+                            valueLabel = if (settings.agentMaxConcurrent == 0) {
+                                stringResource(R.string.agent_numeric_unlimited)
+                            } else {
+                                settings.agentMaxConcurrent.toString()
+                            },
+                            zeroAllowed = true,
+                            onSave = { value ->
+                                onUpdateSettings(settings.copy(agentMaxConcurrent = value))
+                            },
+                        )
                     },
                     colors = ListItemDefaults.colors(
                         containerColor = MaterialTheme.colorScheme.surfaceContainer
@@ -1353,36 +1361,22 @@ internal fun FilesPicker(
                         )
                     },
                     trailingContent = {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            TextButton(
-                                onClick = {
-                                    onUpdateSettings(
-                                        settings.copy(agentThreadTimeoutMinutes = (settings.agentThreadTimeoutMinutes - 5).coerceAtLeast(0))
-                                    )
-                                },
-                                enabled = settings.agentThreadTimeoutMinutes > 0,
-                            ) {
-                                Text("−")
-                            }
-                            Text(
-                                text = if (settings.agentThreadTimeoutMinutes == 0) {
-                                    stringResource(R.string.agent_tools_timeout_unlimited)
-                                } else {
-                                    stringResource(R.string.agent_tools_timeout_minutes, settings.agentThreadTimeoutMinutes)
-                                },
-                                style = MaterialTheme.typography.titleMedium,
-                            )
-                            TextButton(
-                                onClick = {
-                                    onUpdateSettings(
-                                        settings.copy(agentThreadTimeoutMinutes = (settings.agentThreadTimeoutMinutes + 5).coerceAtMost(120))
-                                    )
-                                },
-                                enabled = settings.agentThreadTimeoutMinutes < 120,
-                            ) {
-                                Text("+")
-                            }
-                        }
+                        AgentNumberInput(
+                            title = stringResource(R.string.agent_tools_timeout_title),
+                            value = settings.agentThreadTimeoutMinutes,
+                            valueLabel = if (settings.agentThreadTimeoutMinutes == 0) {
+                                stringResource(R.string.agent_tools_timeout_unlimited)
+                            } else {
+                                stringResource(
+                                    R.string.agent_tools_timeout_minutes,
+                                    settings.agentThreadTimeoutMinutes,
+                                )
+                            },
+                            zeroAllowed = true,
+                            onSave = { value ->
+                                onUpdateSettings(settings.copy(agentThreadTimeoutMinutes = value))
+                            },
+                        )
                     },
                     colors = ListItemDefaults.colors(
                         containerColor = MaterialTheme.colorScheme.surfaceContainer
@@ -1405,35 +1399,18 @@ internal fun FilesPicker(
                         )
                     },
                     trailingContent = {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            TextButton(
-                                onClick = {
-                                    onUpdateSettings(
-                                        settings.copy(agentToolTimeoutMinutes = (settings.agentToolTimeoutMinutes - 5).coerceAtLeast(5))
-                                    )
-                                },
-                                enabled = settings.agentToolTimeoutMinutes > 5,
-                            ) {
-                                Text("−")
-                            }
-                            Text(
-                                text = stringResource(
-                                    R.string.agent_tools_tool_timeout_minutes,
-                                    settings.agentToolTimeoutMinutes
-                                ),
-                                style = MaterialTheme.typography.titleMedium,
-                            )
-                            TextButton(
-                                onClick = {
-                                    onUpdateSettings(
-                                        settings.copy(agentToolTimeoutMinutes = (settings.agentToolTimeoutMinutes + 5).coerceAtMost(60))
-                                    )
-                                },
-                                enabled = settings.agentToolTimeoutMinutes < 60,
-                            ) {
-                                Text("+")
-                            }
-                        }
+                        AgentNumberInput(
+                            title = stringResource(R.string.agent_tools_tool_timeout_title),
+                            value = settings.agentToolTimeoutMinutes,
+                            valueLabel = stringResource(
+                                R.string.agent_tools_tool_timeout_minutes,
+                                settings.agentToolTimeoutMinutes,
+                            ),
+                            zeroAllowed = false,
+                            onSave = { value ->
+                                onUpdateSettings(settings.copy(agentToolTimeoutMinutes = value))
+                            },
+                        )
                     },
                     colors = ListItemDefaults.colors(
                         containerColor = MaterialTheme.colorScheme.surfaceContainer
@@ -1469,35 +1446,22 @@ internal fun FilesPicker(
                         )
                     },
                     trailingContent = {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            TextButton(
-                                onClick = {
-                                    onUpdateSettings(
-                                        settings.copy(toolOutputLimitKb = (settings.toolOutputLimitKb - 32).coerceAtLeast(32))
-                                    )
-                                },
-                                enabled = settings.toolOutputLimitKb > 32,
-                            ) {
-                                Text("−")
-                            }
-                            Text(
-                                text = stringResource(
+                        AgentNumberInput(
+                            title = stringResource(R.string.agent_tools_read_limit_title),
+                            value = settings.toolOutputLimitKb,
+                            valueLabel = if (settings.toolOutputLimitKb == 0) {
+                                stringResource(R.string.agent_numeric_unlimited)
+                            } else {
+                                stringResource(
                                     R.string.agent_tools_read_limit_kb,
-                                    settings.toolOutputLimitKb
-                                ),
-                                style = MaterialTheme.typography.titleMedium,
-                            )
-                            TextButton(
-                                onClick = {
-                                    onUpdateSettings(
-                                        settings.copy(toolOutputLimitKb = (settings.toolOutputLimitKb + 32).coerceAtMost(256))
-                                    )
-                                },
-                                enabled = settings.toolOutputLimitKb < 256,
-                            ) {
-                                Text("+")
-                            }
-                        }
+                                    settings.toolOutputLimitKb,
+                                )
+                            },
+                            zeroAllowed = true,
+                            onSave = { value ->
+                                onUpdateSettings(settings.copy(toolOutputLimitKb = value))
+                            },
+                        )
                     },
                     colors = ListItemDefaults.colors(
                         containerColor = MaterialTheme.colorScheme.surfaceContainer
@@ -1519,36 +1483,22 @@ internal fun FilesPicker(
                         )
                     },
                     trailingContent = {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            TextButton(
-                                onClick = {
-                                    onUpdateSettings(
-                                        settings.copy(agentAutoResumeMax = (settings.agentAutoResumeMax - 1).coerceAtLeast(0))
-                                    )
-                                },
-                                enabled = settings.agentAutoResumeMax > 0,
-                            ) {
-                                Text("−")
-                            }
-                            Text(
-                                text = if (settings.agentAutoResumeMax == 0) {
-                                    stringResource(R.string.agent_tools_resume_max_off)
-                                } else {
-                                    stringResource(R.string.agent_tools_resume_max_times, settings.agentAutoResumeMax)
-                                },
-                                style = MaterialTheme.typography.titleMedium,
-                            )
-                            TextButton(
-                                onClick = {
-                                    onUpdateSettings(
-                                        settings.copy(agentAutoResumeMax = (settings.agentAutoResumeMax + 1).coerceAtMost(10))
-                                    )
-                                },
-                                enabled = settings.agentAutoResumeMax < 10,
-                            ) {
-                                Text("+")
-                            }
-                        }
+                        AgentNumberInput(
+                            title = stringResource(R.string.agent_tools_resume_max_title),
+                            value = settings.agentAutoResumeMax,
+                            valueLabel = if (settings.agentAutoResumeMax == 0) {
+                                stringResource(R.string.agent_tools_resume_max_off)
+                            } else {
+                                stringResource(
+                                    R.string.agent_tools_resume_max_times,
+                                    settings.agentAutoResumeMax,
+                                )
+                            },
+                            zeroAllowed = true,
+                            onSave = { value ->
+                                onUpdateSettings(settings.copy(agentAutoResumeMax = value))
+                            },
+                        )
                     },
                     colors = ListItemDefaults.colors(
                         containerColor = MaterialTheme.colorScheme.surfaceContainer
@@ -1570,32 +1520,22 @@ internal fun FilesPicker(
                         )
                     },
                     trailingContent = {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            TextButton(
-                                onClick = {
-                                    onUpdateSettings(
-                                        settings.copy(agentMaxSteps = (settings.agentMaxSteps - 8).coerceAtLeast(16))
-                                    )
-                                },
-                                enabled = settings.agentMaxSteps > 16,
-                            ) {
-                                Text("−")
-                            }
-                            Text(
-                                text = stringResource(R.string.agent_tools_max_steps_value, settings.agentMaxSteps),
-                                style = MaterialTheme.typography.titleMedium,
-                            )
-                            TextButton(
-                                onClick = {
-                                    onUpdateSettings(
-                                        settings.copy(agentMaxSteps = (settings.agentMaxSteps + 8).coerceAtMost(96))
-                                    )
-                                },
-                                enabled = settings.agentMaxSteps < 96,
-                            ) {
-                                Text("+")
-                            }
-                        }
+                        AgentNumberInput(
+                            title = stringResource(R.string.agent_tools_max_steps_title),
+                            value = settings.agentMaxSteps,
+                            valueLabel = if (settings.agentMaxSteps == 0) {
+                                stringResource(R.string.agent_numeric_unlimited)
+                            } else {
+                                stringResource(
+                                    R.string.agent_tools_max_steps_value,
+                                    settings.agentMaxSteps,
+                                )
+                            },
+                            zeroAllowed = true,
+                            onSave = { value ->
+                                onUpdateSettings(settings.copy(agentMaxSteps = value))
+                            },
+                        )
                     },
                     colors = ListItemDefaults.colors(
                         containerColor = MaterialTheme.colorScheme.surfaceContainer
@@ -1902,8 +1842,9 @@ internal fun FilesPicker(
             },
             // v268：双模式——初始模式记住上次选择；经典模式走官方旧版流程
             initialClassicMode = settings.compressUseClassicMode,
-            onConfirmClassic = { additionalPrompt, targetTokens, keepRecentMessages ->
-                onCompressContextClassic(additionalPrompt, targetTokens, keepRecentMessages)
+            runningJob = runningCompressionJob,
+            onConfirmClassic = { additionalPrompt, keepRecentMessages ->
+                onCompressContextClassic(additionalPrompt, keepRecentMessages)
             },
         )
     }
@@ -1912,18 +1853,23 @@ internal fun FilesPicker(
 @Composable
 private fun RoundTableSwitchRow(
     title: String,
-    desc: String,
+    desc: String? = null,
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit,
 ) {
+    val descText = desc
     ListItem(
         headlineContent = { Text(title) },
-        supportingContent = {
-            Text(
-                text = desc,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+        supportingContent = if (descText.isNullOrBlank()) {
+            null
+        } else {
+            {
+                Text(
+                    text = descText,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         },
         trailingContent = {
             Switch(checked = checked, onCheckedChange = onCheckedChange)

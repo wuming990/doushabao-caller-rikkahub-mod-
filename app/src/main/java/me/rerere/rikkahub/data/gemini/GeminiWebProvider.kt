@@ -4,9 +4,19 @@ import android.util.Log
 import java.security.MessageDigest
 import java.util.UUID
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.catch
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -29,6 +39,7 @@ import me.rerere.ai.util.mergeCustomHeaders
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
 import okhttp3.RequestBody.Companion.toRequestBody
 
 /**
@@ -64,31 +75,20 @@ class GeminiWebProvider(
         /** v1016：表单类型只留一处定义，别出现两个写法不一致的副本。 */
         private const val FORM_CONTENT_TYPE = "application/x-www-form-urlencoded;charset=utf-8"
 
-        private data class WebModel(
-            val modelId: String,
-            val displayName: String,
-            val hash: String,
-            val number: Int,
-        )
-
-        /** hash 来自公开逆向目录；模型编号用于 inner[79] 与 header 末位，必须同源。 */
-        private val WEB_MODELS = listOf(
-            WebModel("gemini-3.1-pro", "Gemini 3.1 Pro（网页）", "9d8ca3786ebdfbea", 1),
-            WebModel("gemini-3.8-flash", "Gemini 3.8 Flash（网页）", "56fdd199312815e2", 2),
-            WebModel("gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite（网页）", "cf41b0e0dd7d53e5", 3),
-        )
-
-        private fun modelOf(modelId: String): WebModel =
-            WEB_MODELS.firstOrNull { it.modelId == modelId } ?: WEB_MODELS.first()
+        private const val STATUS_URL = "$ORIGIN/_/BardChatUi/data/batchexecute"
     }
 
+    // v1020：每次按当前账号查询，不能缓存成全局固定名单，也不能把别的账号目录串进来。
     override suspend fun listModels(providerSetting: ProviderSetting.GeminiWeb): List<Model> =
-        WEB_MODELS.map { model ->
-            Model(
-                modelId = model.modelId,
-                displayName = model.displayName,
-                contextLength = 1_000_000,
-            )
+        withContext(Dispatchers.IO) {
+            val cookie = cookieOf(providerSetting)
+            val session = fetchSession(providerSetting, cookie)
+            fetchCatalog(providerSetting, cookie, session).map { model ->
+                // v1022: do not add ModelAbility.REASONING here. That flag is consumed by
+                // other transports and could send reasoning fields to a providerOverwrite gateway.
+                // The web thinking picker is enabled by the actual GeminiWeb provider type instead.
+                Model(modelId = model.modelId, displayName = model.displayName, contextLength = 1_000_000)
+            }
         }
 
     override suspend fun generateText(
@@ -98,13 +98,16 @@ class GeminiWebProvider(
     ): TextGenerationResult {
         var collected = listOf(UIMessage(role = MessageRole.ASSISTANT, parts = emptyList()))
         val handler = StreamChunkHandler(params.model)
+        var reportedModel = params.model.modelId
         streamText(providerSetting, messages, params).collect { chunk ->
             collected = handler.handle(collected, chunk)
+            if (chunk is StreamChunk.Finish) reportedModel = chunk.model ?: reportedModel
         }
         return TextGenerationResult(
             id = "",
-            model = params.model.modelId,
+            model = reportedModel,
             message = collected.last(),
+            finishReason = collected.last().finishReason,
         )
     }
 
@@ -113,23 +116,15 @@ class GeminiWebProvider(
         messages: List<UIMessage>,
         params: TextGenerationParams,
     ): Flow<StreamChunk> = flow {
-        val rawCookie = providerSetting.cookie.trim()
-        if (rawCookie.isBlank()) {
-            error("Gemini 网页版还没有登录。请到供应商设置里点「一键登录 Google」，或手动粘贴 gemini.google.com 的 Cookie。")
-        }
-        // v1007：粘贴进来的可能是一整段请求头 / 一段 JSON / 换行分隔的键值，
-        // 统一挑出 PSID / PSIDTS / SAPISID 再用；挑不出来就按原样送，让服务端报错更直观。
-        val cookie = normalizeGeminiWebCookie(rawCookie) ?: rawCookie
-
+        val cookie = cookieOf(providerSetting)
         val prompt = buildPrompt(messages)
-        val webModel = modelOf(params.model.modelId)
         val session = fetchSession(providerSetting, cookie)
-        if (session.at.isBlank()) {
-            error("Cookie 里没有登录态（读不到 SNlM0e）。点「一键登录 Google」重新抓一次，或确认粘贴的是已登录 gemini.google.com 的完整 Cookie。")
-        }
+        val webModel = resolveGeminiWebModel(fetchCatalog(providerSetting, cookie, session), params.model.modelId)
 
         val requestUuid = UUID.randomUUID().toString()
-        val fReq = buildFReq(prompt, webModel, requestUuid)
+        // v1022: actually send the selected tier; previously every request was hardcoded to low=1.
+        val thinkingWire = geminiWebThinkingWire(params.reasoningLevel, webModel.isArgonModel())
+        val fReq = buildFReq(prompt, webModel, requestUuid, thinkingWire)
 
         val body = buildString {
             append("at=").append(java.net.URLEncoder.encode(session.at, "UTF-8"))
@@ -156,9 +151,11 @@ class GeminiWebProvider(
             .header("cookie", cookie)
             .header(
                 MODEL_HEADER,
-                """[1,null,null,null,"${webModel.hash}",null,null,0,[4,5,6,8],null,null,1,null,null,${webModel.number}]""",
+                webModel.modelHeader(session.clientSessionUuid, thinkingWire),
             )
             .header(UUID_HEADER, """["$requestUuid",1]""")
+            .header("x-goog-ext-73010989-jspb", "[0]")
+            .header("x-goog-ext-73010990-jspb", "[0,0,0]")
         sapisidHash(cookie)?.let { builder.header("authorization", it) }
         val merged = providerSetting.mergeCustomHeaders(params.customHeaders)
         for (index in 0 until merged.size) {
@@ -167,90 +164,103 @@ class GeminiWebProvider(
 
         Log.i(
             TAG,
-            "streamText model=${params.model.modelId} bl=${session.buildLabel} at=${session.at.length} cookie=${cookie.length}",
+            "streamText requested=${params.model.modelId} selected=${webModel.modelId} name=${webModel.displayName} number=${webModel.number} capacity=${webModel.capacity} thinking=$thinkingWire bl=${session.buildLabel}",
         )
 
-        val response = client.newCall(builder.post(body.toRequestBody(FORM_MEDIA)).build()).execute()
-        response.use { resp ->
-            if (!resp.isSuccessful) {
-                val text = resp.body?.string().orEmpty().take(2000)
-                Log.e(TAG, "HTTP ${resp.code}: $text")
-                when (resp.code) {
-                    401, 403 -> error("Gemini 网页版拒绝访问（${resp.code}）。登录态已过期，或与登录时的浏览器标识不一致：点「一键登录 Google」重抓一次即可（手动粘贴的 Cookie 请重新登录后再复制）。")
-                    429 -> error("Gemini 网页版触发限流（429）。等几分钟再试，或换一个账号。")
-                    else -> error("Gemini 网页版返回 ${resp.code}：${text.take(300)}")
+        withWebResponse(builder.post(body.toRequestBody(FORM_MEDIA)).build()) { response ->
+            requireSuccessful(response)
+            val source = response.body?.source() ?: error("Gemini 网页版返回空内容")
+            val decoder = GeminiWebStreamDecoder(json)
+            readGeminiWebFrames(source, json) { frame ->
+                for (row in geminiWebRows(frame)) {
+                    for (chunk in decoder.accept(row)) emit(chunk)
                 }
             }
-
-            val source = resp.body?.source() ?: error("Gemini 网页版返回空内容")
-            val textId = "gemini-web"
-            var emitted = false
-            var sawAnyWrb = false
-            var errorText: String? = null
-
-            while (true) {
-                val line = source.readUtf8Line() ?: break
-                val trimmed = line.trim().removePrefix(")]}'").trim()
-                if (trimmed.isEmpty() || trimmed.all { it.isDigit() }) continue
-                val root = runCatching { json.parseToJsonElement(trimmed) as? JsonArray }.getOrNull()
-                    ?: continue
-                root.forEach { item ->
-                    val row = item as? JsonArray ?: return@forEach
-                    if (row.getOrNull(0)?.toString()?.contains("wrb.fr") == true) sawAnyWrb = true
-                    val payloadRaw = row.getOrNull(2)?.let { part ->
-                        runCatching { part.jsonPrimitive.content }.getOrNull()
-                    } ?: return@forEach
-                    val payload = runCatching { json.parseToJsonElement(payloadRaw) as? JsonArray }
-                        .getOrNull() ?: return@forEach
-
-                    val code = payload.getOrNull(5)?.toString()?.toIntOrNull()
-                    if (code != null && code != 0) {
-                        errorText = "Gemini 网页版错误码 $code"
-                    }
-
-                    val candidates = payload.getOrNull(4) as? JsonArray ?: return@forEach
-                    candidates.forEach { candidate ->
-                        val candidateArray = candidate as? JsonArray ?: return@forEach
-                        val parts = candidateArray.getOrNull(1) as? JsonArray ?: return@forEach
-                        val text = parts.getOrNull(0)?.let { part ->
-                            runCatching { part.jsonPrimitive.content }.getOrNull()
-                        } ?: return@forEach
-                        if (text.isNotEmpty()) {
-                            emitted = true
-                            emit(StreamChunk.TextDelta(id = textId, text = text))
-                        }
-                    }
-                }
-            }
-
-            if (!emitted) {
-                error(
-                    errorText ?: if (!sawAnyWrb) {
-                        "Gemini 网页版没有返回可解析内容（协议可能已变更，或 Cookie 已失效）"
-                    } else {
-                        "Gemini 网页版返回了空回复"
-                    }
-                )
-            }
-            emit(StreamChunk.Finish(finishReason = "stop", model = params.model.modelId))
+            // v1020：只有 Google 真正完成才 stop；中途 EOF 保留截断事实，交给现有续跑机制。
+            emit(decoder.finish(webModel.modelId))
         }
-    }.flowOn(Dispatchers.IO)
+    }.deliverGeminiWebFailures()
 
-    private data class WebSession(val at: String, val buildLabel: String, val sid: String)
+    private data class WebSession(
+        val at: String,
+        val buildLabel: String,
+        val sid: String,
+        val clientSessionUuid: String = UUID.randomUUID().toString().uppercase(java.util.Locale.ROOT),
+    )
+
+    private fun cookieOf(providerSetting: ProviderSetting.GeminiWeb): String {
+        val rawCookie = providerSetting.cookie.trim()
+        if (rawCookie.isBlank()) {
+            error("Gemini 网页版还没有登录。请到供应商设置里点「一键登录 Google」，或手动粘贴 gemini.google.com 的 Cookie。")
+        }
+        // v1007：粘贴进来的可能是一整段请求头 / 一段 JSON / 换行分隔的键值，
+        // 统一挑出 PSID / PSIDTS / SAPISID 再用；挑不出来就按原样送，让服务端报错更直观。
+        return normalizeGeminiWebCookie(rawCookie) ?: rawCookie
+    }
+
+    // v1020：取消会直接关闭本次 Call；没有内部重发，不会背着用户再提交一遍问题。
+    private suspend fun <T> withWebResponse(request: Request, read: suspend (Response) -> T): T = coroutineScope {
+        val call = client.newCall(request)
+        val cancelWatcher = launch(start = CoroutineStart.UNDISPATCHED) {
+            try { awaitCancellation() } finally { call.cancel() }
+        }
+        try {
+            call.execute().use { response -> read(response) }
+        } catch (failure: Exception) {
+            currentCoroutineContext().ensureActive()
+            throw failure
+        } finally {
+            cancelWatcher.cancel()
+        }
+    }
+
+    private fun requireSuccessful(response: Response) {
+        if (response.isSuccessful) return
+        val detail = response.body?.string().orEmpty().take(300)
+        error("Gemini 网页版返回 HTTP ${response.code}：$detail")
+    }
+
+    private suspend fun fetchCatalog(
+        setting: ProviderSetting.GeminiWeb,
+        cookie: String,
+        session: WebSession,
+    ): List<GeminiWebModel> {
+        val rpc = buildJsonArray { add("otAQ7b"); add("[]"); add(JsonNull); add("generic") }
+        val fReq = buildJsonArray { add(buildJsonArray { add(rpc) }) }.toString()
+        val body = "at=" + java.net.URLEncoder.encode(session.at, "UTF-8") +
+            "&f.req=" + java.net.URLEncoder.encode(fReq, "UTF-8")
+        val url = STATUS_URL + "?rpcids=otAQ7b&source-path=%2Fapp&hl=zh-CN&rt=c&_reqid=" +
+            (100000..999999).random() + "&bl=" + java.net.URLEncoder.encode(session.buildLabel, "UTF-8") +
+            (if (session.sid.isNotBlank()) "&f.sid=" + java.net.URLEncoder.encode(session.sid, "UTF-8") else "")
+        val request = Request.Builder().url(url)
+            .header("content-type", FORM_CONTENT_TYPE)
+            .header("origin", ORIGIN).header("referer", "$ORIGIN/")
+            .header("x-same-domain", "1")
+            .header("user-agent", userAgentOf(setting)).header("cookie", cookie)
+            .header(MODEL_HEADER, """[1,null,null,null,null,null,null,null,[4,5,6,8],null,null,null,null,null,null,null,"${session.clientSessionUuid}"]""")
+            .header("x-goog-ext-73010989-jspb", "[0]")
+        sapisidHash(cookie)?.let { request.header("authorization", it) }
+        return withWebResponse(request.post(body.toRequestBody(FORM_MEDIA)).build()) { response ->
+            requireSuccessful(response)
+            val rows = mutableListOf<JsonArray>()
+            val source = response.body?.source() ?: error("Gemini 网页版模型列表为空")
+            readGeminiWebFrames(source, json) { frame -> rows.addAll(geminiWebRows(frame)) }
+            parseGeminiWebCatalog(rows, json)
+        }
+    }
 
     /** 从 /app 页面取 at（SNlM0e）、bl（cfb2h）、f.sid（FdrFJe）。正则与 Gemini-API 一致。 */
-    private fun fetchSession(providerSetting: ProviderSetting.GeminiWeb, cookie: String): WebSession {
+    private suspend fun fetchSession(providerSetting: ProviderSetting.GeminiWeb, cookie: String): WebSession {
         val builder = Request.Builder()
             .url(APP_URL)
             .header("cookie", cookie)
             .header("user-agent", userAgentOf(providerSetting))
             .header("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
         sapisidHash(cookie)?.let { builder.header("authorization", it) }
-        val html = runCatching {
-            client.newCall(builder.get().build()).execute().use { resp ->
-                if (resp.isSuccessful) resp.body?.string().orEmpty() else ""
-            }
-        }.getOrDefault("")
+        val html = withWebResponse(builder.get().build()) { response ->
+            requireSuccessful(response)
+            response.body?.string().orEmpty()
+        }
 
         fun pick(key: String): String =
             Regex(""""$key"\s*:\s*"(.*?)"""").find(html)?.groupValues?.get(1).orEmpty()
@@ -259,8 +269,10 @@ class GeminiWebProvider(
             .ifBlank { pick("cfb2h") }
             .ifBlank { Regex("""boq_assistant-bard-web-server_[\d.]+_p\d+""").find(html)?.value.orEmpty() }
             .ifBlank { FALLBACK_BL }
+        val at = pick("SNlM0e")
+        if (at.isBlank()) error("Gemini 网页版没有取得登录态（SNlM0e），请重新登录后再试。")
         return WebSession(
-            at = pick("SNlM0e"),
+            at = at,
             buildLabel = bl,
             sid = pick("FdrFJe"),
         )
@@ -292,7 +304,7 @@ class GeminiWebProvider(
     }
 
     /** 81 槽结构照抄 Gemini-API：缺槽位 Google 是宽容的，但 0/1/2/6/7/10/11/17/18/27/30/41/68/79 不能少。 */
-    private fun buildFReq(prompt: String, model: WebModel, requestUuid: String): String {
+    private fun buildFReq(prompt: String, model: GeminiWebModel, requestUuid: String, thinkingWire: Int): String {
         val inner = arrayOfNulls<JsonElement>(81)
         inner[0] = buildJsonArray {
             add(JsonPrimitive(prompt))
@@ -324,7 +336,7 @@ class GeminiWebProvider(
         inner[61] = buildJsonArray { }
         inner[68] = JsonPrimitive(1)
         inner[79] = JsonPrimitive(model.number)
-        inner[80] = JsonPrimitive(1)
+        inner[80] = JsonPrimitive(thinkingWire) // v1022: must match header thinking slot.
 
         val filled = inner.map { it ?: JsonNull }
         return buildJsonArray {
@@ -356,6 +368,19 @@ class GeminiWebProvider(
         }.trim()
     }
 }
+
+/**
+ * v1020：跨IO通道时先把异常排在已收到的正文之后，再在调用侧原样抛出。
+ * 否则flowOn生产端先失败会取消尚未交给UI的正文；取消例外，用户停止仍立即停止。
+ */
+private fun Flow<StreamChunk>.deliverGeminiWebFailures(): Flow<StreamChunk> =
+    map { Result.success(it) }
+        .catch { failure ->
+            if (failure is CancellationException) throw failure
+            emit(Result.failure(failure))
+        }
+        .flowOn(Dispatchers.IO)
+        .map { it.getOrThrow() }
 
 private val FORM_MEDIA = "application/x-www-form-urlencoded".toMediaType()
 

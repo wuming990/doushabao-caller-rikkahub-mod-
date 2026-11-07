@@ -183,6 +183,8 @@ private val SAMPLE = Settings(
     groupChatPresets = listOf(GroupChatPreset(id = id(46), name = "preset")),
     groupChatCleanContext = true,
     allowAgentConversationSearch = true,
+    // v1027：子代理调用 MCP 的总开关。必须取和默认值（false）不同的值，否则 round-trip 测不出读写。
+    allowAgentMcp = true,
     agentMaxSteps = 40,
     enableAgentTools = false,
     agentModelId = id(43),
@@ -193,7 +195,7 @@ private val SAMPLE = Settings(
     sharedStorageTreeUris = listOf("content://tree/1"),
     launchCount = 9,
     autoCompressModelOverrides = listOf(AutoCompressModelOverride(modelId = id(49), triggerTokens = 1000)),
-    roundTableSetting = RoundTableSetting(memberModelIds = listOf(id(50)), mainModelId = id(51)),
+    roundTableSetting = RoundTableSetting(memberModelIds = listOf(id(50)), mainModelId = id(51), keepOnlySpeechBody = true),
     workspaceCommandTimeoutSeconds = 600,
 )
 
@@ -264,6 +266,7 @@ private val STORED_KEYS = setOf(
     "group_chat_presets",
     "group_chat_clean_context",
     "agent_conversation_search",
+    "agent_mcp",
     "agent_max_steps_readonly",
     "agent_tools_enabled",
     "agent_model",

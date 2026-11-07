@@ -356,6 +356,11 @@ class SettingsStore internal constructor(
          * enableRecentChatsReference），子代理的隔离助手副本里那行 false 也一律不动。
          */
         val AGENT_CONVERSATION_SEARCH = booleanPreferencesKey("agent_conversation_search")
+        /**
+         * v1027：允许子代理调用 MCP。默认关 —— 缺 key 时必须得到 false，所以读的时候
+         * 用 `== true`，不许写成 `!= false`（那样老存档会被判成开启，等于偷偷放权）。
+         */
+        val AGENT_MCP = booleanPreferencesKey("agent_mcp")
         val AGENT_MODEL = stringPreferencesKey("agent_model")
 
         val COMPRESS_MODEL = stringPreferencesKey("compress_model")
@@ -463,15 +468,14 @@ class SettingsStore internal constructor(
                 preferences[SUGGESTION_PROMPT] = settings.suggestionPrompt
                 preferences[OCR_MODEL] = settings.ocrModelId.toString()
                 preferences[OCR_PROMPT] = settings.ocrPrompt
-                preferences[AGENT_MAX_CONCURRENT] = settings.agentMaxConcurrent.coerceIn(1, 8)
+                preferences[AGENT_MAX_CONCURRENT] = normalizeAgentLimit(settings.agentMaxConcurrent, 4, true)
                 // v238：超时分钟数必须跟着落盘，否则下一次 DataStore 发射会恢复默认
-                preferences[AGENT_THREAD_TIMEOUT] = settings.agentThreadTimeoutMinutes.coerceIn(0, 120)
+                preferences[AGENT_THREAD_TIMEOUT] = normalizeAgentLimit(settings.agentThreadTimeoutMinutes, 10, true)
                 // v246：工具上限同样必须落盘，否则下一次 DataStore 发射会恢复默认
-                preferences[AGENT_TOOL_TIMEOUT] = settings.agentToolTimeoutMinutes.coerceIn(1, 60)
+                preferences[AGENT_TOOL_TIMEOUT] = normalizeAgentLimit(settings.agentToolTimeoutMinutes, 10, false)
                 // v248：工具返回上限同样必须落盘（少了这一环，用户调完下一次发射就恢复默认）
-                preferences[TOOL_OUTPUT_LIMIT_KB] = settings.toolOutputLimitKb
-                    .coerceIn(TOOL_OUTPUT_LIMIT_MIN_KB, TOOL_OUTPUT_LIMIT_MAX_KB)
-                preferences[AGENT_AUTO_RESUME_MAX] = settings.agentAutoResumeMax.coerceIn(0, 10)
+                preferences[TOOL_OUTPUT_LIMIT_KB] = normalizeAgentLimit(settings.toolOutputLimitKb, TOOL_OUTPUT_LIMIT_DEFAULT_KB, true)
+                preferences[AGENT_AUTO_RESUME_MAX] = normalizeAgentLimit(settings.agentAutoResumeMax, 2, true)
                 preferences[TRUNCATION_AUTO_RESUME_MAX] = settings.truncationAutoResumeMax.coerceIn(0, 99)
                 preferences[SKILL_ORDER] = encodeSkillOrder(settings.skillOrder)
                 preferences[RESUME_STRATEGY_V288] = settings.resumeStrategy.name
@@ -491,7 +495,9 @@ class SettingsStore internal constructor(
                 // v321：「群讨论只保留发言正文」全局开关
                 preferences[GROUP_CHAT_CLEAN_CONTEXT] = settings.groupChatCleanContext
                 preferences[AGENT_CONVERSATION_SEARCH] = settings.allowAgentConversationSearch
-                preferences[AGENT_MAX_STEPS] = settings.agentMaxSteps.coerceIn(16, 96)
+                // v1027：子代理 MCP 开关必须落盘，否则下一次 DataStore 发射会被默认值覆盖回去
+                preferences[AGENT_MCP] = settings.allowAgentMcp
+                preferences[AGENT_MAX_STEPS] = normalizeAgentLimit(settings.agentMaxSteps, 32, true)
                 // v220 修复：子代理开关与默认模型必须落盘，否则下一次 DataStore 发射会恢复默认
                 preferences[AGENT_ENABLED] = settings.enableAgentTools
                 settings.agentModelId?.let {
@@ -611,12 +617,11 @@ class SettingsStore internal constructor(
                 suggestionPrompt = preferences[SUGGESTION_PROMPT] ?: DEFAULT_SUGGESTION_PROMPT,
                 ocrModelId = preferences[OCR_MODEL]?.let { Uuid.parse(it) } ?: Uuid.random(),
                 ocrPrompt = preferences[OCR_PROMPT] ?: DEFAULT_OCR_PROMPT,
-                agentMaxConcurrent = (preferences[AGENT_MAX_CONCURRENT] ?: 4).coerceIn(1, 8),
-                agentThreadTimeoutMinutes = (preferences[AGENT_THREAD_TIMEOUT] ?: 10).coerceIn(0, 120),
-                agentToolTimeoutMinutes = (preferences[AGENT_TOOL_TIMEOUT] ?: 10).coerceIn(1, 60),
-                toolOutputLimitKb = (preferences[TOOL_OUTPUT_LIMIT_KB] ?: TOOL_OUTPUT_LIMIT_DEFAULT_KB)
-                    .coerceIn(TOOL_OUTPUT_LIMIT_MIN_KB, TOOL_OUTPUT_LIMIT_MAX_KB),
-                agentAutoResumeMax = (preferences[AGENT_AUTO_RESUME_MAX] ?: 2).coerceIn(0, 10),
+                agentMaxConcurrent = normalizeAgentLimit((preferences[AGENT_MAX_CONCURRENT] ?: 4), 4, true),
+                agentThreadTimeoutMinutes = normalizeAgentLimit((preferences[AGENT_THREAD_TIMEOUT] ?: 10), 10, true),
+                agentToolTimeoutMinutes = normalizeAgentLimit((preferences[AGENT_TOOL_TIMEOUT] ?: 10), 10, false),
+                toolOutputLimitKb = normalizeAgentLimit((preferences[TOOL_OUTPUT_LIMIT_KB] ?: TOOL_OUTPUT_LIMIT_DEFAULT_KB), TOOL_OUTPUT_LIMIT_DEFAULT_KB, true),
+                agentAutoResumeMax = normalizeAgentLimit((preferences[AGENT_AUTO_RESUME_MAX] ?: 2), 2, true),
                 truncationAutoResumeMax = (preferences[TRUNCATION_AUTO_RESUME_MAX] ?: 3).coerceIn(0, 99),
                 skillOrder = decodeSkillOrder(preferences[SKILL_ORDER]),
                 resumeStrategy = preferences[RESUME_STRATEGY_V288]
@@ -653,7 +658,9 @@ class SettingsStore internal constructor(
                 groupChatCleanContext = preferences[GROUP_CHAT_CLEAN_CONTEXT] == true,
                 // v280：默认必须是关 —— 缺 key 时要得到 false，所以用 `== true` 而不是 `!= false`
                 allowAgentConversationSearch = preferences[AGENT_CONVERSATION_SEARCH] == true,
-                agentMaxSteps = (preferences[AGENT_MAX_STEPS] ?: 32).coerceIn(16, 96),
+                // v1027：默认必须是关 —— 缺 key 时要得到 false，所以用 `== true` 而不是 `!= false`
+                allowAgentMcp = preferences[AGENT_MCP] == true,
+                agentMaxSteps = normalizeAgentLimit((preferences[AGENT_MAX_STEPS] ?: 32), 32, true),
                 // v220 修复：读回子代理开关与默认模型（v219 只写不读/只读不写，会被默认值覆盖）
                 enableAgentTools = preferences[AGENT_ENABLED] != false,
                 agentModelId = preferences[AGENT_MODEL]
@@ -1299,6 +1306,12 @@ data class RoundTableSetting(
     val contractModelId: Uuid? = null,
     /** 针对性反驳用的模型；null = 用主模型 */
     val rebuttalModelId: Uuid? = null,
+    /**
+     * v1029：圆桌「讨论只保留发言正文」（默认关，关闭时行为与旧版一致）。
+     * 开启后，拼下一次请求时剥掉圆桌页里的搜索、工具与思考 part；
+     * 对话记录本身一个字都不删，用户仍然能在圆桌页里回看当时搜了什么。
+     */
+    val keepOnlySpeechBody: Boolean = false,
 )
 
 

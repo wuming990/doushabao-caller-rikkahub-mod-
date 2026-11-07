@@ -113,6 +113,14 @@ data class UIMessage(
      * 新字段带默认值，旧聊天 JSON / 数据库记录仍可正常反序列化，无需迁移。
      */
     val fromGroupChat: Boolean = false,
+    /**
+     * v1029：这条消息是圆桌讨论写进主对话的一页。
+     *
+     * 与 [fromGroupChat] 同一用途：圆桌页在对话里保留搜索、工具与思考记录（用户能回看），
+     * 但打开「讨论只保留发言正文」后，拼**下一次请求**时只带正文与附件。
+     * 新字段带默认值，旧聊天 JSON / 数据库记录仍可正常反序列化，无需迁移。
+     */
+    val fromRoundTable: Boolean = false,
 ) {
     fun summaryAsText(maxLength: Int = Int.MAX_VALUE): String {
         val text = "[${role.name}]: " + parts.joinToString(separator = "\n") { part ->

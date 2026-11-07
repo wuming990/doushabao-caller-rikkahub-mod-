@@ -89,6 +89,7 @@ import me.rerere.rikkahub.ui.components.ui.AutoAIIcon
 import me.rerere.rikkahub.ui.components.ui.Tag
 import me.rerere.rikkahub.ui.components.ui.TagType
 import me.rerere.rikkahub.ui.context.LocalNavController
+import me.rerere.rikkahub.ui.context.LocalSettings
 import me.rerere.rikkahub.ui.hooks.rememberSharedPreferenceString
 import me.rerere.rikkahub.ui.theme.extendColors
 import me.rerere.rikkahub.utils.toDp
@@ -218,7 +219,8 @@ internal fun ModelSelectorButton(
                         it, Modifier
                             .padding(end = 4.dp)
                             .size(36.dp),
-                        color = Color.Transparent
+                        color = Color.Transparent,
+                        providerSetting = model?.findProvider(state.providers)
                     )
                 }
                 Text(
@@ -249,7 +251,8 @@ internal fun ModelSelectorButton(
                 AutoAIIcon(
                     modifier = Modifier.size(36.dp),
                     name = model.modelId,
-                    color = Color.Transparent
+                    color = Color.Transparent,
+                    providerSetting = model.findProvider(state.providers)
                 )
             } else {
                 Icon(
@@ -288,6 +291,7 @@ internal fun ModelField(
                     name = model.modelId,
                     modifier = Modifier.size(24.dp),
                     color = Color.Transparent,
+                    providerSetting = model.findProvider(LocalSettings.current.providers)
                 )
             }
             Text(
@@ -825,7 +829,8 @@ private fun ModelItem(
                         name = model.modelId,
                         modifier = Modifier
                             .padding(4.dp)
-                            .size(32.dp)
+                            .size(32.dp),
+                        providerSetting = model.providerOverwrite ?: providerSetting
                     )
                 }
                 Column(

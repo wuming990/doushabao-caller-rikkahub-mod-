@@ -301,6 +301,22 @@ class ConversationRepository(
         }
     }
 
+    /**
+     * v324：只读会话元数据（含固定配置），**不加载消息节点**。
+     *
+     * 与 [getConversationById] 的差别只在开销：后者会 loadMessageNodes 把整份历史读进内存。
+     * 子代理装配联网工具只需要 assistantId 与 config 两个字段，用全量版本等于让每一次派发
+     * 都付出一趟与对话长度成正比的读取 —— 独立审查抓到的正是这条回归（长对话十几万上文时
+     * 尤其明显，而且编程位、审查位根本不需要联网判定也在白查）。
+     *
+     * ⚠️ 返回的 Conversation.messageNodes 恒为空。不要拿它去渲染、导出、统计或判断历史，
+     * 那些场景必须用 [getConversationById]。
+     */
+    suspend fun getConversationMetadataById(uuid: Uuid): Conversation? {
+        val entity = conversationDAO.getConversationById(uuid.toString()) ?: return null
+        return conversationEntityToConversation(entity, emptyList())
+    }
+
     suspend fun existsConversationById(uuid: Uuid): Boolean {
         return conversationDAO.existsById(uuid.toString())
     }

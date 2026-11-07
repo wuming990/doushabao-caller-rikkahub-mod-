@@ -9,8 +9,11 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ContainedLoadingIndicator
+import androidx.compose.material3.FilledTonalIconButton
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
@@ -29,13 +32,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Job
+import me.rerere.hugeicons.HugeIcons
+import me.rerere.hugeicons.stroke.Add01
+import me.rerere.hugeicons.stroke.Remove01
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.service.CompressionModelSource
-import me.rerere.rikkahub.ui.components.ui.OutlinedNumberInput
 import me.rerere.rikkahub.ui.components.ui.RabbitLoadingIndicator
-import me.rerere.ui.components.OutlinedNumberInput
 
 /**
  * 手动压缩对话框（v268 起双模式）。
@@ -43,8 +48,9 @@ import me.rerere.ui.components.OutlinedNumberInput
  * 智能压缩（默认）：照抄 Codex 的 compaction —— 摘要长度由模型自行决定，
  * 保留的历史由 Codex 的 20k token 用户消息预算决定。
  *
- * 经典压缩（官方旧版，用户要求加回）：自选目标 token 数（500/1000/2000/4000）
+ * 经典压缩（v268 历史描述）：自选目标 token 数（500/1000/2000/4000）
  * 与保留最近消息条数；超长对话分块并发压缩，摘要作为 user 消息保存。
+ * v1019：经典模式已对齐官方 3.1.1；以上经典流程/token 档位仅为历史说明，现保留最近消息并插入可恢复检查点摘要。
  * 上次选择的模式会被记住。
  */
 @Composable
@@ -55,16 +61,20 @@ fun CompressContextDialog(
     initialClassicMode: Boolean = false,
     onDismiss: () -> Unit,
     onConfirm: (additionalPrompt: String, modelSource: CompressionModelSource, customPrompt: String) -> Job,
-    onConfirmClassic: (additionalPrompt: String, targetTokens: Int, keepRecentMessages: Int) -> Job,
+    onConfirmClassic: (additionalPrompt: String, keepRecentMessages: Int) -> Job,
+    runningJob: Job? = null,
 ) {
     var additionalPrompt by remember { mutableStateOf("") }
     var customPrompt by remember { mutableStateOf(initialCustomPrompt) }
     var modelSource by remember { mutableStateOf(CompressionModelSource.FIXED) }
     // v268：双模式状态 + 经典模式的两个参数
     var classicMode by remember { mutableStateOf(initialClassicMode) }
-    var selectedTokens by remember { mutableIntStateOf(2000) }
-    var keepRecentMessages by remember { mutableIntStateOf(32) }
-    var currentJob by remember { mutableStateOf<Job?>(null) }
+    var keepRecentMessages by remember { mutableIntStateOf(0) }
+    var currentJob by remember { mutableStateOf<Job?>(runningJob) }
+    // v1024：重新打开时接回原对话正在压缩的任务，不重复发请求。
+    LaunchedEffect(runningJob) {
+        if (runningJob != null) currentJob = runningJob
+    }
     val isLoading = currentJob?.isActive == true
 
     // Monitor job completion
@@ -77,11 +87,8 @@ fun CompressContextDialog(
     }
 
     AlertDialog(
-        onDismissRequest = {
-            if (!isLoading) {
-                onDismiss()
-            }
-        },
+        // v1024：返回/点外部只隐藏，不取消应用级压缩。
+        onDismissRequest = onDismiss,
         title = {
             Text(stringResource(R.string.chat_page_compress_context_title))
         },
@@ -126,34 +133,42 @@ fun CompressContextDialog(
                     }
 
                     if (classicMode) {
-                        // 经典压缩（官方旧版）：目标 token 数 + 保留最近消息条数
-                        Text(
-                            text = stringResource(R.string.chat_page_compress_target_tokens),
-                            style = MaterialTheme.typography.labelMedium
-                        )
-                        SingleChoiceSegmentedButtonRow(
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            val tokenOptions = listOf(500, 1000, 2000, 4000)
-                            tokenOptions.forEachIndexed { index, tokens ->
-                                SegmentedButton(
-                                    selected = selectedTokens == tokens,
-                                    onClick = { selectedTokens = tokens },
-                                    shape = SegmentedButtonDefaults.itemShape(
-                                        index = index,
-                                        count = tokenOptions.size
-                                    )
+                        // v1019：经典压缩按官方当前方式保留最近消息
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    text = stringResource(R.string.chat_page_compress_keep_recent),
+                                    style = MaterialTheme.typography.titleSmall,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                FilledTonalIconButton(
+                                    onClick = { keepRecentMessages-- },
+                                    enabled = keepRecentMessages > 0,
                                 ) {
-                                    Text("$tokens")
+                                    Icon(HugeIcons.Remove01, contentDescription = "Decrease")
+                                }
+                                Text(
+                                    text = keepRecentMessages.toString(),
+                                    style = MaterialTheme.typography.titleMediumEmphasized,
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.widthIn(min = 40.dp),
+                                )
+                                FilledTonalIconButton(
+                                    onClick = { keepRecentMessages++ },
+                                    enabled = keepRecentMessages < Int.MAX_VALUE,
+                                ) {
+                                    Icon(HugeIcons.Add01, contentDescription = "Increase")
                                 }
                             }
+                            Text(
+                                text = stringResource(R.string.chat_page_compress_keep_recent_desc),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
                         }
-                        me.rerere.ui.components.OutlinedNumberInput(
-                            value = keepRecentMessages,
-                            onValueChange = { keepRecentMessages = it },
-                            label = stringResource(R.string.chat_page_compress_keep_recent),
-                            modifier = Modifier.fillMaxWidth(),
-                        )
                     } else {
                     Text(
                         text = stringResource(R.string.chat_page_compress_codex_note),
@@ -213,7 +228,10 @@ fun CompressContextDialog(
 
                     // Warning text
                     Text(
-                        text = stringResource(R.string.chat_page_compress_warning),
+                        text = stringResource(
+                            if (classicMode) R.string.chat_page_compress_checkpoint_hint
+                            else R.string.chat_page_compress_warning
+                        ),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error
                     )
@@ -231,7 +249,7 @@ fun CompressContextDialog(
             } else {
                 TextButton(onClick = {
                     currentJob = if (classicMode) {
-                        onConfirmClassic(additionalPrompt, selectedTokens, keepRecentMessages)
+                        onConfirmClassic(additionalPrompt, keepRecentMessages)
                     } else {
                         onConfirm(additionalPrompt, modelSource, customPrompt)
                     }
@@ -241,10 +259,8 @@ fun CompressContextDialog(
             }
         },
         dismissButton = {
-            if (!isLoading) {
-                TextButton(onClick = onDismiss) {
-                    Text(stringResource(R.string.cancel))
-                }
+            TextButton(onClick = onDismiss) {
+                Text(stringResource(if (isLoading) R.string.chat_page_compress_background else R.string.cancel))
             }
         }
     )

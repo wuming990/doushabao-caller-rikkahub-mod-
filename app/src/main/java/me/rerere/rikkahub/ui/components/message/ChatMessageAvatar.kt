@@ -16,6 +16,7 @@ import me.rerere.ai.provider.Model
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.isEmptyUIMessage
 import me.rerere.rikkahub.R
+import me.rerere.rikkahub.data.datastore.findProvider
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.Avatar
 import me.rerere.rikkahub.data.model.resolveUserDefaultAvatar
@@ -97,7 +98,8 @@ fun ChatMessageAssistantAvatar(
                     AutoAIIcon(
                         name = model.modelId,
                         modifier = Modifier.size(28.dp),
-                        loading = loading
+                        loading = loading,
+                        providerSetting = model.findProvider(settings.providers)
                     )
                 }
                 Row(

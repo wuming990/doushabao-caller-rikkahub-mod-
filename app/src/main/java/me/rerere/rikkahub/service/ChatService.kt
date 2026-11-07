@@ -52,6 +52,7 @@ import me.rerere.ai.ui.StreamChunk
 import me.rerere.ai.ui.ToolApprovalState
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
+import me.rerere.ai.ui.limitContext
 import me.rerere.ai.ui.canResumeToolExecution
 import me.rerere.ai.ui.finishPendingTools
 import me.rerere.ai.ui.finishReasoning
@@ -62,10 +63,11 @@ import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.ai.CodexCompaction
 import me.rerere.rikkahub.data.ai.GenerationChunk
 import me.rerere.rikkahub.data.ai.GenerationLoop
+import me.rerere.rikkahub.data.ai.ChatRequestFactory
 import me.rerere.rikkahub.data.ai.TranslationHandler
 import me.rerere.rikkahub.data.ai.mcp.McpManager
 import me.rerere.rikkahub.data.ai.prompts.DEFAULT_COMPRESS_PROMPT
-import me.rerere.rikkahub.data.ai.prompts.LEGACY_COMPRESS_PROMPT
+import me.rerere.rikkahub.data.ai.prompts.buildCompressPrompt
 import me.rerere.rikkahub.data.ai.prompts.RoundTableMaterial
 import me.rerere.rikkahub.data.ai.prompts.RoundTableProposal
 import me.rerere.rikkahub.data.ai.prompts.RoundTableRole
@@ -73,6 +75,8 @@ import me.rerere.rikkahub.data.ai.prompts.ROUND_TABLE_CONTINUE_INSTRUCTION
 import me.rerere.rikkahub.data.ai.prompts.buildRoundTableStageMessage
 import me.rerere.rikkahub.data.ai.prompts.buildCompactionPrompt
 import me.rerere.rikkahub.data.ai.prompts.buildRoundTableSummaryMessage
+import me.rerere.rikkahub.data.ai.prompts.withoutRoundTableToolParts
+import me.rerere.rikkahub.data.ai.prompts.ROUND_TABLE_PAGE_META_ROLE
 import me.rerere.rikkahub.data.ai.scopedCustomBodies
 import me.rerere.rikkahub.data.ai.stripResumeDuplication
 import me.rerere.rikkahub.data.ai.tools.createConversationTools
@@ -84,6 +88,7 @@ import me.rerere.rikkahub.data.ai.tools.createSearchToolsForGeneration
 import me.rerere.rikkahub.data.ai.tools.createSkillTools
 import me.rerere.rikkahub.data.ai.tools.createRoundTableReadOnlyWorkspaceTools
 import me.rerere.rikkahub.agent.model.AgentReport
+import me.rerere.rikkahub.agent.model.buildAgentModelCatalog
 import me.rerere.rikkahub.agent.tools.createAgentControlTools
 import me.rerere.rikkahub.data.ai.tools.createWorkspaceTools
 import me.rerere.rikkahub.data.skills.SkillManager
@@ -226,19 +231,23 @@ internal fun resolveAutoCompressTriggerTokens(
  * 服务商返回的真实 token 用量: 取最近一条带用量的消息的 prompt + completion。
  * 没有任何真实用量时返回 null。
  */
-internal fun reportedConversationTokens(conversation: Conversation): Long? =
-    conversation.currentMessages.asReversed()
-        .firstNotNullOfOrNull { message ->
-            message.usage?.let { usage ->
-                val total = usage.promptTokens + usage.completionTokens
-                if (total > 0) total.toLong() else null
-            }
+internal fun reportedConversationTokens(conversation: Conversation): Long? {
+    // v1019：官方经典检查点前的用量已失效；保留尾部也可能带着压缩前的旧用量。
+    // 无检查点时完全保留旧行为，不改变智能压缩的计数口径。
+    val messages = conversation.currentMessages.limitContext(0)
+    val checkpoint = messages.firstOrNull()?.takeIf { it.isContextCheckpoint }
+    return messages.asReversed().firstNotNullOfOrNull { message ->
+        if (checkpoint != null && isPreCheckpointUsage(message, checkpoint)) return@firstNotNullOfOrNull null
+        message.usage?.let { usage ->
+            val total = usage.promptTokens + usage.completionTokens
+            if (total > 0) total.toLong() else null
         }
-        ?.takeIf { it > 0L }
+    }?.takeIf { it > 0L }
+}
 
 /** 本地估算 token: 按 Codex 的 approx_token_count，UTF-8 字节数 / 4 (向上取整)。 */
 internal fun approxConversationTokens(conversation: Conversation): Long =
-    conversation.currentMessages.sumOf {
+    conversation.currentMessages.limitContext(0).sumOf {
         CodexCompaction.approxTokenCount(it.summaryAsText(maxLength = Int.MAX_VALUE)).toLong()
     }
 
@@ -387,6 +396,8 @@ class ChatService(
     private val templateTransformer: TemplateTransformer,
     private val providerManager: ProviderManager,
     private val chatToolFactory: ChatToolFactory,
+    // v1019：仅经典压缩复用官方请求工厂，智能/自动压缩和主对话不换路。
+    private val requestFactory: ChatRequestFactory,
     // v2.5.0 合并保留：官方把它们收进 ChatToolFactory 了，但圆桌与子代理的
     // 工具组装（localTools.getTools / skillManager.listSkills）仍在使用这两个依赖。
     private val localTools: LocalTools,
@@ -465,6 +476,71 @@ class ChatService(
 
     fun clearAllErrors() {
         _errors.value = emptyList()
+    }
+
+    // v1024：手动压缩脱离页面生命周期；只管理这两条手动入口，不改主对话或自动压缩。
+    private val manualCompressionTasks = ManualCompressionTaskRegistry(appScope)
+
+    fun getManualCompressionJobFlow(conversationId: Uuid): Flow<Job?> =
+        manualCompressionTasks.jobs.map { it[conversationId.toString()] }
+
+    fun startManualCompression(
+        conversationId: Uuid,
+        additionalPrompt: String,
+        modelSource: CompressionModelSource,
+        customPrompt: String,
+    ): Job = manualCompressionTasks.launch(conversationId.toString()) {
+        sessionManager.withSession(conversationId) {
+            try {
+                // v1024：请求只使用本任务捕获的提示词/设置，全局写回只记下次默认值。
+                val taskPrompt = customPrompt.trim().ifBlank { DEFAULT_COMPRESS_PROMPT }
+                val taskSettings = settingsStore.awaitLoaded()
+                settingsStore.update { current ->
+                    current.copy(
+                        compressPrompt = taskPrompt,
+                        compressUseClassicMode = false,
+                    )
+                }
+                val session = getOrCreateSession(conversationId)
+                session.initialize(load = { conversationRepo.getConversationById(conversationId) })
+                val source = session.state.value
+                compressConversation(conversationId, source, additionalPrompt, modelSource,
+                    expectedManualSource = source,
+                    expectedManualIncarnation = session.incarnation,
+                    manualPromptOverride = taskPrompt,
+                    manualSettingsOverride = taskSettings).getOrThrow()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                addError(e, conversationId = conversationId,
+                    title = context.getString(R.string.error_title_compress_conversation))
+            }
+        }
+    }
+
+    suspend fun cancelManualCompression(conversationId: Uuid) {
+        manualCompressionTasks.cancel(conversationId.toString())?.join()
+    }
+
+    fun startManualClassicCompression(
+        conversationId: Uuid,
+        additionalPrompt: String,
+        keepRecentMessages: Int,
+    ): Job = manualCompressionTasks.launch(conversationId.toString()) {
+        sessionManager.withSession(conversationId) {
+            try {
+                // v1024：经典模式同样固定本任务设置；后续切对话不改变已发起任务的模型上下文。
+                val taskSettings = settingsStore.awaitLoaded()
+                settingsStore.update { it.copy(compressUseClassicMode = true) }
+                compressConversationClassic(conversationId, additionalPrompt, keepRecentMessages,
+                    manualSettingsOverride = taskSettings).getOrThrow()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                addError(e, conversationId = conversationId,
+                    title = context.getString(R.string.error_title_compress_conversation))
+            }
+        }
     }
 
     // 生成完成流
@@ -1097,24 +1173,28 @@ class ChatService(
         select: Boolean,
         persist: Boolean,
     ) = ctx.writeMutex.withLock {
-        ctx.slots[message.id] = slot
+        // v1029：给圆桌页打上来源标记。对话里仍然保留搜索、工具与思考记录（用户能回看），
+        // 只有「讨论只保留发言正文」打开时，拼下一次请求才会剥掉它们。
+        // 不在这里裁剪数据 —— 与讨论群组同一口径：只影响请求，不删记录。
+        val stored = message.copy(fromRoundTable = true)
+        ctx.slots[stored.id] = slot
         val conversation = getConversationFlow(ctx.conversationId).value
         val nodes = conversation.messageNodes.toMutableList()
         val nodeIndex = nodes.indexOfFirst { it.id == ctx.nodeId }
         if (nodeIndex < 0) {
-            nodes.add(MessageNode(id = ctx.nodeId, messages = listOf(message), selectIndex = 0))
+            nodes.add(MessageNode(id = ctx.nodeId, messages = listOf(stored), selectIndex = 0))
         } else {
             val node = nodes[nodeIndex]
             val keepSelectedId = node.messages.getOrNull(node.selectIndex)?.id
-            val existingIndex = node.messages.indexOfFirst { it.id == message.id }
+            val existingIndex = node.messages.indexOfFirst { it.id == stored.id }
             val merged = if (existingIndex >= 0) {
-                node.messages.toMutableList().also { it[existingIndex] = message }
+                node.messages.toMutableList().also { it[existingIndex] = stored }
             } else {
-                node.messages + message
+                node.messages + stored
             }
             val sorted = merged.sortedBy { ctx.slots[it.id] ?: Int.MAX_VALUE }
             // select=false 时保持用户当前正在看的那一页，不把焦点抢走
-            val targetId = if (select) message.id else keepSelectedId
+            val targetId = if (select) stored.id else keepSelectedId
             val newSelectIndex = sorted.indexOfFirst { it.id == targetId }.let { if (it >= 0) it else 0 }
             nodes[nodeIndex] = node.copy(messages = sorted, selectIndex = newSelectIndex)
         }
@@ -1413,7 +1493,7 @@ class ChatService(
     // ---- v213：圆桌座位运行时（每个位置都能单独停止、换模型、重试、跳过）----
 
     /** 一页圆桌产物的座位标记，写进 Text part 的 metadata；不会发给模型，只用于本地识别 */
-    private val ROUND_TABLE_META_ROLE = "rt_role"
+    private val ROUND_TABLE_META_ROLE = ROUND_TABLE_PAGE_META_ROLE
     private val ROUND_TABLE_META_SEAT = "rt_seat"
     private val ROUND_TABLE_META_ATTEMPT = "rt_attempt"
     private val ROUND_TABLE_META_USABLE = "rt_usable"
@@ -2546,7 +2626,13 @@ class ChatService(
                     settings = settings,
                     assistant = roleAssistant,
                     conversation = conversation,
-                    baseMessages = conversation.currentMessages,
+                    baseMessages = conversation.currentMessages.let { messages ->
+                        if (roundTable.keepOnlySpeechBody) {
+                            messages.withoutRoundTableToolParts()
+                        } else {
+                            messages
+                        }
+                    },
                     tools = buildRoundTableTools(settings, roleAssistant, conversation, allowReadOnly),
                     mainModel = mainModel,
                     writeMutex = Mutex(),
@@ -2873,7 +2959,13 @@ class ChatService(
                     settings = settings,
                     assistant = roleAssistant,
                     conversation = conversation,
-                    baseMessages = conversation.messageNodes.take(nodeIndex).map { it.currentMessage },
+                    baseMessages = conversation.messageNodes.take(nodeIndex).map { it.currentMessage }.let { messages ->
+                        if (roundTable.keepOnlySpeechBody) {
+                            messages.withoutRoundTableToolParts()
+                        } else {
+                            messages
+                        }
+                    },
                     tools = buildRoundTableTools(settings, roleAssistant, conversation, allowReadOnly),
                     mainModel = mainModel,
                     writeMutex = Mutex(),
@@ -3717,6 +3809,8 @@ class ChatService(
      * 用户没有要求本轮改，且删设置属于不可逆动作（见手册 §9 第 2 条）。
      */
     suspend fun releaseGroupStateOnDelete(conversationId: Uuid) {
+        // v1024：其余删除入口复用此清理钩子时也必须取消原对话压缩。
+        cancelManualCompression(conversationId)
         stopGroupDiscussion(conversationId)
         clearGroupRunState(conversationId)
     }
@@ -3918,6 +4012,9 @@ class ChatService(
                 // 一起剥掉再发请求。关掉时传 false = 与 v320 逐字节一致。
                 // 只改这次发出去的请求；库里的记录一个字都不动（用户仍可回看）。
                 stripGroupReasoningParts = settings.groupChatCleanContext,
+                // v1029：圆桌「讨论只保留发言正文」——只裁请求视图，对话记录不删。
+                // 与群聊同一套隔离规矩：默认关，主对话显式传用户设置。
+                stripRoundTableToolParts = settings.roundTableSetting.keepOnlySpeechBody,
                 memories = memoryRepository.getFiles(
                     if (assistant.useGlobalMemory) MemoryRepository.GLOBAL_MEMORY_ID
                     else assistant.id.toString()
@@ -3951,6 +4048,9 @@ class ChatService(
                                 manager = agentThreadManager,
                                 // v220 修复：透传助手绑定的工作区，子代理才拿得到只读文件工具
                                 workspaceId = assistant.workspaceId?.toString(),
+                                // v1029：把「默认 + 备用 1~3」交给主模型；它用 model_ref 点名，
+                                // 不需要知道 UUID，也不会再出现「看不到模型名」。
+                                agentModelCatalog = buildAgentModelCatalog(settings),
                                 // v239：主对话原文只有主会话这一侧拿得到，在这里组装好交给工具层。
                                 // 主模型可以选择带不带（spawn_agent 的 include_full_context），
                                 // 但「想给却给不了」这种情况从此不存在。
@@ -4315,8 +4415,13 @@ class ChatService(
         conversation: Conversation,
         additionalPrompt: String = "",
         modelSource: CompressionModelSource = CompressionModelSource.FIXED,
+        // v1024：仅手动后台压缩传入；自动压缩原算法和写回路线保持原样。
+        expectedManualSource: Conversation? = null,
+        expectedManualIncarnation: Int? = null,
+        manualPromptOverride: String? = null,
+        manualSettingsOverride: Settings? = null,
     ): Result<Unit> = runCatching {
-        val settings = settingsStore.settingsFlow.first()
+        val settings = manualSettingsOverride ?: settingsStore.settingsFlow.first()
         val assistant = settings.getAssistantById(conversation.assistantId)
             ?: settings.getCurrentAssistant()
         val model = when (modelSource) {
@@ -4332,13 +4437,13 @@ class ChatService(
             ?: throw IllegalStateException(context.getString(R.string.chat_page_compress_no_provider))
         val providerHandler = providerManager.getProviderByType(provider)
 
-        val history = conversation.currentMessages.filter { it.isValidToUpload() }
+        val history = smartCompressionHistory(conversation)
         if (history.isEmpty()) {
             throw IllegalStateException(context.getString(R.string.chat_page_compress_not_enough_messages))
         }
 
         val compactionPrompt = buildCompactionPrompt(
-            basePrompt = settings.compressPrompt.ifBlank { DEFAULT_COMPRESS_PROMPT },
+            basePrompt = (manualPromptOverride ?: settings.compressPrompt).ifBlank { DEFAULT_COMPRESS_PROMPT },
             additionalPrompt = additionalPrompt,
         )
 
@@ -4369,6 +4474,10 @@ class ChatService(
                     // 2.4.8 起流式事件改为 StreamChunk 密封类；摘要只关心正文增量。
                     if (chunk is StreamChunk.TextDelta) {
                         textBuilder.append(chunk.text)
+                    } else if (chunk is StreamChunk.TextSnapshot) {
+                        // v1020：只兼容网页版全文快照；压缩算法/提示词/模型来源不变。
+                        textBuilder.setLength(0)
+                        textBuilder.append(chunk.text)
                     }
                 }
             } catch (e: CancellationException) {
@@ -4398,14 +4507,26 @@ class ChatService(
             )
             add(UIMessage.user(CodexCompaction.withSummaryPrefix(summaryText)).toMessageNode())
         }
-        val latest = conversationRepo.getConversationById(conversationId) ?: conversation
-        saveConversation(
-            conversationId,
-            latest.copy(
-                messageNodes = newMessageNodes,
-                chatSuggestions = emptyList(),
-            ),
-        )
+        if (expectedManualSource != null) {
+            // v1024：只保护手动后台提交；摘要期间有新发言/编辑则不拿旧摘要覆盖。
+            val session = getOrCreateSession(conversationId)
+            commitManualSmartCompression(
+                session = session,
+                source = expectedManualSource,
+                newNodes = newMessageNodes,
+                expectedIncarnation = expectedManualIncarnation ?: session.incarnation,
+                sourceStillExists = { conversationRepo.existsConversationById(conversationId) },
+            )
+        } else {
+            val latest = conversationRepo.getConversationById(conversationId) ?: conversation
+            saveConversation(
+                conversationId,
+                latest.copy(
+                    messageNodes = newMessageNodes,
+                    chatSuggestions = emptyList(),
+                ),
+            )
+        }
     }
 
     /**
@@ -4446,88 +4567,47 @@ class ChatService(
      * 提示词用 [LEGACY_COMPRESS_PROMPT]（官方原文带占位符），**故意不读**
      * settings.compressPrompt —— 设置里存的是 Codex 提示词（v219 起迁移），混用会产生乱码。
      */
+    // v1019：上方 v268 注释记录旧实现；现在经典模式独立对齐官方3.1.1的检查点流程，
+    // 不再拼接2000字符短文、不再替换原历史，也不读取智能压缩的自定义提示词。
     suspend fun compressConversationClassic(
         conversationId: Uuid,
-        conversation: Conversation,
         additionalPrompt: String,
-        targetTokens: Int,
-        keepRecentMessages: Int = 32,
-    ): Result<Unit> = runCatching {
-        val settings = settingsStore.settingsFlow.first()
-        val model = settings.findModelById(settings.compressModelId)
-            ?: settings.getCurrentChatModel()
-            ?: throw IllegalStateException("No model available for compression")
-        val provider = model.findProvider(settings.providers)
-            ?: throw IllegalStateException("Provider not found")
-
-        val providerHandler = providerManager.getProviderByType(provider)
-
-        val maxMessagesPerChunk = 256
-        val allMessages = conversation.currentMessages
-
-        // Split messages into those to compress and those to keep
-        val messagesToCompress: List<UIMessage>
-        val messagesToKeep: List<UIMessage>
-
-        if (keepRecentMessages > 0 && allMessages.size > keepRecentMessages) {
-            messagesToCompress = allMessages.dropLast(keepRecentMessages)
-            messagesToKeep = allMessages.takeLast(keepRecentMessages)
-        } else if (keepRecentMessages > 0) {
-            // Not enough messages to compress while keeping recent ones
-            throw IllegalStateException(context.getString(R.string.chat_page_compress_not_enough_messages))
-        } else {
-            messagesToCompress = allMessages
-            messagesToKeep = emptyList()
-        }
-
-        fun splitMessages(messages: List<UIMessage>): List<List<UIMessage>> {
-            if (messages.size <= maxMessagesPerChunk) return listOf(messages)
-            val mid = messages.size / 2
-            val left = splitMessages(messages.subList(0, mid))
-            val right = splitMessages(messages.subList(mid, messages.size))
-            return left + right
-        }
-
-        suspend fun compressMessages(messages: List<UIMessage>): String {
-            val contentToCompress = messages.joinToString("\n\n") { it.summaryAsText(maxLength = 2000) }
-            val prompt = LEGACY_COMPRESS_PROMPT.applyPlaceholders(
-                "content" to contentToCompress,
-                "target_tokens" to targetTokens.toString(),
-                "additional_context" to if (additionalPrompt.isNotBlank()) {
-                    "Additional instructions from user: $additionalPrompt"
-                } else "",
-                "locale" to Locale.getDefault().displayName
+        keepRecentMessages: Int = 0,
+        // v1024：仅手动后台入口捕获；其他调用默认null，经典算法与提示词不变。
+        manualSettingsOverride: Settings? = null,
+    ): Result<Unit> = try {
+        sessionManager.withSession(conversationId) { session ->
+            session.initialize(
+                load = { conversationRepo.getConversationById(conversationId) },
+                create = { session.state.value },
             )
-
-            val result = providerHandler.generateText(
-                providerSetting = provider,
-                messages = listOf(UIMessage.user(prompt)),
-                params = backgroundTextGenerationParams(model, conversationId),
-            )
-
-            return result.message.toText().trim().takeIf { it.isNotBlank() }
-                ?: throw IllegalStateException("Failed to generate compressed summary")
-        }
-
-        val compressedSummaries = coroutineScope {
-            splitMessages(messagesToCompress)
-                .map { chunk -> async { compressMessages(chunk) } }
-                .awaitAll()
-        }
-
-        // Create new conversation with compressed history as multiple user messages + kept messages
-        val newMessageNodes = buildList {
-            compressedSummaries.forEach { summary ->
-                add(UIMessage.user(summary).toMessageNode())
+            session.compressClassicHistory(keepRecentMessages) { conversation, messages ->
+                val turn = requestFactory.createContext(manualSettingsOverride ?: settingsStore.awaitLoaded(), conversation)
+                requestFactory.generateCompressionSummary(
+                    turn = turn,
+                    messages = messages,
+                    compressPrompt = buildCompressPrompt(
+                        additionalPrompt = additionalPrompt,
+                        locale = Locale.getDefault().displayName,
+                    ),
+                )
             }
-            addAll(messagesToKeep.map { it.toMessageNode() })
         }
-        val newConversation = conversation.copy(
-            messageNodes = newMessageNodes,
-            chatSuggestions = emptyList(),
-        )
-
-        saveConversation(conversationId, newConversation)
+        Result.success(Unit)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: ClassicCompressionException) {
+        val resource = when (e.issue) {
+            ClassicCompressionIssue.GENERATING -> R.string.chat_page_compress_blocked_generating
+            ClassicCompressionIssue.NOTHING_TO_COMPRESS -> R.string.chat_page_compress_nothing_to_compress
+            ClassicCompressionIssue.NOT_ENOUGH_MESSAGES -> R.string.chat_page_compress_not_enough_messages
+            ClassicCompressionIssue.PENDING_TOOLS -> R.string.chat_page_compress_handle_pending_tools
+            ClassicCompressionIssue.EMPTY_SUMMARY -> R.string.chat_page_compress_empty_summary
+            ClassicCompressionIssue.CONVERSATION_CHANGED -> R.string.chat_page_compress_conversation_changed
+        }
+        Result.failure(IllegalStateException(context.getString(resource), e))
+    } catch (e: Exception) {
+        Result.failure(e)
     }
 
     suspend fun autoCompressForkConversation(
@@ -4830,24 +4910,8 @@ class ChatService(
         val assistant = settings.getAssistantById(currentConversation.assistantId)
             ?: settings.getCurrentAssistant()
         val processedParts = preprocessUserInputParts(parts, assistant)
-        var edited = false
-
-        val updatedNodes = currentConversation.messageNodes.map { node ->
-            if (!node.messages.any { it.id == messageId }) {
-                return@map node
-            }
-            edited = true
-
-            node.copy(
-                messages = node.messages + UIMessage(
-                    role = node.role,
-                    parts = processedParts,
-                ),
-                selectIndex = node.messages.size
-            )
-        }
-
-        if (!edited) return
+        // v1019：节点写法搬进 editMessageNodes（行为不变），摘要消息在下面这条判据里原地改写。
+        val updatedNodes = editMessageNodes(currentConversation.messageNodes, messageId, processedParts) ?: return
 
         saveConversation(conversationId, currentConversation.copy(messageNodes = updatedNodes))
     }
@@ -5197,6 +5261,8 @@ class ChatService(
     }
 
     suspend fun deleteConversation(conversationId: Uuid) {
+        // v1024：所有公开删除入口在删库前先取消并等待对应手动压缩。
+        cancelManualCompression(conversationId)
         conversationRepo.getConversationById(conversationId)?.let { conversationRepo.deleteConversation(it) }
     }
 
@@ -5206,6 +5272,8 @@ class ChatService(
 
     suspend fun deleteConversationsOfAssistant(assistantId: Uuid) {
         conversationRepo.getConversationsOfAssistant(assistantId).first().forEach {
+            // v1024：按各自对话取消，不能误停其他助手或未删除的对话。
+            cancelManualCompression(it.id)
             conversationRepo.deleteConversation(it)
         }
     }

@@ -7,10 +7,12 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.jsonObject
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.core.Tool
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
+import me.rerere.rikkahub.agent.model.AGENT_EVENT_TYPE_MODEL_ACTIVE
 import me.rerere.rikkahub.agent.model.AGENT_EVENT_TYPE_RESUME_CHECKPOINT
 import me.rerere.rikkahub.agent.model.AgentEvent
 import me.rerere.rikkahub.agent.model.AgentFinishReason
@@ -18,16 +20,25 @@ import me.rerere.rikkahub.agent.model.AgentMessage
 import me.rerere.rikkahub.agent.model.AgentReport
 import me.rerere.rikkahub.agent.model.AgentRole
 import me.rerere.rikkahub.agent.model.AgentThread
+import me.rerere.rikkahub.agent.tools.withSmallAgentOutputLimit
 import me.rerere.rikkahub.agent.tools.createAgentReadOnlyTools
 import me.rerere.rikkahub.agent.tools.createAgentWritableTools
 import me.rerere.rikkahub.data.ai.GenerationChunk
 import me.rerere.rikkahub.data.ai.GenerationLoop
+import me.rerere.rikkahub.data.ai.mcp.McpManager
+import me.rerere.rikkahub.data.ai.mcp.McpServerConfig
+import me.rerere.rikkahub.data.ai.mcp.agentMcpToolRecords
+import me.rerere.rikkahub.data.ai.mcp.agentMcpStalenessNote
 import me.rerere.rikkahub.data.ai.tools.createConversationTools
 import me.rerere.rikkahub.data.ai.tools.createSearchTools
+import me.rerere.rikkahub.data.datastore.agentStepBudget
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.datastore.displayLabel
 import me.rerere.rikkahub.data.datastore.findModelById
+import me.rerere.rikkahub.data.datastore.getAssistantById
 import me.rerere.rikkahub.data.datastore.getCurrentAssistant
+import me.rerere.rikkahub.data.model.Conversation
+import me.rerere.rikkahub.data.model.getAssistantOf
 import me.rerere.rikkahub.data.repository.ConversationRepository
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
 import java.time.Instant
@@ -212,7 +223,9 @@ internal const val AGENT_IDLE_TIMEOUT_MAX_MILLIS = 10 * 60 * 1000L
  * 两条闸会同时到点，甚至兜底先到 —— 那就又变成「按总时长砍」，正是这次要改掉的东西。
  * 4 小时给到阈值上限的两倍，确保任何合法设置下都是静默判据先生效。
  */
-internal const val AGENT_ATTEMPT_HARD_DEADLINE_MILLIS = 4 * 60 * 60 * 1000L
+// v1024：历史4小时死线已撤，用户手填分钟不能再被隐藏的总时长砍掉。
+// 保留旧符号供既有诊断/测试读取；Long.MAX_VALUE是协程API的无期限哨兵。
+internal const val AGENT_ATTEMPT_HARD_DEADLINE_MILLIS = Long.MAX_VALUE
 
 /** v244：静默阈值的默认值（设置里填 0 或非法值时用它） */
 internal const val AGENT_IDLE_TIMEOUT_DEFAULT_MILLIS = 10 * 60 * 1000L
@@ -236,8 +249,8 @@ internal const val AGENT_IDLE_TIMEOUT_DEFAULT_MILLIS = 10 * 60 * 1000L
  */
 internal fun agentIdleTimeoutMillis(idleMinutes: Int): Long {
     if (idleMinutes <= 0) return AGENT_IDLE_TIMEOUT_DEFAULT_MILLIS
-    return (idleMinutes * 60_000L)
-        .coerceAtMost(AGENT_THREAD_TIMEOUT_MAX_MINUTES * 60_000L)
+    // v1024：正数逐分钟生效，0/非法仍按原默认10分钟。
+    return idleMinutes * 60_000L
 }
 
 /** v239：静默看门狗的检查间隔 */
@@ -272,9 +285,9 @@ internal fun agentToolWaitCeilingMillis(toolTimeoutMinutes: Int): Long {
     val minutes = if (toolTimeoutMinutes <= 0) {
         AGENT_TOOL_TIMEOUT_DEFAULT_MINUTES
     } else {
-        toolTimeoutMinutes.coerceAtMost(AGENT_TOOL_TIMEOUT_MAX_MINUTES)
+        toolTimeoutMinutes
     }
-    return (minutes * 60_000L).coerceAtMost(AGENT_ATTEMPT_HARD_DEADLINE_MILLIS)
+    return minutes * 60_000L
 }
 
 /**
@@ -295,8 +308,9 @@ internal fun shouldJudgeStuck(
     toolRunningForMillis: Long,
     toolWaitCeilingMillis: Long,
 ): Boolean {
+    // v1024：非流式不判模型静默，但工具自身超时仍必须生效。
+    if (toolInFlight) return toolWaitCeilingMillis > 0L && toolRunningForMillis >= toolWaitCeilingMillis
     if (idleTimeoutMillis <= 0L) return false
-    if (toolInFlight) return toolRunningForMillis >= toolWaitCeilingMillis
     return idleForMillis >= idleTimeoutMillis
 }
 
@@ -822,6 +836,9 @@ class GenerationAgentBackend(
     // v280：只用于「允许子代理检索历史对话」这一个开关打开时装配 conversation 工具；
     // 开关默认关，关着时这个依赖完全不被触碰。
     private val conversationRepository: ConversationRepository,
+    // v1027：只用于「允许子代理调用 MCP」这一个开关打开时装配 MCP 工具；
+    // 开关默认关，关着时这个依赖完全不被触碰 —— 与上面 conversationRepository 的处理一致。
+    private val mcpManager: McpManager,
 ) : AgentBackend {
 
     /**
@@ -880,9 +897,34 @@ class GenerationAgentBackend(
         // v254：续跑模式由检查点（断点完整原文）推导 —— 不再看 reportJson
         //（手动停止时报告未落库、reportJson 为空，不能作为判定依据）
         val resumeMode = if (resume) resolveAgentResumeMode(thread, checkpoint) else null
+        // v324：联网开关只算一次，工具装配与提示词共用同一个值（单一事实来源）。
+        //
+        // 为什么必须共用：提示词会被生成两次（进 messages 一次、进隔离助手副本一次），
+        // 而「给不给工具」在第三处。三处各自判断迟早分叉 —— 分叉的结果就是本轮用户看到的
+        // 「手里有工具却自称没工具」和「说能上网却上不了网」。
+        //
+        // v1027：联网与 MCP 都要求「按派活那个对话」取，所以合并成**一趟**查询，
+        // 结果同时喂给两边，不再各查各的。
+        //
+        // 但只在真的需要时才查：编程位/审查位拿不到联网工具，MCP 又默认关，
+        // 这两种情况下读会话纯属白花（v1026 审查专门抓过这条开销回归，别改回去）。
+        val needsConversation = thread.role == AgentRole.EXPLORER || settings.allowAgentMcp
+        val dispatchConversation = if (needsConversation) threadConversation(thread) else null
+        val webSearchEnabled = agentWebSearchEnabled(thread, settings, dispatchConversation)
+        val mcpCapability = agentMcpTools(thread, settings, dispatchConversation)
+        // v324：先装配，再把**实际装配到的工具名**交给说明书。
+        //
+        // 顺序很重要：装配在前、说明书在后，说明书照抄结果，就不可能凭空宣称一个没装配的工具。
+        // 第一版按布尔写说明书时，审查抓到「Brave 这类不提供抓取参数的服务根本不会装配
+        // scrape_web，却被无条件写进说明书」—— 照抄结果以后这类分叉结构上无法出现。
+        // MCP 同理：名字来自实际装配结果，被跳过的非法服务器不会出现在说明书里。
+        val tools: List<Tool> = buildAgentTools(thread, settings, webSearchEnabled, mcpCapability.tools)
+        val webSearchToolNames = tools.map { it.name }.filter { it == "search_web" || it == "scrape_web" }
         val messages = buildAgentInputMessages(
             thread, history, resume, resumeMode, checkpoint,
             memoryEnabled = settings.allowAgentConversationSearch,
+            webSearchToolNames = webSearchToolNames,
+            mcp = mcpCapability,
         )
         // v241：续跑时把「中断前已经写出来的部分」留住，最后要接在新内容前面。
         //
@@ -913,14 +955,13 @@ class GenerationAgentBackend(
         } else {
             ""
         }
-        val tools: List<Tool> = buildAgentTools(thread, settings)
 
         var lastFailure: Throwable? = null
         // v244：这个设置项的语义已改成「多久没有新内容算卡住」（用户明确要求：
         //「改成多久没进行新发言就判卡死而不是按照总运行时长」）。
         // 总运行时长只保留一条远得碰不到的硬兜底，专防死循环烧钱。
         val idleLimitMinutes =
-            settings.agentThreadTimeoutMinutes.coerceIn(0, AGENT_THREAD_TIMEOUT_MAX_MINUTES)
+            settings.agentThreadTimeoutMinutes.coerceAtLeast(0)
         // v245：助手是不是流式输出。
         //
         // 非流式时 GenerationLoop 走的是阻塞式 generateText，一整趟只在**结束的瞬间**
@@ -933,12 +974,24 @@ class GenerationAgentBackend(
         // （用户原话：「续跑次数没了直接换下个模型就行了，不用额外设置一个按键」）。
         // 该值为 0（不自动续跑）时至少保留首次尝试，否则整条模型链一个都不会跑。
         val modelAttempts = settings.agentAutoResumeMax
-            .coerceIn(0, 10)
             .coerceAtLeast(1)
         modelChain.forEachIndexed { index, model ->
             // v311：事件里一律用「模型名 · 供应商名」。两家供应商放同一个模型名是常见用法，
             // 只印模型名的话换人前后一个字都不差，用户无法判断到底换没换成（真机反馈）。
             val modelLabel = model.displayLabel(settings.providers)
+            // v1028：不管是第几个候选模型，一确定就报一次 ——
+            // 界面要的是「现在正在用谁」，不能等收尾才看到（用户原话：
+            // 「不要等到结束了再给我看目前所使用的模型」）。
+            // 走既有 onEvent 通道，与其它事件同一条时间线，事后也能追查这次到底换没换人。
+            // 注意：这里与下面的 MODEL_FALLBACK 是两件事 —— 那个只在 index>0 时发。
+            onEvent(
+                AgentEvent(
+                    threadId = thread.id,
+                    type = AGENT_EVENT_TYPE_MODEL_ACTIVE,
+                    detail = modelLabel,
+                    createdAt = Instant.now(),
+                )
+            )
             if (index > 0) {
                 onEvent(
                     AgentEvent(
@@ -1005,6 +1058,8 @@ class GenerationAgentBackend(
                             model = model,
                             messages = messages,
                             tools = tools,
+                            webSearchToolNames = webSearchToolNames,
+                            mcp = mcpCapability,
                             onMessage = watchedOnMessage,
                             onEvent = watchedOnEvent,
                             progress = progress,
@@ -1095,7 +1150,7 @@ class GenerationAgentBackend(
         block: suspend () -> T,
     ): T? = kotlinx.coroutines.coroutineScope {
         val work = async { block() }
-        val guard = if (idleTimeoutMillis > 0L) {
+        val guard = if (idleTimeoutMillis > 0L || toolWaitCeilingMillis > 0L) {
             launch {
                 while (true) {
                     kotlinx.coroutines.delay(AGENT_IDLE_CHECK_INTERVAL_MILLIS)
@@ -1162,6 +1217,10 @@ class GenerationAgentBackend(
         model: me.rerere.ai.provider.Model,
         messages: List<UIMessage>,
         tools: List<Tool>,
+        /** v324：本次实际装配到的联网工具名，由 run() 从 tools 里取；说明书照抄它，不再自行判断 */
+        webSearchToolNames: List<String> = emptyList(),
+        /** v1027：run() 算好的那份 MCP 能力，整条链只传这一个对象 */
+        mcp: AgentMcpCapability = AgentMcpCapability(),
         onMessage: suspend (AgentMessage) -> Unit,
         onEvent: suspend (AgentEvent) -> Unit,
         progress: AgentAttemptProgress,
@@ -1173,10 +1232,17 @@ class GenerationAgentBackend(
         resumeMode: AgentResumeMode? = null,
     ): AgentRunOutcome {
         // 独立助手副本：清空一切可能污染子代理上下文的字段
+        //
+        // v324：这里必须把 webSearchToolNames 一起传下去。这份副本里的 systemPrompt 与
+        // messages 里那条 system 是**同一段话生成两次**，两边用的值必须相同，否则说明书
+        // 会与手里实际的工具分叉（「有工具却自称没工具」就是这么来的）。
         val assistant = buildIsolatedAssistant(
             settings.getCurrentAssistant(),
             thread,
             memoryEnabled = settings.allowAgentConversationSearch,
+            webSearchToolNames = webSearchToolNames,
+            // v1027 复审后整条链只传一个对象，串参数/漏传这两类错误结构上不可能再发生
+            mcp = mcp,
         )
 
         var latestMessages: List<UIMessage> = emptyList()
@@ -1461,7 +1527,9 @@ class GenerationAgentBackend(
     private suspend fun buildAgentTools(
         thread: AgentThread,
         settings: me.rerere.rikkahub.data.datastore.Settings,
-    ): List<Tool> = buildList {
+        webSearchEnabled: Boolean,
+        mcpTools: List<Tool>,
+    ): List<Tool> = withSmallAgentOutputLimit(buildList {
         addAll(createAgentReadOnlyTools(
             thread.workspaceId,
             workspaceRepository,
@@ -1469,23 +1537,45 @@ class GenerationAgentBackend(
         ))
         // 写权限只看 thread.writablePaths（白名单），绝不由角色决定 —— 门禁测试按原文断言这一行
         addAll(createAgentWritableTools(thread.workspaceId, workspaceRepository, thread.writablePaths))
-        // v244：只有「探测位」（EXPLORER）能联网搜索，而且要用户在助手里开着联网搜索。
+        // v244：只有「探测位」（EXPLORER）能联网搜索，而且要用户开着联网搜索。
         //
         // 用户原话：「只给探测位开」。
         //
         // 为什么只给探测位：探测这一环的本职就是去搜集信息；编程位与审查位只该盯着
         // 代码与事实，给它们联网反而容易跑偏，还多烧额度。
         //
-        // 为什么还要看助手开关：那是用户的联网总闸。子代理生成时用的是独立助手副本
-        // （[buildIsolatedAssistant] 里把 enableWebSearch 一律置成 false，那份副本只负责
-        // 生成参数，不参与工具装配），所以这里必须回头看**用户真实助手**的开关。
+        // v324：联网开关改成按**派出这条子代理的那个对话**取，不再读 getCurrentAssistant()。
+        //
+        // 为什么要改（真机 bug，用户实测报告「探测位有时能联网有时不能」）：官方 3.1 起
+        // 联网开关变成了「每个对话各一份」（ConversationConfig.enableWebSearch，界面口径见
+        // ChatPage 里 `conversation.config?.enableWebSearch ?: assistant.enableWebSearch`），
+        // 而 ChatService.updateChatSearch 在会话已固定 config 时**只写 config 就直接 return**，
+        // 助手上那个 enableWebSearch 压根没被改动。这里读的偏偏是助手开关 ——
+        // 于是用户在对话里明明开了联网，子代理却读到一个从未被改过的 false，装不上搜索工具，
+        // 只能回一句「本子代理只能读取工作区文件」；反过来助手为 true 而会话为 false 时它又
+        // 能上网。同一款软件两种表现，就是用户看到的「有时能、有时不能」。
+        //
+        // 单一事实来源：这个布尔值由 run() 算一次后传进来，工具装配与提示词共用同一个值。
+        // 提示词此前会被生成两次（进 messages 一次、进隔离助手副本一次），两处各自判断迟早分叉。
+        //
+        // 为什么仍不直接读隔离助手副本：buildIsolatedAssistant 把 enableWebSearch 硬置 false
+        //（那份副本只负责生成参数，不参与工具装配），这条红线有测试钉着，不动它。
         //
         // 角色不是子代理自己能改的：它在派发那一刻由主模型指定并落库，子代理无从自我提权
         // —— 与写权限白名单同理，权限一律由派发方给定。
-        if (thread.role == AgentRole.EXPLORER &&
-            settings.getCurrentAssistant().enableWebSearch
-        ) {
+        if (thread.role == AgentRole.EXPLORER && webSearchEnabled) {
             addAll(createSearchTools(settings))
+        }
+        // v1027：MCP 工具。列表由 agentMcpTools() 按「开关 + 派活那个对话」算好后传进来，
+        // 这里只负责装配，不再自行判断开关 —— 判断点越少越不容易与说明书分叉。
+        //
+        // 与联网那条不同，这里**不按角色过滤**：用户明确要求一个开关管所有子代理角色
+        // （探测位/编程位/审查位/默认），风险由开关本身控制，而不是再叠一层角色白名单。
+        //
+        // 输出仍会经过 withSmallAgentOutputLimit 统一截断 —— MCP 返回的长内容同样受
+        // 用户设置的「工具返回上限」约束，不因为换了来源就绕过限制。
+        if (mcpTools.isNotEmpty()) {
+            addAll(mcpTools)
         }
         // v280：历史对话检索。默认关，只有用户在子代理设置里主动打开才装配。
         //
@@ -1507,7 +1597,7 @@ class GenerationAgentBackend(
                 )
             )
         }
-    }
+    }, settings.toolOutputCharLimit)
 
     /**
      * v281：历史检索该按**哪个助手**的会话来列。
@@ -1543,6 +1633,139 @@ class GenerationAgentBackend(
     }
 
     /**
+     * v324：查这条线程所属对话的**元数据**（不加载消息节点）；查不到返回 null，由调用方决定口径。
+     *
+     * 为什么不用 getConversationById：它会 loadMessageNodes 把整份历史读进内存，而这里只要
+     * assistantId 与 config 两个字段。独立审查抓到这条开销回归 —— 每次派发子代理都按对话长度
+     * 付一趟全量读取，长对话上尤其浪费，而且非探测位根本用不上这个判定。
+     *
+     * 不能用 runCatching 包整段 —— 它连 CancellationException 一起吞，用户点停止的信号
+     * 会被咽下去，协程接着往下跑。这条规矩见 [agentMemoryAssistantId] 的注释。
+     */
+    private suspend fun threadConversation(thread: AgentThread): Conversation? = try {
+        conversationRepository.getConversationMetadataById(Uuid.parse(thread.conversationId))
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        // conversationId 不是合法 Uuid、对话已被删、数据库读失败 —— 都只是「查不到」。
+        null
+    }
+
+    /**
+     * v324：联网搜索该按**哪个对话**的开关来给。
+     *
+     * 这与 [agentMemoryAssistantId] 是同一个坑的两半：那边 v281 已经改成按
+     * thread.conversationId 查所属对话，这边当时没跟着改，于是留下
+     * 「主对话能搜、探测位不能搜」的错位。口径统一为
+     * 「派活那一刻、那个对话的会话视角开关」，与界面上看到的一致。
+     *
+     * 非探测位直接返回 false：装配红线本来就禁止其他角色拿到搜索工具。
+     * conversation 由 run() 查好后传进来（v1027 合并成一趟查询），这里不再自行读库。
+     */
+    private fun agentWebSearchEnabled(
+        thread: AgentThread,
+        settings: me.rerere.rikkahub.data.datastore.Settings,
+        conversation: Conversation?,
+    ): Boolean {
+        if (thread.role != AgentRole.EXPLORER) return false
+        return agentWebSearchEnabledFrom(conversation, settings)
+    }
+
+    /**
+     * v1027：按开关与**派活那个对话**的会话视角，装配子代理可用的 MCP 工具。
+     *
+     * 三条规矩，缺一不可：
+     * 1. 开关关着 → 返回空列表，一个都不装，行为与 v1026 一字节不差。
+     *    这个开关默认就是关的：MCP 会真实调用外部服务，可能写文件、改外部数据、产生费用，
+     *    而且它**不受**子代理那层「不能执行命令/不能编译/不能删除」的约束，
+     *    属于必须由用户主动放开的权限，不能默认给。
+     * 2. 查不到派活对话 → 同样返回空（失败关闭）。与联网那条同理：
+     *    拿不准用户意图时一律不放权，绝不拿「此刻界面上选中的助手」凑数。
+     * 3. 能用哪些服务器仍由助手上的勾选决定 —— 这里只负责「要不要交给子代理」，
+     *    不新增、不放宽、不绕过助手上的 MCP 白名单。
+     *
+     * 与主对话那条路的两处差异（都是刻意的）：
+     * - 主对话遇到非法服务器名直接抛 InvalidMcpServerNamesException；子代理里抛会把整趟
+     *   任务炸掉而用户看不见原因，这里改成跳过该服务器、少装一个工具。
+     *   说明书是按实际装配结果写的，被跳过的工具不会出现在提示词里，
+     *   所以不会出现「说明书说有、手里没有」—— 那正是 v324 修掉的那类分叉。
+     * - 主对话把 MCP 工具混在 ChatToolFactory 里；这里单独装配，开关关掉时连 mcpManager
+     *   都不碰，保证默认路径零影响。
+     */
+    private fun agentMcpTools(
+        thread: AgentThread,
+        settings: me.rerere.rikkahub.data.datastore.Settings,
+        conversation: Conversation?,
+    ): AgentMcpCapability {
+        val assistant = agentMcpAssistantFor(settings, conversation) ?: return AgentMcpCapability()
+        // v1027 复审后：谁能挂、叫什么、什么被跳过，全部由纯函数 decideAgentMcpTools 决定；
+        // 这里只把留下来的东西造成 Tool 对象。判断点只有一处，装配与说明书共用同一份结果，
+        // 结构上不可能出现「说明书说有、手里没有」（v324 那类分叉）。
+        //
+        // 🔴 第七轮双审抓到的越权入口 4：这里原先喂的是 getAllAvailableTools，
+        // 那个方法已经把 tool.enable=false 的记录滤掉了 —— 于是「禁用+要求批准」那份配置
+        // 到不了决策函数，决策函数里「任一配置要求批准 → 整条身份不挂」看不到它，
+        // 「启用+不要求批准」那份就照常挂上执行。函数内部守得再严也没用，因为东西
+        // 在送过来之前就少了。现在改走子代理专用的纯枚举 agentMcpToolRecords：
+        // 它在**任何过滤之前**先按 serverId 判重（入口 5/6），并且不过滤工具级 enable
+        // （服务器启用与勾选这两道边界仍然保留）。
+        // 主对话那条 getAllAvailableTools 一字未动 —— 那边「禁用就不出现」才是对的。
+        // 枚举返回「记录 + 因重复 serverId 被整台放弃的台数」，两个都必须交给决策，
+        // 否则计数就变成只有注释在说的事。
+        //
+        // 🔴 第九轮审查抓到的**快照不一致**：原先这里调 mcpManager.getAllToolRecordsForAgent，
+        // 而那个方法自己读实时 store（settingsFlow.value），assistant 却来自 run()
+        // 开头那份 settings 快照 —— 服务器清单与勾选集合来自**不同时刻**。
+        // 期间用户改勾选的话，就会拿「旧勾选」去筛「新服务器表」，
+        // 已经撤销勾选的服务器可能仍然被挂上来。MCP 会真的动外部世界，不能这样。
+        // 现在两半都从同一个 settings 取，纯枚举不碰 store。
+        val records = agentMcpToolRecords(settings.mcpServers, assistant.mcpServers)
+        val decision = decideAgentMcpTools(records.entries, records.ambiguousServerCount)
+
+        // 🔴 入口 7（时序版）：装配只保证「那一刻」是安全的，执行发生在几分钟之后。
+        // 所以每次真正调用外部服务器之前，都用**当时最新**的设置重新问一遍：
+        // 这台服务器还在吗、还是唯一一份吗、还启用吗、还在勾选里吗、
+        // 这个工具还启用吗、有没有被改成需要用户批准。
+        // 任何一条不满足就**拒绝执行**，把原因作为工具结果交给模型 ——
+        // 复查本身不抛异常（`call` 自己失败仍上抛，由 GenerationLoop 既有 runCatching 兜住；
+        // 协程取消原样上抛），也绝不在情况已经变了的情况下动外部世界。
+        //
+        // 勾选维度只在「勾选来自助手」时检查；勾选来自这个对话自己的 config 时
+        // 不查库拿不到实时值，硬比会误拒正常配置，此时传 null 跳过该维度（已如实登记）。
+        val selectedFromAssistant = conversation?.config?.mcpServers == null
+        val mcpAssistantId = assistant.id
+        val tools = decision.kept.map { kept ->
+            buildAgentMcpTool(kept) { id, toolName, args ->
+                val live = settingsStore.settingsFlow.value
+                val liveSelected = if (selectedFromAssistant) {
+                    live.getAssistantById(mcpAssistantId)?.mcpServers ?: emptySet()
+                } else {
+                    null
+                }
+                // 第十轮补强：复查与执行之间不留缝。
+                // 抽成 runAgentMcpToolGuarded 的目的，是让「执行前情况变了 → 外部调用一次都没发生」
+                // 这件事有**行为断言**，而不是只有一行注释自称守住了。
+                runAgentMcpToolGuarded(
+                    servers = live.mcpServers,
+                    serverId = id,
+                    toolName = toolName,
+                    args = args,
+                    liveSelectedServerIds = liveSelected,
+                    // 第十一轮：总开关也必须复查 —— 用户运行中途关掉它，下一句就不许再外发。
+                    // 刻意取实时值（live 上的开关字段），而不是 run() 开头那份旧快照里的：
+                    // 那份是装配期的设置，用户可能已经改过。
+                    agentMcpAllowed = live.allowAgentMcp,
+                    call = { guardedId, guardedTool, guardedArgs ->
+                        mcpManager.callTool(guardedId, guardedTool, guardedArgs)
+                    },
+                )
+            }
+        }
+        return AgentMcpCapability(tools = tools, decision = decision)
+    }
+
+
+    /**
      * v236：步数上限按有没有写权限分开给。
      * v241：改成用户可调（设置里的「子代理单趟步数」），常量只作为默认值。
      *
@@ -1556,8 +1779,8 @@ class GenerationAgentBackend(
         thread: AgentThread,
         settings: me.rerere.rikkahub.data.datastore.Settings,
     ): Int {
-        val base = settings.agentMaxSteps.takeIf { it > 0 } ?: AGENT_MAX_STEPS_READONLY
-        return if (thread.canWrite) base * 3 / 2 else base
+        // v1024：0不限，正数按用户填写；写权限仍沿原1.5倍，但不能先溢出。
+        return agentStepBudget(settings.agentMaxSteps, thread.canWrite)
     }
 }
 
@@ -1777,8 +2000,12 @@ internal fun buildAgentInputMessages(
     resumeMode: AgentResumeMode? = null,
     checkpoint: String? = null,
     memoryEnabled: Boolean = false,
+    webSearchToolNames: List<String> = emptyList(),
+    mcp: AgentMcpCapability = AgentMcpCapability(),
 ): List<UIMessage> {
-    val system = UIMessage.system(buildAgentSystemPrompt(thread, memoryEnabled))
+    val system = UIMessage.system(
+        buildAgentSystemPrompt(thread, memoryEnabled, webSearchToolNames, mcp),
+    )
     if (!resume) {
         val followUps = history.filter { it.role == "user" }.map { UIMessage.user(it.content) }
         return buildList {
@@ -1841,13 +2068,503 @@ internal fun buildAgentInputMessages(
     }
 }
 
+/**
+ * v324：子代理联网工具的开关口径 —— 与主对话同源（纯函数，便于行为测试）。
+ *
+ * 走 `Settings.getAssistantOf(conversation)`：那是主对话一直在用的同一条读取路径
+ * （getStoredAssistantOf + withConversation），**不是**给子代理另起一套判断。
+ * 会话已固定 config 时它取 config 里的开关，没固定时才取助手自身的值 ——
+ * 与 ChatPage 上 `conversation.config?.enableWebSearch ?: assistant.enableWebSearch`
+ * 完全等价。
+ *
+ * 查不到对话时**失败关闭**（返回 false），不回退到当前助手。
+ *
+ * 为什么这里不能照搬 v281 那句「回退比直接不给工具好」：那条说的是查历史对话 ——
+ * 读的是用户自己的数据，不外发、不花钱，少给一次能力只是查不到。联网不一样，
+ * 它会把查询发出去、并按供应商规则消耗搜索额度。在「不知道派活那个对话开没开」的情况下
+ * 拿「此刻界面上恰好选中的助手」当依据，等于用**无关对话**的开关替用户决定要不要外发和花钱 ——
+ * 而那恰恰是本轮要消灭的错位本身（审查两路都抓到了这条）。所以口径拿不准时一律不给。
+ */
+internal fun agentWebSearchEnabledFrom(
+    conversation: Conversation?,
+    settings: me.rerere.rikkahub.data.datastore.Settings,
+): Boolean = conversation?.let { settings.getAssistantOf(it).enableWebSearch } ?: false
+
+/**
+ * v1027：子代理这次该按**哪个助手**去枚举 MCP 工具；返回 null 表示一个都不给。
+ *
+ * 三条给不出来的路，全部是刻意失败关闭：
+ * 1. 开关关着（默认就是关）—— 行为与 v1026 一字节不差；
+ * 2. 查不到派活那个对话，或那个对话所属的助手已被删除 —— MCP 会真实调用外部服务、
+ *    可能改外部数据或产生费用，拿不准用户意图时一律不放权。
+ *    🔴 这条与联网那一路**故意不同**：联网走 getAssistantOf 的当前助手回退（与主对话
+ *    同源，v324 定的口径），MCP 则在回退之前先查助手是否还存在，不存在就直接不给 ——
+ *    拿别的助手勾的服务器放权是越权，不是同源。
+ * 3. 助手上本来就没勾任何 MCP 服务器 —— 由返回的 mcpServers 为空自然体现，
+ *    枚举出来就是空列表。
+ *
+ * 走 Settings.getAssistantOf(conversation)：与主对话同一条读取路径（会话视角）。
+ * 会话固定过 config 时取 config 里的 mcpServers，没固定时才取助手自身的值 ——
+ * 这样「你在某个对话里勾了哪些 MCP」就是子代理看到的范围，不随界面切换漂移。
+ */
+internal fun agentMcpAssistantFor(
+    settings: me.rerere.rikkahub.data.datastore.Settings,
+    conversation: Conversation?,
+): me.rerere.rikkahub.data.model.Assistant? {
+    if (!settings.allowAgentMcp) return null
+    val conv = conversation ?: return null
+    // v1027 复审修正：getAssistantOf 内部是 getStoredAssistantOf，助手被删除时
+    // 会**退回此刻选中的助手**。对联网那一路这是「与主对话同源」，但对 MCP 不行 ——
+    // 那等于用另一个助手勾的服务器去调外部服务、还可能改外部数据或产生费用，
+    // 属于真实越权。这里先确认会话所属助手还在，不在就失败关闭。
+    if (settings.getAssistantById(conv.assistantId) == null) return null
+    return settings.getAssistantOf(conv)
+}
+
+/**
+ * 与主对话 ChatToolFactory 同一套字符集规则，避免两边对「合法服务器名」判断不一致。
+ *
+ * v1027 复审后从类成员改成顶层函数：纯决策函数也要用它，而规则只许存在一份
+ * （主对话那份在 ChatToolFactory，两边由 AgentMcpAccessTest 钉住字面一致）。
+ */
+internal fun isMcpServerNameUsable(name: String): Boolean =
+    name.isNotEmpty() && name.all { it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' }
+
+/**
+ * 工具名长度上限。
+ *
+ * 🔴 为什么必须有：全项目没有任何地方限制工具名长度，名字是原样发给供应商的
+ * （ChatCompletionsAPI 里 put("name", tool.name)）。OpenAI 与 Claude 的函数名上限都是 64，
+ * Gemini 是 63 且不接受连字符。「服务器名 + 工具名」由用户和外部服务器自己决定，
+ * 拼成 mcp__…__… 再加撞名区分码很容易越过上限 —— 一旦被上游判非法，
+ * **整个请求会被拒**（不只是这个工具用不上），用户看到的就是「莫名其妙发不出去」。
+ *
+ * 取 63 的依据（本轮已联网核实到原文，不再是「通行说法」）：
+ * - OpenAI：官方 SDK 规格原文 `Must be a-z, A-Z, 0-9, or contain underscores and
+ *   dashes, with a maximum length of 64`。
+ * - Claude：官方 API 400 报错原文 `^[a-zA-Z0-9_-]{1,64}$`。
+ * - Gemini：老版 protos 写 **63**；新版 SDK 文档写 128；但线上实际 400 报错是
+ *   `maximum length of 64`。三家取最小值 → 63。新版文档的 128 不可依赖。
+ *
+ * 字符集同样必须管：OpenAI/Claude 只接受 `[a-zA-Z0-9_-]`，Gemini 要求以字母或下划线开头。
+ * 而 MCP 服务器自己给的工具名可以带点号、空格甚至中文（公开案例里 `codesys.project.open`
+ * 这种就曾被 Claude 直接 400）。所以我们拼名字时一律先清洗成安全字符，
+ * 执行时仍用**原始** serverId + 工具名，模型看到的名字与真正调用的目标不是一回事。
+ *
+ * 为什么宁可「不挂并说清原因」：一个名字不合法或超长，上游拒的是**整个请求**，
+ * 爆炸半径是整条对话，不是某一个工具。
+ */
+internal const val MAX_MCP_TOOL_NAME_LENGTH = 63
+
+/**
+ * 挂给模型的 MCP 工具描述。
+ *
+ * 名字被清洗或被编号过的时候，必须把「实际调用的是哪台服务器的哪个原始工具名」
+ * 写进模型真正看得见的 description 里 —— 光存在 decision 对象里不算送到，
+ * 这一步原本只有我看代码确认，现在抽成纯函数由测试钉住。
+ */
+internal fun agentMcpToolDescription(kept: AgentMcpKeptTool): String =
+    if (kept.identityNote == null) {
+        kept.tool.description ?: ""
+    } else {
+        listOfNotNull(kept.tool.description?.takeIf { it.isNotBlank() }, kept.identityNote)
+            .joinToString(" ｜ ")
+    }
+
+/**
+ * 把一个决策保留项装配成模型真正看得见的 Tool 对象。
+ *
+ * 🔴 第八轮审查点名：这一层以前只有源码字面量断言，没有行为证据 ——
+ * 而「 displayName 可能被清洗或加过区分码，执行却必须打回原始目标」这条承诺
+ * 恰恰落在这里。抽成可注入 call 的窄函数之后，测试能真的调用这些闭包，逐项验：
+ *  - parameters 返回**代表记录**的 inputSchema
+ *  - needsApproval 如实传递，不许写死 false（写死等于替用户自动批准外部操作）
+ *  - execute 用**原始 serverId + 原始工具名**调用，绝不从 displayName 反推
+ *
+ * call 由调用方注入，所以本函数不碰 mcpManager，可被单测直接调用。
+ */
+internal fun buildAgentMcpTool(
+    kept: AgentMcpKeptTool,
+    call: suspend (serverId: Uuid, toolName: String, args: kotlinx.serialization.json.JsonObject) -> List<UIMessagePart>,
+): Tool = Tool(
+    name = kept.displayName,
+    description = agentMcpToolDescription(kept),
+    parameters = { kept.tool.inputSchema },
+    // 保留原表达式而不是写死 false：万一过滤条件以后被改动，
+    // 审批标志仍然如实传递，不会悄悄变成「全部自动批准」。
+    needsApproval = { kept.tool.needsApproval },
+    // 🔴 路由用决策里带的 serverId 与**原始**工具名，绝不从名字反推 ——
+    // 撞名加过区分码之后，名字已经不是原始 (服务器名, 工具名) 了。
+    execute = { call(kept.serverId, kept.tool.name, it.jsonObject) },
+)
+
+/**
+ * v1027 第十轮：**执行前**的最后一道门。
+ *
+ * ## 为什么非要有这一层
+ *
+ * 装配（[decideAgentMcpTools]）只证明「几分钟前那一刻」是安全的。执行发生在之后，
+ * 中间用户完全可能：停用服务器、取消勾选、删掉配置、再加一份同 id 的配置、
+ * 或者把某个工具改成「需要用户批准」。这些都是真实的界面操作，不是假想。
+ * MCP 会动外部世界（改文件、下单、发消息），所以「拿旧结论去执行新状态」不可接受。
+ *
+ * ## 为什么抽成独立函数
+ *
+ * 上一版把判断直接内联在装配 lambda 里，测试只能断言「源码里有这句话」——
+ * 而审查位明确指出：那**不是**行为证据。抽出来之后，测试可以注入一个会记账的
+ * `call`，然后证明「情况变了 → call 计数为 0」，以及「一切没变 → 恰好调用 1 次、
+ * 参数原样传出」。生产路径与测试走的是同一个函数，不是另写一份仿制品。
+ *
+ * ## 边界（照实写，不许再写成「全防」）
+ *
+ * - **复查本身不抛异常**：拒绝执行时把原因作为工具结果返回，让子代理写进报告，
+ *   而不是炸掉整趟任务。但 `call` 自己失败仍然会往上抛，由 GenerationLoop 既有的
+ *   runCatching 兜住（协程取消原样上抛，不在这里吞掉）。
+ * - 拒绝时**一个字节都不外发**：`call` 在拒绝分支里根本不会被调用。
+ * - 不改 `needsApproval` 语义：需要批准就是拒绝，绝不替用户自动放行。
+ * - 总开关（`allowAgentMcp`）也复查：用户运行中途撤权，下一句就不许再外发。
+ * - **已知残余**：勾选来自这个对话自己的 config 时（`liveSelectedServerIds == null`），
+ *   执行期不复查勾选维度 —— 拿库里的助手勾选去硬比会误拒正常配置。其余六项照查。
+ */
+internal suspend fun runAgentMcpToolGuarded(
+    servers: List<McpServerConfig>,
+    serverId: Uuid,
+    toolName: String,
+    args: kotlinx.serialization.json.JsonObject,
+    liveSelectedServerIds: Set<Uuid>?,
+    agentMcpAllowed: Boolean,
+    call: suspend (serverId: Uuid, toolName: String, args: kotlinx.serialization.json.JsonObject) -> List<UIMessagePart>,
+): List<UIMessagePart> {
+    // 🔴 第十一轮（双审独立抓到）：这里是「用户撤回授权」最直接的一条，
+    // 而上一版漏了 —— 用户把总开关关掉后，已经挂上的工具照样继续真实外发。
+    // 判在 agentMcpStalenessNote 之前：撤权优先于一切细则。
+    if (!agentMcpAllowed) {
+        return listOf(
+            UIMessagePart.Text(
+                "MCP 工具本次没有执行：子代理调用 MCP 的总开关在执行前被关掉了（用户在运行期间撤回了授权）。" +
+                    "请把这件事写进 uncertainties 交回主对话，不要重试。",
+            ),
+        )
+    }
+    val refusal = agentMcpStalenessNote(servers, serverId, toolName, liveSelectedServerIds)
+    if (refusal != null) return listOf(UIMessagePart.Text(refusal))
+    return call(serverId, toolName, args)
+}
+
+/**
+ * 名字分配最后的防御性自检：名单里万一仍有重复，**丢掉后来的并计数，绝不抛异常**。
+ *
+ * 抽成纯函数是为了能真的测到 —— 这段分支在 claimMcpToolName 正确时不可达，
+ * 若只写在主流程里，等于一段永远没有证据的代码。
+ */
+internal fun dropDuplicateMcpNames(planned: List<String?>): Pair<List<String?>, Int> {
+    val seen = mutableSetOf<String>()
+    var dropped = 0
+    val out = planned.map { name ->
+        when {
+            name == null -> null
+            seen.add(name) -> name
+            else -> { dropped += 1; null }
+        }
+    }
+    return out to dropped
+}
+
+/**
+ * 在**全局**已用名集合里给候选名占位：撞了就追加 `_2`、`_3`… 直到空闲。
+ *
+ * 为什么必须全局：上一版只在撞名组内编号，`get.file` + `get_file` + `get_file_2`
+ * 会产出两个相同名字，随后自检抛异常把整趟子代理炸掉。现在任何候选名都要
+ * 对着同一个集合占位，谁撞谁让，且**永不抛异常**。
+ */
+internal fun claimMcpToolName(candidate: String, used: MutableSet<String>): String {
+    if (used.add(candidate)) return candidate
+    var suffix = 2
+    while (true) {
+        val next = "${candidate}_$suffix"
+        if (used.add(next)) return next
+        suffix += 1
+    }
+}
+
+/**
+ * 把名字清洗成三家都接受的字符集（字母/数字/下划线）。
+ *
+ * 服务器名另有 stricter 规则（非法名直接不挂，与主对话一致）；这里管的是
+ * **工具名** —— 它完全由外部 MCP 服务器决定，`codesys.project.open`、
+ * `Get Data!` 这类都真实存在过，原样拼进名字会被 OpenAI/Claude 400，
+ * 而且拒的是整个请求。清洗只影响**给模型看的名字**，不影响执行目标
+ * （执行用 kept.serverId + kept.tool.name，见 agentMcpTools）。
+ */
+internal fun sanitizeMcpToolNamePart(value: String): String =
+    value.map { ch ->
+        if (ch in 'a'..'z' || ch in 'A'..'Z' || ch in '0'..'9' || ch == '_') ch else '_'
+    }.joinToString("")
+
+/** 撞名时依次尝试的服务器 id 前缀长度；都不够就退到完整 id。 */
+private val MCP_ID_PREFIX_WIDTHS = listOf(8, 12, 16, 20, 24, 28, 32)
+
+/** 一条真正要挂上子代理的 MCP 工具，以及它最终叫什么名字。 */
+internal data class AgentMcpKeptTool(
+    val serverId: Uuid,
+    val serverName: String,
+    val tool: me.rerere.rikkahub.data.ai.mcp.McpTool,
+    val displayName: String,
+    /**
+     * 身份说明。给模型看的名字可能被清洗或编号，这时必须另有一处写清
+     * 「实际调用的是哪台服务器的哪个工具」，否则两条名字相近的工具在模型眼里
+     * 无法区分，它就会凭猜测选错 —— 与「名字唯一」是两件事。
+     */
+    val identityNote: String? = null,
+)
+
+/**
+ * v1027：MCP 装配的**纯决策**（不碰 mcpManager、不造 Tool 对象，因此能被行为测试直接调用）。
+ *
+ * 复审指出：上一版把「非法名被跳过」「待批准被跳过」这两件事只写成源码字面量断言，
+ * 把真正的过滤删掉、只留下计数，测试照样全绿。改成纯函数后，测试直接喂工具列表拿结果。
+ */
+internal data class AgentMcpDecision(
+    val kept: List<AgentMcpKeptTool> = emptyList(),
+    /** 要求用户手动批准，但子代理没有批准入口，只能不挂 */
+    val needsApprovalCount: Int = 0,
+    /** 服务器名不合法（与主对话同一套字符集规则），只能不挂 */
+    val invalidNameCount: Int = 0,
+    /** 最终名字超过供应商长度上限，只能不挂 */
+    val nameOverflowCount: Int = 0,
+    /** 名字分配最后的防御性自检发现重复，丢掉后来的（正常不可达；单独计数以免与「超长」混淆） */
+    val conflictDroppedCount: Int = 0,
+    /**
+     * 🔴 越权入口 5：同一 serverId 在设置里出现多份配置时被**整台放弃的服务器数量**。
+     * 量纲是「台」，不是「个工具」，说明书必须分开讲 —— 混进工具数会虚报影响面。
+     * 这个数字来自枚举层（McpManager.agentMcpToolRecords），决策函数只是如实转记，
+     * 因为「同一台服务器有两份配置」这件事只有在拿到完整服务器清单时才看得见。
+     */
+    val ambiguousServerCount: Int = 0,
+)
+
+/**
+ * 决定这批 MCP 工具里哪些能挂给子代理、各自叫什么名字。四条规矩都有真实后果：
+ *
+ * 0. **任何过滤都不许排在身份归并之前**（🔴 第六轮双审独立点名，第七轮又查出第三个入口）。
+ *    第五轮修掉的是「先滤审批、后归并」；第六轮发现同一类病的第二个入口 ——
+ *    非法服务器名的过滤同样排在归并前面。于是同一 (serverId + 工具名) 身份若有两条
+ *    配置记录（一条服务器名非法且 `needsApproval=true`、另一条名字合法且 `false`；
+ *    重复 serverId 的配置在导入/恢复路径上并没有去重保证，McpManager 是逐行展开的），
+ *    非法那条先消失，归并时只剩 `false`，这个「要求用户批准」的工具照样挂上并
+ *    **以无审批状态执行** —— 又等于替用户放权。安全边界只能由本函数自己闭合，
+ *    不能赌配置数据里不会出现重复条目。
+ *    第七轮复查修复时查出第三个同类入口：`filter { tool.enable }` 也排在归并前，
+ *    于是「禁用+要求批准」那份配置被当成禁用扔掉后，「启用+不要求批准」那份照样挂上。
+ *    现在的写法是**先归并、再在身份内部按 a→b→c 逐条问**，归并之前一条记录都不扔。
+ *
+ * 1. **同一台服务器的同名工具只留一条**（按 serverId + 工具名去重）。
+ *    上一版给重复项加 `_2` 序号，名字确实两两不同了，可那个尾巴跟服务器身份毫无关系 ——
+ *    模型看到 mcp__orders__refund_2 完全不知道自己调的是哪一台。而这两条指向的是
+ *    **同一个** serverId + 同一个工具名，本来就是同一个工具，留一条即可，不必编号骗人。
+ *
+ * 2. **撞名（两台不同服务器同名同工具）时加服务器 id 区分码**，长度按冲突程度自动加长
+ *    （8→12→16→20→24→28→完整 id）。上一版写死前 8 位，而 UUID 前 8 位相同是真实存在的 ——
+ *    等于赌概率；测试还因为「序号兜底让名单仍然两两不同」而全绿，是个摆设。
+ *
+ * 3. **加上区分码会突破供应商名字长度上限时，整组不挂**，并如实计入 nameOverflowCount。
+ *    两个害处都不能要：发超长名字可能让整次请求被拒；偏向先出现的那条则会把调用
+ *    打到错误的服务器上（外部数据误操作）。宁可不给这个工具。
+ *
+ * 计数口径（第六轮统一、第七轮扩为五类）：五个计数里前四个以**逻辑工具身份**（serverId + 原始工具名）
+ * 为单位，而且每个身份只落在一种原因里，互斥不重复。原先审批与非法名按「配置记录数」计、
+ * 超长与冲突按「身份数」计 —— 同一份数据两种量纲，说明书里那句「N 个工具要求批准」
+ * 就会虚报；审查点名要求明确口径，这里定为身份数。
+ */
+internal fun decideAgentMcpTools(
+    entries: List<Triple<Uuid, String, me.rerere.rikkahub.data.ai.mcp.McpTool>>,
+    ambiguousServerCount: Int = 0,
+): AgentMcpDecision {
+    // 规矩 0（🔴 第六轮提出、第七轮贯彻到底）：**归并之前一条记录都不许滤**。
+    // 这个洞一共出现过三次，每次的症状都是「多了一个排在归并之前的过滤」：
+    //   · 第五轮：先滤掉 needsApproval=true 再归并 → 同身份「一条要批准、一条不要」时，
+    //     要批准那条消失，不要批准那条被挂上并以无审批状态执行，等于替用户放权。
+    //   · 第六轮：双审独立指出「非法服务器名」的过滤也排在归并前 → 同身份「非法名+要批准」
+    //     与「合法名+不要批准」并存时，同一个洞从新维度重新打开。
+    //   · 第七轮：复查上面的修复又发现第三个入口 —— `filter { tool.enable }` 同样在归并前。
+    //     同身份「禁用+要求批准」与「启用+不要求批准」并存时，要求批准那条被当成禁用滤走，
+    //     剩下那条照样挂上执行。已用行为模型推演确认确实越权，不是理论洁癖。
+    // 结论：只要归并前存在任何按记录维度的过滤，这个洞就能从新维度再开一次。
+    // 所以现在改成「先归并，再在每个身份内部逐条问」，一条记录都不先扔。
+    val byIdentity = entries.groupBy { (serverId, _, tool) -> serverId to tool.name }
+    val distinct = mutableListOf<Triple<Uuid, String, me.rerere.rikkahub.data.ai.mcp.McpTool>>()
+    var needsApprovalCount = 0
+    var invalidNameCount = 0
+    byIdentity.values.forEach { group ->
+        // a) 该身份的每一份配置都被用户禁用 → 不挂，但**不计入任何「用不了」的原因**：
+        //    那是用户自己的选择，说明书把它报成「N 个工具因为审批/非法名用不了」会误导。
+        val on = group.filter { (_, _, tool) -> tool.enable }
+        if (on.isEmpty()) return@forEach
+        // b) 审批取最严格，而且要问**这个身份的全部配置**（含被禁用的那一份）：
+        //    只问启用记录的话，「禁用+要求批准」那条一不算就等于替用户放权 —— 入口 3。
+        if (group.any { it.third.needsApproval }) {
+            needsApprovalCount += 1
+            return@forEach
+        }
+        // c) 代表必须取「已启用 + 服务器名合法」的那条。全组启用配置的名字都不可用时
+        //    整个身份不挂并计数。主对话碰到非法名是直接抛 InvalidMcpServerNamesException；
+        //    子代理里抛会把整趟任务炸掉而用户看不见原因，所以这里改成跳过 + 如实交代。
+        //    残余风险（不谎报成「没有后果」）：同一身份的多份配置若 description /
+        //    inputSchema 不一致，这里只能取代表那一份。能保证的是**执行路由不变** ——
+        //    仍按 serverId + 原始工具名调用，不会打到别的服务器上；
+        //    不能保证的是模型会照哪份 schema 生成参数：parameters 取的就是代表记录的
+        //    inputSchema，而参数是直接发给 MCP 服务端的（McpSessionRegistry 里没有
+        //    按 schema 再做校验）。所以「schema 取哪一份」在异常配置下是有实际影响的，
+        //    只是它属于重复配置这种本不该存在的数据，未额外扩大处理。
+        val rep = on.firstOrNull { (_, serverName, _) -> isMcpServerNameUsable(serverName) }
+        if (rep == null) {
+            invalidNameCount += 1
+            return@forEach
+        }
+        distinct.add(rep)
+    }
+
+    // 解构顺序：first = serverId、second = serverName、third = tool。写错顺序编译器不一定拦得住。
+    // 名字一律先清洗再拼装：外部服务器给的工具名可能带点号、空格、中文，原样发出去会被
+    // OpenAI/Claude 拒整个请求（公开案例 codesys.project.open 就被 400）。
+    // 清洗只改「给模型看的名字」，执行仍用 serverId + 原始工具名。
+    val natural = distinct.map { (_, serverName, tool) -> "mcp__${serverName}__${tool.name}" }
+    val base = distinct.map { (_, serverName, tool) ->
+        "mcp__${sanitizeMcpToolNamePart(serverName)}__${sanitizeMcpToolNamePart(tool.name)}"
+    }
+    val planned = arrayOfNulls<String>(distinct.size)
+    val notes = arrayOfNulls<String>(distinct.size)
+    // 🔴 第五轮审查抓到的真缺陷：上一版只在「本组内」编号，于是
+    // get.file / get_file / get_file_2 三件套会产出两个一模一样的中文名，
+    // 随后 check() 抛异常把整趟子代理炸掉。名字分配必须是**全局**的：
+    // 所有候选名都对着同一个 used 集合占位，谁撞谁让。
+    val used = mutableSetOf<String>()
+
+    // 第一轮：不撞名的先占到自己的本名 —— 它们本来就干净，不该被撞名组的编号挤掉
+    base.indices.groupBy { base[it] }.forEach { (_, indexes) ->
+        if (indexes.size == 1) {
+            val i = indexes[0]
+            used.add(base[i])
+            planned[i] = base[i]
+        }
+    }
+
+    // 第二轮：撞名组
+    base.indices.groupBy { base[it] }.forEach { (_, indexes) ->
+        if (indexes.size == 1) return@forEach
+        val ids = indexes.map { distinct[it].first.toString().replace("-", "") }
+        val width = MCP_ID_PREFIX_WIDTHS.firstOrNull { w ->
+            ids.map { it.take(w) }.distinct().size == ids.size
+        }
+        if (width != null) {
+            // 服务器 id 能区分：加 id 前缀（身份说明里用**实际采用的那一段**，
+            // 不能固定写前 8 位 —— 前 8 位相同的两台服务器会出现说明也相同的窘境）
+            indexes.forEachIndexed { position, i ->
+                val prefix = ids[position].take(width)
+                val candidate = "mcp__${sanitizeMcpToolNamePart(distinct[i].second)}_" +
+                    "${prefix}__${sanitizeMcpToolNamePart(distinct[i].third.name)}"
+                planned[i] = claimMcpToolName(candidate, used)
+                notes[i] = "实际调用服务器 ${distinct[i].second}（id $prefix）的工具 ${distinct[i].third.name}"
+            }
+        } else {
+            // 同一台服务器上不同工具名被清洗成了同一段：按出现顺序编号，
+            // 但候选名仍要过全局占位，绝不允许与别的真实工具名重合
+            indexes.forEachIndexed { position, i ->
+                val candidate = if (position == 0) base[i] else "${base[i]}_${position + 1}"
+                planned[i] = claimMcpToolName(candidate, used)
+                notes[i] = "实际调用服务器 ${distinct[i].second} 的工具 ${distinct[i].third.name}"
+            }
+        }
+    }
+
+    // 被清洗过、但没撞名的条目同样要让模型知道原始工具名，
+    // 否则它看到 project_open 完全不知道对应的是 project.open。
+    distinct.indices.forEach { i ->
+        val name = planned[i] ?: return@forEach
+        if (notes[i] == null && name != natural[i]) {
+            notes[i] = "实际调用服务器 ${distinct[i].second} 的工具 ${distinct[i].third.name}"
+        }
+    }
+
+    // 规矩 3（唯一的长度闸门）：不论撞不撞名，超上限的一律不挂并计数
+    var overflow = 0
+    planned.indices.forEach { i ->
+        val name = planned[i] ?: return@forEach
+        if (name.length > MAX_MCP_TOOL_NAME_LENGTH) {
+            planned[i] = null
+            overflow += 1
+        }
+    }
+
+    // 最后一道自证：claim 已保证两两不同，这里**绝不抛异常**再炸一次用户任务。
+    // 重复丢弃单独计数，不再混进「超长」——否则说明书会把原因说错（审查点名）。
+    val (finalPlanned, conflictDropped) = dropDuplicateMcpNames(planned.toList())
+    val kept = distinct.mapIndexedNotNull { i, entry ->
+        val name = finalPlanned[i] ?: return@mapIndexedNotNull null
+        AgentMcpKeptTool(entry.first, entry.second, entry.third, name, notes[i])
+    }
+    return AgentMcpDecision(
+        kept = kept,
+        needsApprovalCount = needsApprovalCount,
+        invalidNameCount = invalidNameCount,
+        nameOverflowCount = overflow,
+        conflictDroppedCount = conflictDropped,
+        ambiguousServerCount = ambiguousServerCount,
+    )
+}
+
+/**
+ * v1027：子代理本次实际拿到的 MCP 能力 —— 只装**实际装配结果 + 那份决策**。
+ *
+ * 上一版是三个散装参数（工具名列表 + 两个计数）手传四个函数、六个调用点：
+ * 红验证证明「只把计数从装配返回值里拿掉、说明书侧不动」测试照样全绿（计数是摆设），
+ * 而批量替换时也确实串过一次变量名。现在只有一个对象要传，
+ * 漏传与串参数这两类错误在结构上无法发生；五个计数全部由 decision 派生，
+ * 说明书不可能拿到与装配不一致的数字。
+ *
+ * - tools：真正挂上去的工具（已跳过需要用户批准的那些）
+ * - decision：那份完整决策，说明书需要的每个数字都从这里读，不许自己判断开关
+ *
+ * 被跳过的数量必须告诉模型，否则它会以为自己没有这项能力却不知道为什么，
+ * 或者反复尝试一个根本不会执行的调用。
+ */
+internal data class AgentMcpCapability(
+    val tools: List<Tool> = emptyList(),
+    val decision: AgentMcpDecision = AgentMcpDecision(),
+) {
+    /** 说明书宣称的数量只能来自这里 */
+    val toolNames: List<String> get() = tools.map { it.name }
+    val approvalSkippedCount: Int get() = decision.needsApprovalCount
+    val invalidNameSkippedCount: Int get() = decision.invalidNameCount
+    val nameOverflowCount: Int get() = decision.nameOverflowCount
+    val conflictDroppedCount: Int get() = decision.conflictDroppedCount
+    /** 第八轮入口 5：被整台放弃的服务器「台数」，量纲与其它四项不同，说明书要分开讲 */
+    val ambiguousServerCount: Int get() = decision.ambiguousServerCount
+    /**
+     * 五类「开关开着却没挂上」的原因合计；与工具名一起决定说明书提不提 MCP。
+     *
+     * ⚠️ 措辞历史（别改回去）：
+     *  · 第六轮指出旧注释写「三种」与实现不符，实际四类；
+     *  · 第八轮补上「重复 serverId 整台放弃」，变五类。
+     * 其中「防御性重名丢弃」正常不可达，属兜底，界面不列；
+     * 所以界面文案列的是**四类常见原因**（审批、非法服务器名、重复配置、名字超长）。
+     * 说明书侧五类都单独讲。这句注释写错，下一个改代码的人会按旧分类去理解。
+     */
+    val skippedTotal: Int
+        get() = decision.needsApprovalCount + decision.invalidNameCount +
+            decision.nameOverflowCount + decision.conflictDroppedCount +
+            decision.ambiguousServerCount
+}
+
 /** 构建独立助手副本：清空记忆、MCP、技能、正则、模式注入、知识库、网络搜索等一切污染源 */
 internal fun buildIsolatedAssistant(
     base: me.rerere.rikkahub.data.model.Assistant,
     thread: AgentThread,
     memoryEnabled: Boolean = false,
+    webSearchToolNames: List<String> = emptyList(),
+    mcp: AgentMcpCapability = AgentMcpCapability(),
 ): me.rerere.rikkahub.data.model.Assistant = base.copy(
-    systemPrompt = buildAgentSystemPrompt(thread, memoryEnabled),
+    systemPrompt = buildAgentSystemPrompt(thread, memoryEnabled, webSearchToolNames, mcp),
     enableMemory = false,
     useGlobalMemory = false,
     mcpServers = emptySet(),
@@ -1865,6 +2582,8 @@ internal fun buildIsolatedAssistant(
 internal fun buildAgentSystemPrompt(
     thread: AgentThread,
     memoryEnabled: Boolean = false,
+    webSearchToolNames: List<String> = emptyList(),
+    mcp: AgentMcpCapability = AgentMcpCapability(),
 ): String = buildString {
     appendLine(when (thread.role) {
         AgentRole.DEFAULT -> "你是一个子代理，负责完成分配给你的明确任务。"
@@ -1910,6 +2629,146 @@ internal fun buildAgentSystemPrompt(
         appendLine("引用历史内容时同样按 evidence 的规矩写清来源（对话标题 + 日期），不要把旧对话里的")
         appendLine("结论当成自己的判断 —— 里面可能有已经被推翻的说法。")
         appendLine()
+    }
+    // v324：联网能力必须写进提示词，光把工具塞进 tools 列表不够 —— 与 v281 那条教训同源。
+    //
+    // 上面那句「你只能读取工作区文件进行查证」就是子代理自称「我上不了网」的直接来源。
+    // 真机实测一条探测位，报告原文「本子代理只能读取工作区文件，不能按要求实际联网搜索」，
+    // 句式与那句说明书几乎一字不差 —— 它是在**复读说明书**，不是在看自己手里有什么工具。
+    //
+    // 为什么这里读的是 webSearchToolNames（实际装配到的工具名）而不是一个布尔开关：
+    // 说明书只要自己判断一次，就迟早与 tools 分叉。本轮第一版正是按布尔写的，
+    // 结果无条件宣称了 scrape_web —— 可 SearchTools 只在搜索服务提供抓取参数时才装配它
+    //（Brave 等返回 null，根本不会装配），等于又埋一个「说明书说有、手里没有」。
+    // 改成照抄装配结果以后，这类分叉在结构上就不可能出现：没装配的工具名进不了这句话；
+    // 非探测位拿不到工具、列表为空，也自然一个字不提，不必在这里再重复一遍角色判断
+    //（重复判断本身就是下一次分叉的起点）。
+    if (webSearchToolNames.isNotEmpty()) {
+        appendLine("## 联网搜索（本次已开启）")
+        appendLine()
+        appendLine("你手里有这些联网工具（这就是本次全部可用的，没列出来的那个不存在）：")
+        webSearchToolNames.forEach { name ->
+            appendLine(
+                when (name) {
+                    "scrape_web" ->
+                        "- `scrape_web`：抓指定网址的正文，可带 query 只取相关内容，长页可分段读。"
+                    else ->
+                        "- `search_web`：按关键词搜网页，返回标题、来源网址与相关片段。"
+                },
+            )
+        }
+        appendLine()
+        appendLine("上面那句「只能读取工作区文件」讲的是**不能改文件、不能执行命令**，")
+        appendLine("不是禁止你联网。任务要求查网上的信息时直接用上面的工具，")
+        appendLine("**不要**在报告里写「我无法联网搜索」「只能读取工作区文件」这类结论。")
+        appendLine()
+        appendLine("真的查不到时，如实说明是哪一步失败的（搜索无结果 / 抓取报错 / 该网站需要登录），")
+        appendLine("并写清你试过哪些关键词或网址；不要笼统地说自己没有联网能力。")
+        appendLine()
+    }
+    // v1027：MCP 能力同样必须写进说明书 —— 与 v281（查历史）、v324（联网）是同一条教训：
+    // 能力不写进去，光把工具塞进 tools 列表，模型会照着「你只能读取工作区文件」那句
+    // 自称没这能力，开关等于白开。
+    //
+    // 这里只报**数量**、不逐个列名字：MCP 工具名由用户自配的服务器决定，可能几十个，
+    // 全列进提示词会白占上下文。名称与参数模型本来就能在工具列表里看到，
+    // 所以「有 N 个 + 见工具列表」足以消除「自称没能力」的误判。
+    //
+    // 数量取自实际装配结果（agentMcpTools 的返回值）：被跳过的非法服务器不算在内，
+    // 所以这里宣称的数量不可能大于手里真有的工具。
+    val mcpToolNames = mcp.toolNames
+    if (mcpToolNames.isNotEmpty() || mcp.skippedTotal > 0) {
+        if (mcpToolNames.isNotEmpty()) {
+            appendLine("## MCP 外部工具（本次已开启，可用 ${mcpToolNames.size} 个）")
+            appendLine()
+            appendLine("本次还给你挂了 ${mcpToolNames.size} 个 MCP 工具。名字一般形如 mcp__服务器名__工具名；")
+            // 措辞要跟实现对得上：只有**最终拼出来的名字会撞车**时才加区分码，
+            // 两台同名服务器各提供不同工具时名字其实是干净的 —— 上一版说成
+            // 「重名就带 id」并不准确（第五轮审查指出）。
+            appendLine("如果两个工具拼出来的名字会撞车，名字里会加服务器 id 片段或序号来区分；")
+            appendLine("凡是名字被改动过的，描述里都会写清实际调用的是哪台服务器的哪个工具。")
+            appendLine("具体名称与参数见本次提供的工具列表 —— 那里列出的就是全部，没列出的不存在。")
+            appendLine()
+            appendLine("这些工具会**真实调用外部服务**：可能写文件、改外部数据、产生费用。")
+            appendLine("它们不受上面「不能执行命令、不能编译、不能删除」那层限制约束 ——")
+            appendLine("那层限制管的是本地命令，管不到 MCP 服务器在外面做了什么。")
+            appendLine()
+            appendLine("所以：只有任务确实需要、而且你能说清它会对**外部世界**做什么时，才调用。")
+            appendLine("拿不准会不会改坏外部数据时，把这一点写进 uncertainties 交回主代理决定，")
+            appendLine("不要自己按下去。调用过哪些 MCP 工具、各自做了什么，报告里必须写清楚。")
+            appendLine()
+        } else {
+            // 一个都没挂上，但仍然要说 —— 不说的话模型只看到「没有 MCP 工具」，
+            // 会以为自己压根没这能力，或者凭空编一个工具名去调。
+            // 为什么没挂上，原因也必须照实际丢掉的数量讲，不许只讲其中一种。
+            appendLine("## MCP 外部工具（本次已开启，但没有一个能直接用）")
+            appendLine()
+            // 「开关是开着的」必须无条件先讲一句：只有非法名、没有待批准工具时，
+            // 上一版会整段不讲开关状态 —— 本轮测试就是把它抓出来的。
+            appendLine("MCP 开关是开着的，可本次没有任何 MCP 工具能挂上来，原因是：")
+            if (mcp.approvalSkippedCount > 0) {
+                appendLine("・${mcp.approvalSkippedCount} 个要求用户手动批准，而子代理没有批准入口；")
+            }
+            if (mcp.invalidNameSkippedCount > 0) {
+                appendLine("・${mcp.invalidNameSkippedCount} 个所在的 MCP 服务器名称不合法")
+                appendLine("（只允许英文字母和数字）。主对话碰到这种名字会直接报错，")
+                appendLine("  子代理为了不炸掉整趟任务改成跳过这一台；")
+            }
+            if (mcp.ambiguousServerCount > 0) {
+                // 量纲是「台」不是「个工具」，措辞必须分开，否则用户会以为只少了几个工具。
+                appendLine("・${mcp.ambiguousServerCount} 台 MCP 服务器在设置里存在多份相同 id 的配置，")
+                appendLine("  这些服务器上的工具本次一个都不提供：连接层按 id 只认一份（后出现的覆盖前面的），")
+                appendLine("  而工具说明取自另一份配置 —— 硬挂上去等于可能把外部操作发往你没看到的那台服务器。")
+                appendLine("  请把重复的那一份配置删掉再试；")
+            }
+            if (mcp.conflictDroppedCount > 0) {
+                // 正常不可达（claim 已保证唯一），但一旦发生必须说清是「重名冲突被丢」，
+                // 不许混进「名字超长」—— 那是两种完全不同的原因（第五轮审查点名）。
+                appendLine("・${mcp.conflictDroppedCount} 个与其他工具最终撞成同一个名字，")
+                appendLine("  为避免调用打到错误的对象，重复的那些本次没有挂上来；")
+            }
+            if (mcp.nameOverflowCount > 0) {
+                // 这一条必须讲，而且措辞要同时覆盖两种成因：
+                // ① 工具名自己就长（不撞名也超长）；② 两台服务器重名、加区分码后顶爆上限。
+                // 第四轮复审正是抓到「只讲重名」会让第一种成因说法失真。
+                appendLine("・${mcp.nameOverflowCount} 个的名字超过供应商函数名长度上限")
+                appendLine("（${MAX_MCP_TOOL_NAME_LENGTH} 字符；可能是工具名本身太长，也可能是两台服务器")
+                appendLine("  重名后加区分码顶爆的）。硬发出去会让整个请求被供应商拒，")
+                appendLine("  所以这些工具本次没有挂上来；")
+            }
+            appendLine("所以本次你手里没有 MCP 工具。")
+            appendLine("任务确实需要它们时，把这一点写进 uncertainties 交回主代理处理，")
+            appendLine("不要凭空调用列表里不存在的工具名。")
+            appendLine()
+        }
+        if (mcpToolNames.isNotEmpty() && mcp.skippedTotal > 0) {
+            // 部分被跳过也必须讲出来：模型知道「有什么、缺什么、为什么缺」，
+            // 才不会在缺的那类操作上反复撞墙。
+            val skippedParts = buildString {
+                if (mcp.approvalSkippedCount > 0) {
+                    append("${mcp.approvalSkippedCount} 个要求用户手动批准（子代理没有批准入口）")
+                }
+                if (mcp.invalidNameSkippedCount > 0) {
+                    if (isNotEmpty()) append("，")
+                    append("${mcp.invalidNameSkippedCount} 个所在的 MCP 服务器名称不合法（只允许英文字母和数字）")
+                }
+                if (mcp.nameOverflowCount > 0) {
+                    if (isNotEmpty()) append("，")
+                    append("${mcp.nameOverflowCount} 个名字超过供应商函数名长度上限（$MAX_MCP_TOOL_NAME_LENGTH 字符）")
+                }
+                if (mcp.ambiguousServerCount > 0) {
+                    if (isNotEmpty()) append("，")
+                    append("${mcp.ambiguousServerCount} 台服务器有多份相同 id 的重复配置（这些服务器上的工具全部没挂）")
+                }
+                if (mcp.conflictDroppedCount > 0) {
+                    if (isNotEmpty()) append("，")
+                    append("${mcp.conflictDroppedCount} 个与其他工具撞成同一个名字")
+                }
+            }
+            appendLine("补充：另有 $skippedParts 的 MCP 工具没有挂上来。")
+            appendLine("需要时写进 uncertainties 交回主代理，不要尝试调用工具列表里没有的名字。")
+            appendLine()
+        }
     }
     // v238：开局自动去找项目约定文件。
     //

@@ -168,9 +168,10 @@ class AgentTimeoutAndModelSwitchTest {
         )
         assertTrue(
             "超时上界必须与设置层一致",
-            backend.contains("coerceIn(0, AGENT_THREAD_TIMEOUT_MAX_MINUTES)"),
+            backend.contains("coerceAtLeast(0)"),
         )
-        assertEquals(120, AGENT_THREAD_TIMEOUT_MAX_MINUTES)
+        // v1024：用户自填300分钟必须真生效，不能只读历史120常量就冒称接线正确。
+        assertEquals(300 * 60_000L, me.rerere.rikkahub.agent.runtime.agentIdleTimeoutMillis(300))
     }
 
     @Test
@@ -210,11 +211,11 @@ class AgentTimeoutAndModelSwitchTest {
         )
         assertTrue(
             "缺少读回",
-            store.contains("agentThreadTimeoutMinutes = (preferences[AGENT_THREAD_TIMEOUT] ?: 10).coerceIn(0, 120)"),
+            store.contains("agentThreadTimeoutMinutes = normalizeAgentLimit((preferences[AGENT_THREAD_TIMEOUT] ?: 10), 10, true)"),
         )
         assertTrue(
             "缺少落盘 —— v219 就是因为只读不写让用户配好的设置自己变回默认（v220 才修）",
-            store.contains("preferences[AGENT_THREAD_TIMEOUT] = settings.agentThreadTimeoutMinutes.coerceIn(0, 120)"),
+            store.contains("preferences[AGENT_THREAD_TIMEOUT] = normalizeAgentLimit(settings.agentThreadTimeoutMinutes, 10, true)"),
         )
         assertTrue(
             "Settings 字段必须有默认值，否则旧备份反序列化会炸",
@@ -368,8 +369,8 @@ class AgentTimeoutAndModelSwitchTest {
             "0 必须显示成「不限时」而不是「0 分钟」",
             picker.contains("R.string.agent_tools_timeout_unlimited"),
         )
-        assertTrue(picker.contains("agentThreadTimeoutMinutes - 5).coerceAtLeast(0)"))
-        assertTrue(picker.contains("agentThreadTimeoutMinutes + 5).coerceAtMost(120)"))
+        assertTrue(picker.contains("value = settings.agentThreadTimeoutMinutes"))
+        assertTrue(Regex("""onSave\s*=\s*\{\s*(\w+)\s*->\s*onUpdateSettings\(settings\.copy\(agentThreadTimeoutMinutes\s*=\s*\1\)\)""").containsMatchIn(picker))
     }
 
     // ------------------------------------------- 审查关卡漏写 verdict 的补问（v238）

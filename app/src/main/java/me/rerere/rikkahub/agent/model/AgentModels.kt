@@ -330,7 +330,8 @@ data class AgentThread(
  * 不观察每条线程的消息与事件。真机反馈：用户在面板上看到红色的「没动静 7 分 49 秒」，
  * 而它其实正卡在一次工具调用里 —— 面板不说原因，红字看着就像死机。
  *
- * 这里只放三个最小信号（最后一条事件类型、还没返回的工具数、有没有产出过消息），
+ * 这里只放四个最小信号（最后一条事件类型、还没返回的工具数、有没有产出过消息、
+ * 以及 v1028 新增的「当前使用的模型名」），
  * 由 [me.rerere.rikkahub.agent.runtime.AgentThreadManager] 在落库回调里顺手维护，
  * 面板与详情页共用同一套判据（`agentPhaseTextFrom`），不会两处说法不一致。
  */
@@ -339,6 +340,14 @@ data class AgentStageSignal(
     /** 已发出但还没拿到结果的工具数量（>0 表示正在跑工具，这时候「没动静」是正常的） */
     val pendingTools: Int = 0,
     val hasMessages: Boolean = false,
+    /**
+     * v1028：**当前正在使用**的模型（`模型名 · 供应商名`）。
+     *
+     * 为什么必须有：`AgentThread.activeModelId` 只在收尾时落库，运行期间界面永远是空的，
+     * 用户只能等跑完才知道到底是哪个模型在干活（原话：「不要等到结束了再给我看」）。
+     * 这里走内存信号，模型一确定就更新，与落库无关。
+     */
+    val modelLabel: String? = null,
 )
 
 /** 代理线程内的一条消息（可观察输出，只写 AgentDatabase，绝不进入主会话） */
@@ -369,6 +378,16 @@ data class AgentEvent(
  * - AgentThreadManager 的 onEvent 对检查点不算可见阶段事件，但可以更新 activity。
  */
 internal const val AGENT_EVENT_TYPE_RESUME_CHECKPOINT = "RESUME_CHECKPOINT"
+
+/**
+ * v1028：模型一确定就发一次，`detail` = `model.displayLabel(settings.providers)`（模型名 · 供应商名）。
+ *
+ * 与 `MODEL_FALLBACK` 事件的区别是关键的：后者只在**换人**时发，
+ * 第一个模型不发，所以旧版界面在运行期间永远不知道当前用的是谁。
+ * 这个事件每个候选模型开始时都发一次，界面从第一秒就有值（用户原话：
+ * 「不要等到结束了再给我看目前所使用的模型」）。
+ */
+internal const val AGENT_EVENT_TYPE_MODEL_ACTIVE = "MODEL_ACTIVE"
 
 /**
  * 子代理结构化报告：结论 + 证据 + 不确定项 + 建议（+ v236 审查结论）。

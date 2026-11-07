@@ -420,8 +420,8 @@ class AgentV242StateGuardTest {
             agentIdleTimeoutMillis(20),
         )
         assertEquals(
-            "不许超过设置项自身的上限",
-            AGENT_THREAD_TIMEOUT_MAX_MINUTES * minute,
+            "v1024 自填999分钟必须原样生效，不再压回120分钟",
+            999 * minute,
             agentIdleTimeoutMillis(999),
         )
         assertEquals("负数按 0 处理", AGENT_IDLE_TIMEOUT_DEFAULT_MILLIS, agentIdleTimeoutMillis(-3))
@@ -504,8 +504,8 @@ class AgentV242StateGuardTest {
             pipelineStageWaitMillis(80 * 60_000L, fiveMinutes, 2) >= 80 * 60_000L,
         )
         assertEquals(
-            "超过硬上限要夹住，一棒挂死不能拖住整条流水线",
-            AGENT_PIPELINE_STAGE_WAIT_MAX_MILLIS,
+            "v1024 调用方给600分钟就不再压回90分钟",
+            600 * 60_000L,
             pipelineStageWaitMillis(600 * 60_000L, fiveMinutes, 2),
         )
         assertEquals(
@@ -581,8 +581,26 @@ class AgentV242StateGuardTest {
             backend.contains("thread.role == AgentRole.EXPLORER &&"),
         )
         assertTrue(
-            "还必须跟随用户助手的联网总闸，否则等于绕过用户的全局设置",
-            backend.contains("settings.getCurrentAssistant().enableWebSearch"),
+            "还必须跟随用户的联网总闸，否则等于绕过用户的全局设置",
+            backend.contains("settings.getAssistantOf(it).enableWebSearch"),
+        )
+        // v324：把旧口径钉死的那句断言（要求代码里必须出现 getCurrentAssistant().enableWebSearch）
+        // 正是这个 bug 能活下来的原因 —— 官方 3.1 把联网开关改成「每个对话各一份」以后，
+        // 断言仍然绿灯，等于测试把过时口径焊进了代码。这里改成钉新口径。
+        assertTrue(
+            "v324：联网开关必须按「派出这条子代理的那个对话」取，不许按界面上此刻选中的助手取。" +
+                "v1027 起会话由 run() 查一趟再分发，所以这里钉的是 dispatchConversation 整条链",
+            backend.contains("agentWebSearchEnabledFrom(conversation, settings)") &&
+                backend.contains(
+                    "val dispatchConversation = if (needsConversation) threadConversation(thread) else null",
+                ) &&
+                backend.contains("agentWebSearchEnabled(thread, settings, dispatchConversation)"),
+        )
+        assertEquals(
+            "v324：「读此刻选中助手的联网开关」这个旧口径必须彻底消失 —— 联网会真实外发并消耗额度，" +
+                "查不到派活对话时只能失败关闭，不许拿无关对话的开关替用户决定",
+            0,
+            Regex("settings\\.getCurrentAssistant\\(\\)\\.enableWebSearch").findAll(backend).count(),
         )
         assertTrue("必须真的把搜索工具装进去", backend.contains("addAll(createSearchTools(settings))"))
         assertEquals(
@@ -593,7 +611,11 @@ class AgentV242StateGuardTest {
         assertTrue(
             "工具装配必须能看到设置（否则拿不到搜索服务配置）",
             backend.contains("settings: me.rerere.rikkahub.data.datastore.Settings,") &&
-                backend.contains("buildAgentTools(thread, settings)"),
+                backend.contains("buildAgentTools(thread, settings, webSearchEnabled, mcpCapability.tools)"),
+        )
+        assertTrue(
+            "v324：开关值必须在 run() 里算一次再传下去，装配与提示词共用同一个值",
+            backend.contains("val webSearchEnabled = agentWebSearchEnabled(thread, settings, dispatchConversation)"),
         )
         assertFalse(
             "子代理仍然不许有终端、编译、删除能力",
@@ -605,8 +627,8 @@ class AgentV242StateGuardTest {
     fun `总运行时长只剩防死循环的兜底`() {
         val backend = source(backendPath)
         assertTrue(
-            "硬兜底必须是个远得碰不到的固定值，而且要明显大于静默阈值的上限",
-            backend.contains("AGENT_ATTEMPT_HARD_DEADLINE_MILLIS = 4 * 60 * 60 * 1000L"),
+            "v1024 不再用隐藏4小时死线压掉用户自填预算，保留API无期限哨兵",
+            backend.contains("AGENT_ATTEMPT_HARD_DEADLINE_MILLIS = Long.MAX_VALUE"),
         )
         assertTrue(
             "兜底必须至少是静默阈值上限的两倍，否则拉满阈值时又变成按总时长砍",

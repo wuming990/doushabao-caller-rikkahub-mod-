@@ -63,6 +63,9 @@ import kotlin.uuid.Uuid
 @Composable
 fun AgentActivityPanel(
     threads: List<AgentThread>,
+    // v1023：折叠状态由聊天页统一控制，收起后只在共用小条保留入口。
+    expanded: Boolean,
+    onToggleExpanded: () -> Unit,
     onStop: (String) -> Unit,
     onMerge: (String) -> Unit = {},
     onClose: (String) -> Unit = {},
@@ -74,7 +77,8 @@ fun AgentActivityPanel(
     val visible = visibleAgentThreads(threads)
     if (visible.isEmpty()) return
 
-    var expanded by remember { mutableStateOf(false) }
+    // v1023：不仅藏列表，整块旧底板也不组合；展开入口由 CompactActivityBar 提供。
+    if (!expanded) return
     var selectedThreadId by remember { mutableStateOf<String?>(null) }
     val activeCount = visible.count { !it.status.isTerminal }
     val finishedCount = visible.size - activeCount
@@ -86,6 +90,8 @@ fun AgentActivityPanel(
     // 时长。而主模型在等子代理时用户看的就是这个面板，看不出进度只能干等。
     // 计时器只在**有活动线程**时才开，避免整个聊天页每秒重组。
     val manager: AgentThreadManager = koinInject()
+    // v1028：行上也要能显示模型名（终态回落到落库值，运行中只认实时信号）。
+    val settings by rememberUserSettingsState()
     val activity by manager.activityFlow.collectAsStateWithLifecycle()
     // v246：面板还要说清「为什么没动静」—— 用户在这里看到红色的「没动静 7 分 49 秒」，
     // 其实是正卡在一次工具调用里，不说原因就像死机（真机反馈）。
@@ -109,7 +115,7 @@ fun AgentActivityPanel(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { expanded = !expanded },
+                    .clickable(onClick = onToggleExpanded),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
@@ -178,6 +184,11 @@ fun AgentActivityPanel(
                                 hasMessages = signal?.hasMessages == true,
                             ),
                             toolRunning = (signal?.pendingTools ?: 0) > 0,
+                            // v1028：运行中实时显示当前模型；终态才回落到落库值（避免拿上一轮的旧值冒充）。
+                            modelLabel = signal?.modelLabel ?: thread.activeModelId
+                                ?.takeIf { thread.status.isTerminal }
+                                ?.let { raw -> runCatching { Uuid.parse(raw) }.getOrNull() }
+                                ?.let { settings.findModelById(it)?.displayLabel(settings.providers) },
                             onStop = { onStop(thread.id) },
                             onClick = { selectedThreadId = thread.id },
                         )
@@ -194,6 +205,8 @@ fun AgentActivityPanel(
     selectedThread?.let { thread ->
         AgentThreadDetailDialog(
             thread = thread,
+            // v1028：运行中的实时模型名；终态时信号已被清掉，这里自然是 null，回退到落库值。
+            liveModelLabel = stage[thread.id]?.modelLabel,
             onDismiss = { selectedThreadId = null },
             onStop = {
                 onStop(thread.id)
@@ -237,6 +250,8 @@ private fun AgentThreadRow(
     phaseText: String? = null,
     /** v246：是否有工具正在执行 —— 这时候「没动静」是正常的，不许标红 */
     toolRunning: Boolean = false,
+    /** v1028：当前正在使用的模型（模型名 · 供应商名）；null = 还不知道（排队/未开始） */
+    modelLabel: String? = null,
 ) {
     Surface(
         modifier = Modifier
@@ -273,6 +288,18 @@ private fun AgentThreadRow(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+                // v1028：实时显示「现在用的是哪个模型」。
+                // 单独一行而不是塞进下面那行：模型名带供应商（`模型名 · 供应商名`），
+                // 塞进「阶段 · 已跑 · 没动静」会被省略号截断，而「现在是谁在跑」正是用户最想看的。
+                if (!modelLabel.isNullOrBlank()) {
+                    Text(
+                        text = "模型：$modelLabel",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
                 // v245：时长单独一行，「没动静」按时长变色（与详情页同一套判据）
                 // v246：前面加当前阶段；工具在跑时改文案并且不标红 ——
                 // 真机反馈：红色的「没动静 7 分 49 秒」其实是在跑工具，红字属于误导。
@@ -421,6 +448,8 @@ internal fun agentPhaseTextFrom(
 @Composable
 private fun AgentThreadDetailDialog(
     thread: AgentThread,
+    /** v1028：运行中的实时模型名（内存信号）。终态时调用方传 null，回退到落库值。 */
+    liveModelLabel: String? = null,
     onDismiss: () -> Unit,
     onStop: () -> Unit,
     onMerge: () -> Unit,
@@ -435,6 +464,16 @@ private fun AgentThreadDetailDialog(
     val activeModelName = thread.activeModelId
         ?.let { raw -> runCatching { Uuid.parse(raw) }.getOrNull() }
         ?.let { settings.findModelById(it)?.displayLabel(settings.providers) }
+    // v1028：运行中优先用实时值。落库的 activeModelId 只有收尾才写，
+    // 只认它等于「跑完才告诉你」，正是用户明确否掉的行为。
+    // v1028：非终态只认实时值。回落落库值会把「上一轮的旧模型」标成「当前使用的模型」，
+    // 那是撒谎（等待自动重试 / 刚点继续输出到 MODEL_ACTIVE 落地之间就会发生）。
+    val shownModelName = if (thread.status.isTerminal) {
+        liveModelLabel?.takeIf { it.isNotBlank() } ?: activeModelName
+    } else {
+        liveModelLabel?.takeIf { it.isNotBlank() }
+    }
+    val modelPrefix = if (thread.status.isTerminal) "实际跑的模型" else "当前使用的模型"
     AlertDialog(
         onDismissRequest = onDismiss,
         title = {
@@ -450,9 +489,9 @@ private fun AgentThreadDetailDialog(
             ) {
                 Text("任务：${thread.task}", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
                 Text("状态：${agentStatusText(thread)}", style = MaterialTheme.typography.labelMedium)
-                if (activeModelName != null) {
+                if (shownModelName != null) {
                     Text(
-                        "实际跑的模型：$activeModelName",
+                        "$modelPrefix：$shownModelName",
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )

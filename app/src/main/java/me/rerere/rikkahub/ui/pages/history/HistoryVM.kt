@@ -36,6 +36,8 @@ class HistoryVM(
 
     fun deleteConversation(conversation: Conversation) {
         viewModelScope.launch {
+            // v1024：与聊天页一致，先等原压缩停止/提交收尾，再删记录。
+            chatService.cancelManualCompression(conversation.id)
             conversationRepo.deleteConversation(conversation)
             // v318：删对话要一并释放它的讨论群运行态与状态转发订阅（ChatVM 同一口径）
             chatService.releaseGroupStateOnDelete(conversation.id)

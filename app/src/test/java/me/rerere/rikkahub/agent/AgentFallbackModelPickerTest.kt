@@ -342,9 +342,16 @@ class AgentFallbackModelPickerTest {
     @Test
     fun `子代理界面必须显示这次实际是哪个模型跑的`() {
         val threadPage = source("app/src/main/java/me/rerere/rikkahub/ui/pages/chat/AgentThreadPage.kt")
+        // v1028：文案改成「运行中说『当前使用的模型』/ 收尾说『实际跑的模型』」，
+        // 冒号由模板拼出来，所以这里不再钉「实际跑的模型：」这个连续字面量 ——
+        // 但仍要求这两句话必须真的出现在界面源码里，防止有人把模型显示整段删掉。
         assertTrue(
             "详情页必须显示实际模型，否则用户看不出有没有换过人",
-            threadPage.contains("实际跑的模型："),
+            threadPage.contains("实际跑的模型"),
+        )
+        assertTrue(
+            "运行中必须显示「当前使用的模型」，不能等收尾才告诉用户（v1028 的核心需求）",
+            threadPage.contains("当前使用的模型"),
         )
         assertTrue(
             "换过备用模型时要特别标出来",
@@ -355,7 +362,8 @@ class AgentFallbackModelPickerTest {
             threadPage.contains("events.any { it.type == \"MODEL_FALLBACK\" }"),
         )
         val panel = source("app/src/main/java/me/rerere/rikkahub/ui/pages/chat/AgentActivityPanel.kt")
-        assertTrue("弹窗详情也要显示实际模型", panel.contains("实际跑的模型："))
+        assertTrue("弹窗详情也要显示实际模型", panel.contains("实际跑的模型"))
+        assertTrue("运行中面板与弹窗都要说「当前使用的模型」", panel.contains("当前使用的模型"))
     }
 
     @Test

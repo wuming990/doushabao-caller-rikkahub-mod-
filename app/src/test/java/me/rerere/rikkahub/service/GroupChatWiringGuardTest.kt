@@ -847,7 +847,7 @@ class GroupChatWiringGuardTest {
         )
         // ChatPage 必须把偏好读进来、把切换写回去（缺一个就是骗人的开关）
         assertTrue("页面要读折叠偏好", chatPage.contains("collapsed = setting.displaySetting.groupPanelCollapsed"))
-        assertTrue("页面要写回折叠偏好", chatPage.contains("groupPanelCollapsed = !setting.displaySetting.groupPanelCollapsed"))
+        assertTrue("页面要写回折叠偏好", chatPage.contains("groupPanelCollapsed = !current.displaySetting.groupPanelCollapsed"))
         // 偏好必须走 DisplaySetting（DataStore JSON），绝不允许动数据库版本
         assertTrue("偏好字段要有默认值（旧数据兼容）", store.contains("val groupPanelCollapsed: Boolean = false,"))
         // 折叠只是显示偏好，绝不允许动数据库版本。

@@ -29,6 +29,18 @@ sealed class StreamChunk {
         val metadata: JsonObject? = null,
     ) : StreamChunk()
 
+    /**
+     * v1020: A full text snapshot replaces only the current part with the same id. Only web providers emit this;
+     * the existing delta behavior remains unchanged.
+     */
+    @Serializable
+    @SerialName("text_snapshot")
+    data class TextSnapshot(
+        val id: String,
+        val text: String,
+        val metadata: JsonObject? = null,
+    ) : StreamChunk()
+
     @Serializable
     @SerialName("text_end")
     data class TextEnd(val id: String) : StreamChunk()
@@ -44,6 +56,16 @@ sealed class StreamChunk {
     @Serializable
     @SerialName("reasoning_delta")
     data class ReasoningDelta(
+        val id: String,
+        val text: String,
+        val metadata: JsonObject? = null,
+        val reasoningType: ReasoningType = ReasoningType.REASONING_TEXT,
+    ) : StreamChunk()
+
+    /** v1021: Web thoughts are cumulative snapshots, independent of visible answer text. */
+    @Serializable
+    @SerialName("reasoning_snapshot")
+    data class ReasoningSnapshot(
         val id: String,
         val text: String,
         val metadata: JsonObject? = null,

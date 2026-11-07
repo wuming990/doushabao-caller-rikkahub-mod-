@@ -140,11 +140,11 @@ class AgentV245IdleTruthTest {
     fun `静默阈值为零等于关掉看门狗`() {
         // 非流式走的就是这条路：一趟只有一次回调，静默判据毫无意义，只留硬兜底
         assertFalse(shouldJudgeStuck(99 * 60_000L, 0L, false, 0L, 10 * 60_000L))
-        assertFalse(shouldJudgeStuck(99 * 60_000L, 0L, true, 99 * 60_000L, 10 * 60_000L))
+        assertTrue(shouldJudgeStuck(99 * 60_000L, 0L, true, 99 * 60_000L, 10 * 60_000L))
     }
 
     @Test
-    fun `工具等待上限由设置决定并且有天花板`() {
+    fun `工具等待由自填设置决定不再按60分钟封顶`() {
         // v246：上限从「静默阈值×2」改成用户可调的独立设置项（默认 10 分钟）。
         // 起因是用户原话：「我现在设置五分钟，为什么超过五分钟了没有停下」——
         // 当时它正卡在一次工具调用里，走的是这条闸，而界面上一个字都没提。
@@ -166,8 +166,8 @@ class AgentV245IdleTruthTest {
             agentToolWaitCeilingMillis(-7),
         )
         assertEquals(
-            "超过可调上限要夹住，与设置界面保持一致",
-            AGENT_TOOL_TIMEOUT_MAX_MINUTES * 60_000L,
+            "v1024 用户填写9999就按9999分钟，不再压回60分钟",
+            9999 * 60_000L,
             agentToolWaitCeilingMillis(9999),
         )
         assertTrue(
@@ -613,8 +613,8 @@ class AgentV245IdleTruthTest {
         val store = source("app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt") + "\n" + source("app/src/main/java/me/rerere/rikkahub/data/datastore/Settings.kt") // v323：官方 3.1 把 Settings 字段拆到 Settings.kt，判据改读两个文件（断言内容未改）
         listOf(
             "val AGENT_TOOL_TIMEOUT = intPreferencesKey(\"agent_tool_timeout_minutes\")",
-            "agentToolTimeoutMinutes = (preferences[AGENT_TOOL_TIMEOUT] ?: 10).coerceIn(1, 60)",
-            "preferences[AGENT_TOOL_TIMEOUT] = settings.agentToolTimeoutMinutes.coerceIn(1, 60)",
+            "agentToolTimeoutMinutes = normalizeAgentLimit((preferences[AGENT_TOOL_TIMEOUT] ?: 10), 10, false)",
+            "preferences[AGENT_TOOL_TIMEOUT] = normalizeAgentLimit(settings.agentToolTimeoutMinutes, 10, false)",
             "val agentToolTimeoutMinutes: Int = 10,",
         ).forEach { needle ->
             // 少了「写入」那一环，用户配好的值会自己变回默认（v219 真踩过）

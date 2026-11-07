@@ -78,7 +78,7 @@ class AgentV247ReadSliceTest {
 
     // v248：换算与 Settings.toolOutputCharLimit 保持一致（测试里不便构造 Settings，故本地复算）
     private fun limitChars(kb: Int): Int =
-        kb.coerceIn(TOOL_OUTPUT_LIMIT_MIN_KB, TOOL_OUTPUT_LIMIT_MAX_KB) * 1024
+        me.rerere.rikkahub.data.datastore.agentOutputCharLimit(kb)
 
     // v248：一切以「设置里的 KB 档位」为准算出来，不再写死常量
     private val defaultLimitChars = limitChars(TOOL_OUTPUT_LIMIT_DEFAULT_KB)
@@ -423,14 +423,15 @@ class AgentV247ReadSliceTest {
     // ------------------------------------------------------------ v248：档位设置
 
     @Test
-    fun `档位换算必须准确，越界要夹住`() {
+    fun `自填换算必须准确零不限且不夹回旧档位`() {
         assertEquals(32 * 1024, limitChars(32))
         assertEquals(64 * 1024, limitChars(64))
         assertEquals(128 * 1024, limitChars(128))
         assertEquals(256 * 1024, limitChars(256))
-        assertEquals("低于下限一律按下限", TOOL_OUTPUT_LIMIT_MIN_KB * 1024, limitChars(1))
-        assertEquals("低于下限一律按下限", TOOL_OUTPUT_LIMIT_MIN_KB * 1024, limitChars(-99))
-        assertEquals("高于上限一律按上限", TOOL_OUTPUT_LIMIT_MAX_KB * 1024, limitChars(9999))
+        assertEquals("v1024 1KB按1KB", 1024, limitChars(1))
+        assertEquals("无效负数回默认64KB而非不限", 64 * 1024, limitChars(-99))
+        assertEquals("v1024 填9999KB不夹回256", 9999 * 1024, limitChars(9999))
+        assertEquals("v1024 0交给字符串API不限哨兵", Int.MAX_VALUE, limitChars(0))
         assertEquals("默认档位就是设置里的默认值", 64, TOOL_OUTPUT_LIMIT_DEFAULT_KB)
         // 32 档位必须刚好退回本版早先那套数（24KB 预算 / 31KB 安全线），保证行为可预期
         assertEquals(24 * 1024, agentReadBudgetChars(limitChars(32)))
@@ -494,19 +495,19 @@ class AgentV247ReadSliceTest {
             "1 定义 key",
             prefs.contains("val TOOL_OUTPUT_LIMIT_KB = intPreferencesKey(\"tool_output_limit_kb\")"),
         )
-        assertTrue("2 读取", prefs.contains("toolOutputLimitKb = (preferences[TOOL_OUTPUT_LIMIT_KB]"))
+        assertTrue("2 读取", prefs.contains("toolOutputLimitKb = normalizeAgentLimit((preferences[TOOL_OUTPUT_LIMIT_KB]"))
         assertTrue(
             "3 写入 —— 少了这一环，用户调完下一次发射就恢复默认（历史上真踩过）",
-            prefs.contains("preferences[TOOL_OUTPUT_LIMIT_KB] = settings.toolOutputLimitKb"),
+            prefs.contains("preferences[TOOL_OUTPUT_LIMIT_KB] = normalizeAgentLimit(settings.toolOutputLimitKb,"),
         )
         assertTrue("4 字段带默认值", prefs.contains("val toolOutputLimitKb: Int = TOOL_OUTPUT_LIMIT_DEFAULT_KB,"))
 
         val picker = source("app/src/main/java/me/rerere/rikkahub/ui/components/ai/FilesPicker.kt")
         assertTrue("5 设置界面有调节入口", picker.contains("agent_tools_read_limit_title"))
         assertTrue(
-            "5 加减按钮必须真的改这个字段",
-            picker.contains("settings.copy(toolOutputLimitKb = (settings.toolOutputLimitKb - 32)") &&
-                picker.contains("settings.copy(toolOutputLimitKb = (settings.toolOutputLimitKb + 32)"),
+            "5 手填控件必须真的保存这个字段（不依赖lambda变量名或换行格式）",
+            picker.contains("value = settings.toolOutputLimitKb") &&
+                Regex("""onSave\s*=\s*\{\s*(\w+)\s*->\s*onUpdateSettings\(settings\.copy\(toolOutputLimitKb\s*=\s*\1\)\)""").containsMatchIn(picker),
         )
 
         val backend = source(backendPath)

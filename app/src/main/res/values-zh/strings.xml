@@ -2000,20 +2000,22 @@ mDNS 地址：使用 .local 主机名，同一网络中的其他设备可通过�
 <string name="round_table_status_phase_rebuttal">圆桌正在等待反驳环节…</string>
 <string name="round_table_status_phase_finished">圆桌已结束</string>
 <string name="round_table_unknown_model">未知模型</string>
-<string name="agent_tools_section_title">子代理（Codex 风格）</string>
+<string name="agent_tools_section_title">子代理</string>
 <string name="agent_tools_section_summary_on">已开启 · 主模型可自行派子代理</string>
 <string name="agent_tools_section_summary_off">已关闭 · 不影响圆桌会议</string>
 <string name="agent_tools_section_desc">子代理的所有选项都收在这里，和圆桌会议互不干扰；关掉后输入框上方的「代理活动」面板也不再出现。</string>
-<string name="agent_tools_switch_title">子代理（Codex 风格）</string>
+<string name="agent_tools_switch_title">子代理</string>
 <string name="agent_tools_switch_desc">在普通聊天中让主模型派发独立只读子代理；与圆桌会议完全分开。关闭后主模型将拿不到子代理工具。</string>
 <string name="agent_tools_assistant_switch_title">当前助手启用子代理</string>
 <string name="agent_tools_assistant_switch_desc">按助手单独控制（当前：%1$s）。需要和上面的总开关同时打开才生效。关掉它，这个助手就没有子代理面板、主模型也拿不到派发工具，而你其他助手不受影响。</string>
 <string name="agent_tools_memory_title">允许子代理检索历史对话</string>
+<string name="agent_tools_mcp_title">允许子代理调用 MCP 工具</string>
+<string name="agent_tools_mcp_desc">默认关闭；关闭时子代理行为与之前完全一致。打开后，子代理可以调用你在该助手里勾选的 MCP 服务器。注意：MCP 工具会真实调用外部服务，可能写文件、改外部数据或产生费用，而且它不受子代理常规限制（不能执行命令、不能编译、不能删除）约束，所以只给你信任的服务器打开。能用哪些服务器仍由助手上的 MCP 勾选决定，这个开关不会新增任何服务器。有四类常见原因会让工具即使开着也用不上，子代理会拿不到：一类是你勾了「需要批准」的工具（子代理没有批准按钮，挂上去只会卡死）；一类是服务器名含中文或符号的（主对话碰到会直接报错，子代理改为跳过那一台）；一类是拼出来的工具名超过供应商长度上限的（硬发会让整次请求被供应商拒掉）；一类是同一台服务器在设置里存在多份相同 id 的配置（连接层只认其中一份，硬挂上去可能把外部操作发往你没看到的另一台，所以这种服务器上的工具全部不提供，请删掉重复配置）。这几种情况子代理都会在报告里说明原因。无论开关，主对话与圆桌的行为都不受影响。</string>
 <string name="agent_tools_memory_desc">默认关闭。打开后，子代理可以全文搜索你过去的对话（涵盖所有助手），用来回答「这个问题以前是不是碰过」「当初为什么这么定」这类只有翻旧记录才知道的问题。搜到的对话内容会发送给子代理所使用的模型。无论开关，主对话的行为都不受任何影响。</string>
 <string name="agent_tools_model_title">子代理模型</string>
 <string name="agent_tools_model_follow_main">跟随主助手</string>
 <string name="agent_tools_concurrent_title">最大并发子代理数</string>
-<string name="agent_tools_concurrent_desc">同时运行的子代理数量上限（1～8），修改后立即生效。</string>
+<string name="agent_tools_concurrent_desc">同时运行多少个子代理，点击数值直接填写；0 表示不限。调小不会强停已经在运行的任务。</string>
 <string name="agent_tools_role_default">通用角色</string>
 <string name="agent_tools_role_explorer">探索角色</string>
 <string name="agent_tools_role_reviewer">审查角色</string>
@@ -2030,14 +2032,14 @@ mDNS 地址：使用 .local 主机名，同一网络中的其他设备可通过�
 <string name="agent_tools_chain_warn">只有 1 个模型：崩了会直接失败，不会换人。建议至少加 1 个备用模型。</string>
 <string name="agent_tools_chain_role_note">这里按「通用角色」算。给某个角色单独指定过模型的话，那个角色的第一棒会换成它，后面的顺序不变。</string>
 <string name="agent_tools_timeout_title">子代理卡住判定</string>
-<string name="agent_tools_timeout_desc">子代理连续这么久没有产出任何新内容，就当它卡住了、停掉这一趟，之后照常走重试与换备用模型的流程。只看「多久没动静」，不按总时长砍 —— 一直在干活的任务不会被打断。**工具执行时间另算**，由下面的「工具最长执行时间」管。设为 0 用默认 10 分钟。</string>
+<string name="agent_tools_timeout_desc">子代理连续这么多分钟没有新内容才算卡住，工具执行时间另算。点击数值手动填写，0 保持原来的默认 10 分钟。</string>
 <string name="agent_tools_timeout_unlimited">默认 10 分钟</string>
 <string name="agent_tools_timeout_minutes">%1$d 分钟</string>
 <string name="agent_tools_tool_timeout_title">工具最长执行时间</string>
-<string name="agent_tools_tool_timeout_desc">子代理调用一个工具（读文件、搜索、联网查资料）最多允许跑多久。工具是一件一件同步跑的，跑的时候不会有任何新内容，所以这段时间**不算**「没动静」，单独由这里管。查得慢的搜索可以调大；想让它早点放弃就调小。</string>
+<string name="agent_tools_tool_timeout_desc">一个子代理工具最多运行多少分钟，点击数值填写正整数，不再限制最高 60 分钟。工具执行期间不按模型没动静计算。</string>
 <string name="agent_tools_tool_timeout_minutes">%1$d 分钟</string>
 <string name="agent_tools_read_limit_title">子代理工具返回上限</string>
-<string name="agent_tools_read_limit_desc">子代理一次工具返回最多带回多少内容（读文件、搜索结果）。**只影响子代理，主对话完全按原样不动。**子代理没有终端，被截掉的部分它拿不回来，只能分成好几段接着读。调大 = 读大文件少跑几步；调小 = 对上下文窗口小的模型更安全（窗口不够会直接请求失败）。</string>
+<string name="agent_tools_read_limit_desc">一次子代理工具返回最多带回多少 KB，点击数值直接填写；0 表示不限。只影响子代理，不改主对话和圆桌。调大后仍要能装进所选模型的上下文。</string>
 <string name="gemini_provider_description">用自己的谷歌账号登录，通过与 Antigravity 相同的后台（Google Cloud Code Assist）生成回答，不需要 API 密钥。</string>
 <string name="gemini_provider_short_description">谷歌账号登录 · 请先看封号提醒</string>
 <string name="gemini_ban_warning_title">这可能导致你的谷歌账号被封</string>
@@ -2111,11 +2113,11 @@ mDNS 地址：使用 .local 主机名，同一网络中的其他设备可通过�
 <string name="grok_cooldown_until">已撞免费额度上限，轮询会跳过它到 %1$s</string>
 <string name="agent_tools_read_limit_kb">%1$d KB</string>
 <string name="agent_tools_resume_max_title">自动续跑次数</string>
-<string name="agent_tools_resume_max_desc">子代理话没说完被切断时，允许它自己接着跑几次；报错时也在同一个模型上重试这么多次，次数用完才换备用模型（卡住超时会立刻换，不耗次数）。设为 0 就完全不自动重试，一切等你手点。</string>
+<string name="agent_tools_resume_max_desc">自动续跑和同模型重试的次数，点击数值直接填写；0 仍表示关闭自动续跑。次数用完后照旧走备用模型，不另加重试设置。</string>
 <string name="agent_tools_resume_max_off">不自动续跑</string>
 <string name="agent_tools_resume_max_times">%1$d 次</string>
 <string name="agent_tools_max_steps_title">子代理单趟步数</string>
-<string name="agent_tools_max_steps_desc">一步 = 一次模型调用（含它这一轮想用的工具）。这个上限只为防止模型陷进死循环反复烧钱；撞到上限不算失败，会标成「这趟没跑完」并从断点接着跑。负责改代码的子代理自动按 1.5 倍给。</string>
+<string name="agent_tools_max_steps_desc">一步是一次模型调用。点击数值直接填写，0 表示不限；编程位仍按原来的 1.5 倍给。保留你原来填写的值，不自动改成不限。</string>
 <string name="agent_tools_max_steps_value">%1$d 步</string>
 <string name="round_table_setting_title">圆桌模式（多模型出方案）</string>
 <string name="round_table_setting_desc">按「一个主模型拍板 + 其他模型找盲点」的流程跑：先理清任务与事实，然后各模型和主模型同时各出一份方案，再由一个模型逐条反驳，最后主模型看完全部材料拍板。每一步都是一页，可以左右翻着看。全程只能查资料，不能改文件、不能跑命令。</string>
@@ -2128,6 +2130,8 @@ mDNS 地址：使用 .local 主机名，同一网络中的其他设备可通过�
 <string name="round_table_summary_prompt_hint">留空则使用内置的默认提示词</string>
 <string name="round_table_allow_readonly_tools">出方案时允许查资料</string>
 <string name="round_table_allow_readonly_tools_desc">让每个模型都能联网搜索、读取工作区里的文件，方案基于真实材料而不是凭空想象。代价是搜索次数和 token 按模型数量翻倍。会改动东西的操作始终禁用。</string>
+<string name="round_table_body_only_title">讨论只保留发言正文</string>
+<string name="round_table_body_only_desc">打开后，圆桌写进主对话的页在之后的对话里只带正文：自己想的过程、查资料拿回的原文、搜索结果都不会再被后续对话当成上文。圆桌页本身仍然保留这些记录，你随时能回看当时搜了什么；图片和文件照旧保留。关掉 = 与现在完全一样。</string>
 <string name="round_table_add_member">添加模型</string>
 <string name="round_table_remove_member">移除</string>
 <string name="round_table_member_missing">已删除的模型</string>
@@ -2419,4 +2423,10 @@ mDNS 地址：使用 .local 主机名，同一网络中的其他设备可通过�
   <string name="workspace_ssh_editor_trust_new_key">信任新密钥</string>
   <string name="workspace_ssh_editor_username">用户名</string>
   <string name="workspace_ssh_editor_working_dir">工作目录</string>
+    <string name="agent_numeric_unlimited">不限</string>
+    <string name="agent_numeric_input_hint">请输入整数；0 的含义见该设置说明。</string>
+    <string name="agent_numeric_positive_hint">请输入大于 0 的整数。</string>
+    <string name="agent_numeric_input_error">请输入有效整数，数值不能超出整数可表示的范围。</string>
+    <string name="chat_page_compress_background">后台继续</string>
+    <string name="chat_page_compress_background_status">正在压缩本对话，可以切换其他对话</string>
 </resources>

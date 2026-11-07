@@ -121,6 +121,18 @@ fun ChatMessage(
     onToolAnswer: ((toolCallId: String, answer: String) -> Unit)? = null,
 ) {
     val message = node.messages[node.selectIndex]
+    // v1019：官方 3.1.1 的检查点卡片（分隔线 + 可折叠摘要 + 编辑/删除入口）。
+    // 不接这一段，经典压缩的摘要会以普通用户气泡铺开，弹窗里承诺的
+    // 「分隔线以上不再发送 / 删摘要可恢复完整历史」在界面上既看不到也没有入口。
+    if (message.isContextCheckpoint) {
+        ChatMessageContextCheckpoint(
+            message = message,
+            onEdit = onEdit,
+            onDelete = onDelete,
+            modifier = modifier,
+        )
+        return
+    }
     val settings = LocalSettings.current.displaySetting
     val chatFontFamily = LocalChatFontFamily.current ?: rememberChatFontFamily(settings)
     val textStyle = LocalTextStyle.current.copy(

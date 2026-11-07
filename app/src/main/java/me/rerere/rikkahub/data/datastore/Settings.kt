@@ -96,6 +96,7 @@ data class Settings(
     val roundTableSetting: RoundTableSetting = RoundTableSetting(),
     val enableAgentTools: Boolean = true,
     val agentModelId: Uuid? = null,
+    // v1024：手填非负整数；0不限，旧4不变。
     val agentMaxConcurrent: Int = 4,
     val agentThreadTimeoutMinutes: Int = 10,
     /**
@@ -113,6 +114,7 @@ data class Settings(
      *
      * ⚠️ **主对话与圆桌不读这个字段**（红线：主模型不许被限制或改动）。
      */
+    // v1024：上方32~256是历史；现可手填，0不限，旧默认64KB不变。
     val toolOutputLimitKb: Int = TOOL_OUTPUT_LIMIT_DEFAULT_KB,
     /**
      * v241：子代理自动续跑次数上限。0 = 完全不自动续跑（一切都等你手动点）。
@@ -176,11 +178,29 @@ data class Settings(
      */
     val allowAgentConversationSearch: Boolean = false,
     /**
+     * v1027：允许子代理调用 MCP 工具。默认 false —— 关掉时行为与 v1026 一字节不差。
+     *
+     * 为什么要做成开关：子代理的隔离助手副本一直把 mcpServers 写死成 emptySet()
+     * （注释原话是「清空…MCP…等一切污染源」），而且工具装配里根本没有 MCP 那一路，
+     * 于是子代理从来用不了 MCP。用户要求把这层能力交回自己决定，而不是永久封死。
+     *
+     * 为什么默认关：MCP 工具会真实调用外部服务器 —— 可能写文件、改外部数据、产生费用。
+     * 而子代理现有的限制是「不能执行命令、不能编译、不能删除」，MCP 是从旁边开的一扇侧门，
+     * 不受那层限制约束。这种能力必须由用户主动打开，不能默认就给。
+     *
+     * 开关只管「能不能用」，不管「用哪些」——具体是哪些 MCP 服务器，仍然由你在助手里
+     * 勾选的那份决定（与主对话同一份白名单，不另搞一套）。
+     *
+     * 主对话与圆桌完全不看这个字段。
+     */
+    val allowAgentMcp: Boolean = false,
+    /**
      * v241：子代理单趟步数上限（只读位）。编程位自动取它的 1.5 倍。
      *
      * 「一步」= 一次完整的模型调用（含它这一轮想调的工具）。上限存在的唯一理由是
      * 防止模型陷进死循环反复烧钱；撞到上限不算失败，会标成「这趟没跑完」并从断点接着跑。
      */
+    // v1024：现可手填，0不限；只读/编程倍率仍见统一agentStepBudget。
     val agentMaxSteps: Int = 32,
     val agentRoleModelOverrides: Map<String, Uuid?> = emptyMap(),
     val agentFallbackModelIds: List<Uuid> = emptyList(),
@@ -188,8 +208,8 @@ data class Settings(
 ) {
     /** v248：子代理工具返回上限（KB→字节），主对话不读它。 */
     val toolOutputCharLimit: Int
-        get() = toolOutputLimitKb
-            .coerceIn(TOOL_OUTPUT_LIMIT_MIN_KB, TOOL_OUTPUT_LIMIT_MAX_KB) * 1024
+        // v1024：0不限；KB先用Long换算，不会在大值时溢出后静默变小。
+        get() = agentOutputCharLimit(toolOutputLimitKb)
 
     companion object {
         // 构造一个用于初始化的settings, 但它不能用于保存，防止使用初始值存储

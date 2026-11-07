@@ -113,6 +113,8 @@ internal fun GroupChatPanel(
     collapsed: Boolean,
     /** v317：切换收起 / 展开 */
     onToggleCollapsed: () -> Unit,
+    // v1023：聊天页把收起入口合在一排；展开态和独立调用默认仍保留旧标题。
+    showCollapsedHeader: Boolean = true,
     modifier: Modifier = Modifier,
 ) {
     // 没建过群、也没在讨论 → 完全不显示，不占输入框上方位置
@@ -126,48 +128,56 @@ internal fun GroupChatPanel(
         (state.turnsInRun > 0 || state.lastSpeakerModelId != null)
     val primary = resolveGroupPrimaryAction(status)
 
+    // v1023：普通收起态没有旧底板；报错和缺成员仍摊开，不能把故障藏起来。
+    if (collapsed && !showCollapsedHeader && state?.error == null && membersEnough) return
+
     Surface(
         modifier = modifier.fillMaxWidth(),
         color = MaterialTheme.colorScheme.surfaceVariant,
     ) {
         Column(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            modifier = Modifier.padding(
+                horizontal = 12.dp,
+                vertical = if (collapsed && !showCollapsedHeader) 2.dp else 8.dp,
+            ),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = when {
-                        paused -> "⏸ 讨论群已暂停（成员和设置都留着）"
-                        waiting -> "🙋 有成员在等你回答"
-                        busy -> "🗣 ${state?.currentSpeakerName.orEmpty()} 正在发言"
-                        status == GroupRunStatus.PAUSED -> "⏸ 已暂停，随时可以接着聊"
-                        status == GroupRunStatus.STOPPED -> "⏹ 已停止（说过的话都留着）"
-                        status == GroupRunStatus.FINISHED -> "✅ 这轮讨论已结束"
-                        else -> "💬 讨论群已就绪"
-                    },
-                    style = MaterialTheme.typography.titleSmall,
-                    maxLines = 1,
-                    // 收起时这一行是唯一可见内容，宁可截断成「🗣 xxx 正在发…」也不能换行；
-                    // 展开态保持原样（默认 Clip），免得"收起再展开"看着跟以前不一样
-                    overflow = if (collapsed) TextOverflow.Ellipsis else TextOverflow.Clip,
-                    modifier = Modifier.weight(1f),
-                )
-                if (!paused && state != null && state.turnsBudget > 0) {
-                    // v317：进度在收起态也保留（用户要的样式：状态 · 第 0/3 条）
+            if (!collapsed || showCollapsedHeader) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        text = "第 ${state.turnsInRun}/${state.turnsBudget} 条",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        text = when {
+                            paused -> "⏸ 讨论群已暂停（成员和设置都留着）"
+                            waiting -> "🙋 有成员在等你回答"
+                            busy -> "🗣 ${state?.currentSpeakerName.orEmpty()} 正在发言"
+                            status == GroupRunStatus.PAUSED -> "⏸ 已暂停，随时可以接着聊"
+                            status == GroupRunStatus.STOPPED -> "⏹ 已停止（说过的话都留着）"
+                            status == GroupRunStatus.FINISHED -> "✅ 这轮讨论已结束"
+                            else -> "💬 讨论群已就绪"
+                        },
+                        style = MaterialTheme.typography.titleSmall,
+                        maxLines = 1,
+                        // 收起时这一行是唯一可见内容，宁可截断成「🗣 xxx 正在发…」也不能换行；
+                        // 展开态保持原样（默认 Clip），免得"收起再展开"看着跟以前不一样
+                        overflow = if (collapsed) TextOverflow.Ellipsis else TextOverflow.Clip,
+                        modifier = Modifier.weight(1f),
                     )
-                }
-                // v317：折叠开关。用户拍板原话是「展开箭头」，所以给箭头；
-                // 但箭头不单独表意（▼/▲ 在小字号下容易被看成装饰），一律配文字。
-                // 用文字符号而不是图标组件：项目已有 ▶/⏹/🙋 先例，零新增依赖。
-                TextButton(onClick = onToggleCollapsed) {
-                    Text(
-                        text = if (collapsed) "▼ 展开" else "▲ 收起",
-                        style = MaterialTheme.typography.labelMedium,
-                    )
+                    if (!paused && state != null && state.turnsBudget > 0) {
+                        // v317：进度在收起态也保留（用户要的样式：状态 · 第 0/3 条）
+                        Text(
+                            text = "第 ${state.turnsInRun}/${state.turnsBudget} 条",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    // v317：折叠开关。用户拍板原话是「展开箭头」，所以给箭头；
+                    // 但箭头不单独表意（▼/▲ 在小字号下容易被看成装饰），一律配文字。
+                    // 用文字符号而不是图标组件：项目已有 ▶/⏹/🙋 先例，零新增依赖。
+                    TextButton(onClick = onToggleCollapsed) {
+                        Text(
+                            text = if (collapsed) "▼ 展开" else "▲ 收起",
+                            style = MaterialTheme.typography.labelMedium,
+                        )
+                    }
                 }
             }
 

@@ -104,9 +104,21 @@ fun AgentThreadPage(
     // activeModelId 从 v236 起就落库、也回传给主模型了，但界面一个字都不显示，
     // 用户因此完全看不出备用模型到底有没有换过人（真实反馈）。
     val settings by rememberUserSettingsState()
-    val activeModelName = thread?.activeModelId
+    // v1028：运行中优先用实时信号。落库值只有收尾才写，只认它等于「跑完才告诉你」。
+    val stage by manager.stageFlow.collectAsStateWithLifecycle()
+    val liveModelLabel = stage[threadId]?.modelLabel?.takeIf { it.isNotBlank() }
+    val storedModelName = thread?.activeModelId
         ?.let { raw -> runCatching { Uuid.parse(raw) }.getOrNull() }
         ?.let { settings.findModelById(it)?.displayLabel(settings.providers) }
+    // v1028：只有**终态**才允许回落到落库值。
+    // 非终态回落是撒谎：等待自动重试、或刚点「继续输出」到 MODEL_ACTIVE 落地之间，
+    // 落库值还是上一轮那个模型，界面却会标成「当前使用的模型」（审查抓到的实际窗口）。
+    // 终态且落库值缺失（停止/失败分支从不写 activeModelId）→ 退一步读最后一条 MODEL_ACTIVE 事件，
+    // 这样「跑挂了」也能知道刚才用的是谁 —— 那正是用户最想知道的时刻。
+    val eventModelName = events.lastOrNull { it.type == "MODEL_ACTIVE" }
+        ?.detail?.takeIf { it.isNotBlank() }
+    val activeModelName = liveModelLabel
+        ?: thread?.takeIf { it.status.isTerminal }?.let { storedModelName ?: eventModelName }
     val modelSwitched = events.any { it.type == "MODEL_FALLBACK" }
 
     // v238：跑了多久 / 多久没有新内容。
@@ -602,13 +614,17 @@ fun AgentThreadPage(
                             )
                         }
                         // v237：实际跑这次任务的模型（换过备用模型时特别标出来）
+                        // v1028：运行中显示「当前使用的模型」，收尾后仍用「实际跑的模型」——
+                        // 前者是实时值，后者是落库值，两者文案必须能区分。
                         if (activeModelName != null) {
                             HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+                            val running = thread?.status?.isTerminal == false
+                            val prefix = if (running) "当前使用的模型" else "实际跑的模型"
                             Text(
                                 text = if (modelSwitched) {
-                                    "实际跑的模型：$activeModelName（中途换过备用模型）"
+                                    "$prefix：$activeModelName（中途换过备用模型）"
                                 } else {
-                                    "实际跑的模型：$activeModelName"
+                                    "$prefix：$activeModelName"
                                 },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = if (modelSwitched) {
@@ -649,11 +665,15 @@ fun AgentThreadPage(
                 }
             }
 
+            // v1028：MODEL_ACTIVE 是「现在用谁」的标记，不是一次动作。
+            // 混进「N 项动作」会让计数虚高（每个候选、每次续跑都 +1），所以计数只算真正的工具动作。
+            // 模型切换记录本身仍照常出现在下面的列表里。
+            val actionEvents = events.filter { it.type != "MODEL_ACTIVE" }
             // 工具事件
             if (events.isNotEmpty()) {
                 item(key = "events_header") {
                     Text(
-                        text = "工具调用轨迹（${events.size} 项动作）",
+                        text = "工具调用轨迹（${actionEvents.size} 项动作）",
                         style = MaterialTheme.typography.labelMedium,
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.outline,

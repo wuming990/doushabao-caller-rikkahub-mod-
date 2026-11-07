@@ -16,6 +16,7 @@ import androidx.compose.ui.unit.dp
 import coil3.compose.AsyncImage
 import coil3.request.ImageRequest
 import coil3.svg.css
+import me.rerere.ai.provider.ProviderSetting
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.ui.hooks.rememberAvatarShape
 import me.rerere.rikkahub.ui.theme.LocalDarkMode
@@ -63,8 +64,12 @@ fun AutoAIIcon(
     modifier: Modifier = Modifier,
     loading: Boolean = false,
     color: Color = MaterialTheme.colorScheme.secondaryContainer,
+    providerSetting: ProviderSetting? = null,
 ) {
-    val path = remember(name) { computeAIIconByName(name) } ?: run {
+    // v1021: Only explicitly identified GeminiWeb models bypass legacy name-based branding.
+    val path = remember(name, providerSetting is ProviderSetting.GeminiWeb) {
+        computeAIIconByName(name, providerSetting)
+    } ?: run {
         TextAvatar(text = name, modifier = modifier, loading = loading, color = color)
         return
     }

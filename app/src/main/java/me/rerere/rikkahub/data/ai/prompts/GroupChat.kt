@@ -422,6 +422,47 @@ private fun UIMessage.onlyGroupUtteranceText(): UIMessage {
 }
 
 /**
+ * v1029：圆桌页在 Text part metadata 里的角色标记 key。
+ *
+ * 旧版本（v1028 及更早）还没有 `fromRoundTable` 字段，但圆桌页已经带这个标记；
+ * 过滤时把它当兜底判据，打开开关后旧对话也能生效，不需要迁移数据库。
+ */
+const val ROUND_TABLE_PAGE_META_ROLE = "rt_role"
+
+private fun UIMessage.isRoundTableDiscussionPage(): Boolean =
+    fromRoundTable || parts.any { part ->
+        part is UIMessagePart.Text &&
+            part.metadata?.containsKey(ROUND_TABLE_PAGE_META_ROLE) == true
+    }
+
+/**
+ * v1029：圆桌「讨论只保留发言正文」——直接复用群聊已经验证过的那套判定。
+ *
+ * 只影响**发给模型的那份请求**：圆桌页在对话里仍然保留搜索、工具与思考记录，
+ * 用户照样能回看；但带上这个开关后，后续请求只看正文与附件。
+ * 判定共用 [isGroupToolPart] / [isGroupReasoningPart]，所以以后补新的工具类型时
+ * 两边不会漂移。与群聊一样，返回新列表，绝不修改传入的那份。
+ */
+fun List<UIMessage>.withoutRoundTableToolParts(): List<UIMessage> = map { message ->
+    if (!message.isRoundTableDiscussionPage()) return@map message
+    val kept = message.parts.filterNot { part ->
+        isGroupToolPart(part) || isGroupReasoningPart(part)
+    }
+    if (kept == message.parts) return@map message
+    // tagRoundTablePage 在模型还没写正文时会插入 Text("") 当 metadata 载体。
+    // 只判 isEmpty() 会把这种空壳当成有内容，结果把空 assistant 消息发给服务商；
+    // 所以「只剩空白 Text」也必须换成占位。
+    if (kept.isEmpty() || kept.all { it is UIMessagePart.Text && it.text.isBlank() }) {
+        return@map message.copy(
+            parts = listOf(
+                UIMessagePart.Text("（这条圆桌发言只有思考过程与工具调用，正文为空）")
+            )
+        )
+    }
+    message.copy(parts = kept)
+}
+
+/**
  * v319：把「群组讨论期间产生的发言」里的工具调用与搜索结果摘掉，只留正文与推理。
  *
  * 给**主对话**拼上下文用：群里为了讨论去搜的东西，不该在解散群之后被当成主对话的

@@ -153,6 +153,26 @@ class StreamChunkHandler(
                 }
             }
 
+            is StreamChunk.TextSnapshot -> {
+                val index = textPartIndexes[chunk.id]
+                if (index == null || parts.getOrNull(index) !is UIMessagePart.Text) {
+                    copy(parts = parts + UIMessagePart.Text(chunk.text, chunk.metadata)).also {
+                        textPartIndexes[chunk.id] = parts.size
+                    }
+                } else {
+                    copy(parts = parts.toMutableList().apply {
+                        val text = get(index) as UIMessagePart.Text
+                        set(
+                            index,
+                            text.copy(
+                                text = chunk.text,
+                                metadata = chunk.metadata ?: text.metadata,
+                            )
+                        )
+                    })
+                }
+            }
+
             is StreamChunk.TextEnd -> this.also { textPartIndexes.remove(chunk.id) }
             is StreamChunk.ReasoningStart -> {
                 if (chunk.id in reasoningPartIndexes) {
@@ -183,6 +203,35 @@ class StreamChunkHandler(
                         val reasoning = get(index) as UIMessagePart.Reasoning
                         set(index, reasoning.copy(
                             reasoning = reasoning.reasoning + chunk.text,
+                            metadata = chunk.metadata ?: reasoning.metadata,
+                            reasoningType = chunk.reasoningType,
+                        ))
+                    })
+                }
+            }
+
+            // v1021: Replace only this stream's native-thought part; never append a full snapshot.
+            is StreamChunk.ReasoningSnapshot -> {
+                val index = reasoningPartIndexes[chunk.id]
+                if (chunk.text.isEmpty()) {
+                    if (index == null || parts.getOrNull(index) !is UIMessagePart.Reasoning) this
+                    else copy(parts = parts.toMutableList().apply { removeAt(index) }).also {
+                        forgetPartAt(index)
+                    }
+                } else if (index == null || parts.getOrNull(index) !is UIMessagePart.Reasoning) {
+                    copy(parts = parts + UIMessagePart.Reasoning(
+                        reasoning = chunk.text,
+                        createdAt = Clock.System.now(),
+                        finishedAt = null,
+                        metadata = chunk.metadata,
+                        reasoningType = chunk.reasoningType,
+                    )).also { reasoningPartIndexes[chunk.id] = parts.size }
+                } else {
+                    copy(parts = parts.toMutableList().apply {
+                        val reasoning = get(index) as UIMessagePart.Reasoning
+                        set(index, reasoning.copy(
+                            reasoning = chunk.text,
+                            finishedAt = null,
                             metadata = chunk.metadata ?: reasoning.metadata,
                             reasoningType = chunk.reasoningType,
                         ))
@@ -381,6 +430,20 @@ class StreamChunkHandler(
         }
     }
 
+    // v1021: Clearing withdrawn thoughts must also move the text/image indexes left by one.
+    private fun forgetPartAt(index: Int) {
+        for (indexes in listOf(textPartIndexes, reasoningPartIndexes, imagePartIndexes)) {
+            val entries = indexes.entries.iterator()
+            while (entries.hasNext()) {
+                val entry = entries.next()
+                when {
+                    entry.value == index -> entries.remove()
+                    entry.value > index -> entry.setValue(entry.value - 1)
+                }
+            }
+        }
+    }
+
     private fun UIMessage.updateServerTool(
         id: String,
         transform: (UIMessagePart.ServerTool) -> UIMessagePart.ServerTool,
@@ -421,7 +484,10 @@ data class RoundTiming(
  * 工具调用参数、图像同理 —— 它们都计入输出。只带用量或收尾信息的分片一律不算。
  */
 private fun StreamChunk.producesOutput(): Boolean = when (this) {
+    // v1021: An empty withdrawal is not the first generated token.
+    is StreamChunk.ReasoningSnapshot -> text.isNotEmpty()
     is StreamChunk.TextDelta,
+    is StreamChunk.TextSnapshot,
     is StreamChunk.ReasoningDelta,
     is StreamChunk.ToolCallDelta,
     is StreamChunk.ServerToolInputDelta,

@@ -62,7 +62,8 @@ import java.time.Duration
 /**
  * 显示消息的技术统计信息（如 token 使用量），点击查看详情
  *
- * 多轮工具调用时 usage 是各步累计值，行内只显示最后一次请求的上下文占用，累计值放在详情里。
+ * 官方的 usage 是各步累计值；二改主对话另存 cumulativeUsage 作为真实消耗总账。
+ * v1018：详情优先读累计账；行内上下文仍读最后一次请求，不把累计计费量当上下文大小。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -114,7 +115,7 @@ fun ChatMessageNerdLine(
                     }
                     if (stats.tps != null) {
                         StatsItem(
-                            icon = { StatsIcon(HugeIcons.Zap, stringResource(R.string.chat_message_usage_speed)) },
+                            icon = { StatsIcon(HugeIcons.Zap, stringResource(R.string.chat_message_usage_response_speed)) },
                             content = { Text(text = "${stats.tps.toFixed(1)} tok/s") }
                         )
                     }
@@ -185,14 +186,15 @@ private data class UsageSegment(val label: String, val tokens: Int, val color: C
  * 分母不含工具执行时间、不含用户审批等待。外面工具分两派，两行各对应一派：
  * 「速度」只算模型真正在吐字的时间（LM Studio / Cherry Studio 口径，不含首字等待）；
  * 「响应速度」从发出请求算到本轮收完（Claude Code 插件 / ccstatusline 口径，含首字等待）。
- * 取不到新账本时（旧聊天记录、非流式那一趟）退回官方原算法，旧消息不掉数。
+ * 取不到生成计时时，展开面板的「速度」行保留旧算法；
+ * v1018：底部仅取有计时的响应速度，老记录缺响应计时时不显示，不拿生成速度顶替。
  * v1007 的教训也保留：这些读数原来写在 `segments.forEach` 里面，缓存/输入/输出有几段
  * 就重复几遍（3 段 = 3 份「生成 / 响应 / 秒数」），最后一份被挤成竖排 —— 用户报「统计很杂乱」。
  * 所以**一条消息只能出现一次**，且面板与底部必须同源。
  */
 internal data class SpeedReadout(
     /**
-     * 「速度」行与底部小字：按精度依次兜底 —— 累计纯吐字 → 本条消息的生成耗时 → 墙钟。
+     * 「速度」行：按精度依次兜底 —— 累计纯吐字 → 本条消息的生成耗时 → 墙钟。
      *
      * 三审 P2：上一版只算墙钟，把旧消息本来就存着的 generationTimeMs 丢了，
      * 那会让旧消息的速度数凭空变慢（口径倒退）。
@@ -202,8 +204,8 @@ internal data class SpeedReadout(
     val responseTps: Float?,
     val seconds: Float?,
 ) {
-    /** 底部小字只有一个位置：优先纯吐字口径 */
-    val headlineTps: Float? get() = generationTps ?: responseTps
+    /** v1018：底部小字只显示响应速度；缺响应计时就不显示，不用生成速度冒充。 */
+    val headlineTps: Float? get() = responseTps
 
     companion object {
         /** 没有 finishedAt（还在跑）时返回 null，界面就不显示速度，不猜。 */
@@ -409,13 +411,16 @@ private data class NerdStats(
 
 private fun UIMessage.nerdStats(usage: TokenUsage): NerdStats {
     val last = lastRequestUsage() ?: usage
+    // v1018：与官方一样区分总消耗和最后一步上下文；二改总账在独立字段中，不能相加。
+    val total = cumulativeUsage ?: usage
     return NerdStats(
-        total = usage,
+        total = total,
         lastUsage = last,
         steps = displayedGenerationSteps(stepCount, cumulativeRequestCount),
         contextTokens = last.promptTokens + last.completionTokens,
         // v1014：与面板「速度」行同源（同一份 SpeedReadout），不再各算一套
-        tps = SpeedReadout.of(this, usage)?.headlineTps,
+        // v1018：按用户新要求，底部改为与面板「响应速度」行同源，累计分子也统一用 total。
+        tps = SpeedReadout.of(this, total)?.headlineTps,
     )
 }
 

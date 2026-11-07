@@ -135,6 +135,7 @@ val appModule = module {
             templateTransformer = get(),
             providerManager = get(),
             chatToolFactory = get(),
+            requestFactory = get(),
             // v2.5.0 合并保留：圆桌与子代理的工具组装仍直接使用这两个依赖
             localTools = get(),
             mcpManager = get(),

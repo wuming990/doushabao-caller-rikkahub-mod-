@@ -233,6 +233,7 @@ internal val SETTINGS_FIELDS: List<SettingsField<*, *>> = with(SettingsStore) {
         plain(AGENT_CONVERSATION_SEARCH, Settings::allowAgentConversationSearch) {
             copy(allowAgentConversationSearch = it)
         },
+        plain(AGENT_MCP, Settings::allowAgentMcp) { copy(allowAgentMcp = it) },
         plain(AGENT_MAX_STEPS, Settings::agentMaxSteps) { copy(agentMaxSteps = it) },
         plain(AGENT_ENABLED, Settings::enableAgentTools) { copy(enableAgentTools = it) },
         SettingsField(

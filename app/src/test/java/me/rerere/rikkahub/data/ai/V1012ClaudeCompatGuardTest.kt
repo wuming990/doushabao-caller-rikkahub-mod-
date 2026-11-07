@@ -483,8 +483,13 @@ class V1012ClaudeCompatGuardTest {
         // v1016：又一次踩到这条固定税 —— 只升了 build.gradle.kts 没同步这里，门禁②会直接红。
         // v1017：本轮两处一起改（1017 / 3.1.1-mod15），别再漏。
         // 记进手册：升 versionCode 必须同时改这里，两处一起改才算改完。
-        assertTrue("版本号必须前进，否则用户装不上", gradle.contains("versionCode = 1017"))
-        assertTrue(gradle.contains("versionName = \"3.1.1-mod15\""))
+        // v1025：又踩到了 —— 只改了 build.gradle.kts 没同步这里，全量测试直接红在这一条。
+        // 说明这条「固定税」光靠注释提醒不住，必须把「两处一起改」做成能被机器发现的形式。
+        // v1026：起用机器门禁 —— full_chain 在编译之前就会扫所有 versionCode/versionName
+        // 字面断言并与本次发布号比对，漏改会在几十秒内被拦下，不用等一轮全量测试。
+        // v1029：三处一起改（1029 / 3.1.1-mod27）。机器门禁已在岗，漏改会在编译前被拦。
+        assertTrue("版本号必须前进，否则用户装不上", gradle.contains("versionCode = 1029"))
+        assertTrue(gradle.contains("versionName = \"3.1.1-mod27\""))
         // 三依赖保持官方版本，不许锁回旧版
         val libs = source("gradle/libs.versions.toml")
         assertTrue(libs.contains("haze"))

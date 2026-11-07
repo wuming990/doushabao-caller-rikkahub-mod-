@@ -371,6 +371,24 @@ private fun ChatPageContent(
         config.memberModelIds.count { it in existing } >= GroupChatConfig.MIN_MEMBERS
     }
     val agentThreads by vm.agentThreads.collectAsStateWithLifecycle()
+    val manualCompressionJob by vm.manualCompressionJob.collectAsStateWithLifecycle()
+    // v1023：只上移显示状态，不碰代理任务；换对话时默认收起。
+    var agentPanelExpanded by remember(conversation.id) { mutableStateOf(false) }
+    val agentPanelAvailable = setting.enableAgentTools && assistant.enableAgentTools &&
+        visibleAgentThreads(agentThreads).isNotEmpty()
+    // v1023：旧组件移出页面后会忘记展开态；保留这一点，清完/关闭后下批代理默认收起。
+    LaunchedEffect(conversation.id, agentPanelAvailable) {
+        if (!agentPanelAvailable) agentPanelExpanded = false
+    }
+    val onToggleGroupPanel: () -> Unit = {
+        vm.updateSettings { current ->
+            current.copy(
+                displaySetting = current.displaySetting.copy(
+                    groupPanelCollapsed = !current.displaySetting.groupPanelCollapsed
+                )
+            )
+        }
+    }
     // v209：圆桌确认框的待确认请求；非空时弹框。放在这一层，底部面板关掉也不会跟着消失。
     var roundTableRequest by remember { mutableStateOf<RoundTableConfirmRequest?>(null) }
 
@@ -473,6 +491,8 @@ private fun ChatPageContent(
                         if (assistant.enableAgentTools) {
                             AgentActivityPanel(
                                 threads = agentThreads,
+                                expanded = agentPanelExpanded,
+                                onToggleExpanded = { agentPanelExpanded = !agentPanelExpanded },
                                 onStop = { vm.stopAgent(it) },
                                 onMerge = { vm.mergeAgentReport(it) },
                                 onClose = { vm.closeAgent(it) },
@@ -569,16 +589,27 @@ private fun ChatPageContent(
                         // 偏好存 DisplaySetting.groupPanelCollapsed —— 全局记住，换对话/重启都保持；
                         // 走设置 JSON，不动数据库（AppDatabase 必须停在 25）。
                         collapsed = setting.displaySetting.groupPanelCollapsed,
-                        onToggleCollapsed = {
-                            vm.updateSettings { 
-                                setting.copy(
-                                    displaySetting = setting.displaySetting.copy(
-                                        groupPanelCollapsed = !setting.displaySetting.groupPanelCollapsed
-                                    )
-                                )
-                             }
-                        },
+                        onToggleCollapsed = onToggleGroupPanel,
+                        showCollapsedHeader = false,
                     )
+                    // v1023：收起的两项共用一排小入口；只有一项也按内容收紧，不铺满底板。
+                    CompactActivityBar(
+                        agents = if (setting.enableAgentTools && assistant.enableAgentTools && !agentPanelExpanded) {
+                            compactAgentActivitySummary(agentThreads)
+                        } else null,
+                        group = if (setting.displaySetting.groupPanelCollapsed) {
+                            compactGroupActivitySummary(
+                                state = groupRun,
+                                hasConfig = groupConfig != null,
+                                paused = groupConfig?.enabled == false,
+                                membersEnough = groupMembersEnough,
+                            )
+                        } else null,
+                        onExpandAgents = { agentPanelExpanded = true },
+                        onExpandGroup = onToggleGroupPanel,
+                    )
+                    // v1024：压缩在本对话后台继续，不盖住侧栏和新建对话入口。
+                    ManualCompressionNotice(manualCompressionJob)
                     ChatInput(
                         onStartVoiceMode = if (
                             setting.getSelectedASRProvider()?.supportsServerVadVoiceMode == true &&
@@ -1133,6 +1164,7 @@ private fun ChatFilesPickerSheet(
         .collectAsStateWithLifecycle(initialValue = emptyList())
     var showInjectionSheet by remember { mutableStateOf(false) }
     var showCompressDialog by remember { mutableStateOf(false) }
+    val manualCompressionJob by vm.manualCompressionJob.collectAsStateWithLifecycle()
     var showFileBrowser by remember { mutableStateOf(false) }
     var showImageTargetDialog by remember { mutableStateOf(false) }
     var imageTarget by remember { mutableStateOf<ChatImageTarget>(ChatImageTarget.AiOnly) }
@@ -1366,12 +1398,13 @@ private fun ChatFilesPickerSheet(
             state = inputState,
             assistant = assistant,
             mcpManager = vm.mcpManager,
+            runningCompressionJob = manualCompressionJob,
             onCompressContext = { additionalPrompt, modelSource, customPrompt ->
                 vm.handleCompressContext(additionalPrompt, modelSource, customPrompt)
             },
             // v268：经典压缩（官方旧版流程）
-            onCompressContextClassic = { additionalPrompt, targetTokens, keepRecentMessages ->
-                vm.handleCompressContextClassic(additionalPrompt, targetTokens, keepRecentMessages)
+            onCompressContextClassic = { additionalPrompt, keepRecentMessages ->
+                vm.handleCompressContextClassic(additionalPrompt, keepRecentMessages)
             },
             // v323：必须走 VM（ChatService.updateChatAssistant → withoutConversationFields 剥掉会话字段）。
             // 旧写法直接把「会话视角助手」整份写回 settings.assistants：以前 assistant 是全局助手

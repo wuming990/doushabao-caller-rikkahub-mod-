@@ -1999,20 +1999,22 @@
 <string name="round_table_status_phase_rebuttal">Round table is waiting for the rebuttal round…</string>
 <string name="round_table_status_phase_finished">Round table finished</string>
 <string name="round_table_unknown_model">Unknown model</string>
-<string name="agent_tools_section_title">Subagents (Codex style)</string>
+<string name="agent_tools_section_title">Subagents</string>
 <string name="agent_tools_section_summary_on">On · the main model can dispatch subagents by itself</string>
 <string name="agent_tools_section_summary_off">Off · does not affect the round table</string>
 <string name="agent_tools_section_desc">All subagent options live here, separate from the round table. Turning this off hides the subagent activity panel as well.</string>
-<string name="agent_tools_switch_title">Subagents (Codex style)</string>
+<string name="agent_tools_switch_title">Subagents</string>
 <string name="agent_tools_switch_desc">Let the main model spawn independent read-only subagents in normal chat. Completely separate from the round table.</string>
 <string name="agent_tools_assistant_switch_title">Enable for the current assistant</string>
 <string name="agent_tools_assistant_switch_desc">Per-assistant switch (currently: %1$s). Both this and the master switch above must be on. Turn it off and this assistant loses the subagent panel and the spawn tools, while your other assistants keep them.</string>
 <string name="agent_tools_memory_title">Let subagents search past chats</string>
+<string name="agent_tools_mcp_title">Let subagents call MCP tools</string>
+<string name="agent_tools_mcp_desc">Off by default; with it off, subagents behave exactly as before. When on, a subagent can call the MCP servers you enabled for this assistant. MCP tools really do run against external services - they may write files, change external data, or cost money - and they are NOT covered by the usual subagent limits (no shell, no compile, no delete), so only turn this on for servers you trust. Which servers are available is still decided by the MCP list on the assistant; this switch does not add any new server. Four common reasons a tool stays unavailable even when this is on: tools you marked as requiring approval (a subagent has no approve button, so mounting one would just hang), servers whose name contains non-ASCII characters or symbols (the main chat raises an error for those, a subagent skips that server instead), and tools whose composed name exceeds the provider length limit - sending one would get the whole request rejected - and servers that appear more than once in your settings with the same id (the connection layer only keeps one of them, so mounting those tools could send external actions to a server you never configured; every tool on such a server is skipped, please remove the duplicate). The subagent says so in its report whenever any of these happen. The main chat and the round table are unaffected either way.</string>
 <string name="agent_tools_memory_desc">Off by default. When on, a subagent can full-text search your past conversations (across every assistant) to answer questions like \"have we hit this bug before\" or \"why was it decided this way\". The matched conversation content is sent to whichever model the subagent runs on. The main chat is unaffected either way.</string>
 <string name="agent_tools_model_title">Subagent model</string>
 <string name="agent_tools_model_follow_main">Follow main assistant</string>
 <string name="agent_tools_concurrent_title">Max concurrent agents</string>
-<string name="agent_tools_concurrent_desc">Upper limit of subagents running at the same time (1-8). Takes effect immediately.</string>
+<string name="agent_tools_concurrent_desc">Maximum simultaneous subagents. Enter a number directly; 0 means unlimited. Existing running tasks are not stopped when you change this value.</string>
 <string name="agent_tools_role_default">Default role</string>
 <string name="agent_tools_role_explorer">Explorer role</string>
 <string name="agent_tools_role_reviewer">Reviewer role</string>
@@ -2029,21 +2031,21 @@
 <string name="agent_tools_chain_warn">Only 1 model: a failure stops the subagent instead of switching. Add at least one fallback model.</string>
 <string name="agent_tools_chain_role_note">Shown for the default role. If a role has its own model, that model replaces the first step for that role; the rest of the order stays the same.</string>
 <string name="agent_tools_timeout_title">Stuck detection</string>
-<string name="agent_tools_timeout_desc">If a subagent produces nothing new for this long, it is treated as stuck and that attempt is stopped, then the normal retry and model fallback path applies. Only idle time counts: a subagent that keeps producing output is never cut off by total runtime. Tool execution time is excluded and handled by "Tool time limit" below. Set to 0 to use the default of 10 minutes.</string>
+<string name="agent_tools_timeout_desc">A subagent is stuck only after this many minutes with no new output. Tool execution is timed separately. Enter 0 to use the original 10-minute default.</string>
 <string name="agent_tools_timeout_unlimited">Default 10 min</string>
 <string name="agent_tools_timeout_minutes">%1$d minutes</string>
 <string name="agent_tools_tool_timeout_title">Tool time limit</string>
-<string name="agent_tools_tool_timeout_desc">How long a single tool call (read file, search, web lookup) may run. Tools execute one at a time and produce no output while running, so this time does NOT count as idle and is governed here instead. Raise it for slow searches; lower it to give up sooner.</string>
+<string name="agent_tools_tool_timeout_desc">Maximum minutes for one subagent tool call. Enter a positive integer directly; there is no preset 60-minute cap. Tool execution does not count as model silence.</string>
 <string name="agent_tools_tool_timeout_minutes">%1$d minutes</string>
 <string name="agent_tools_read_limit_title">Sub-agent tool reply limit</string>
-<string name="agent_tools_read_limit_desc">How much a single tool reply may carry for sub-agents (file reads, search results). Affects sub-agents only — the main chat is left exactly as upstream. Sub-agents have no terminal, so whatever gets cut off is lost to them and they must read on in several chunks. Raise it to finish big files in fewer steps; lower it if your sub-agent model has a small context window.</string>
+<string name="agent_tools_read_limit_desc">Maximum content from one subagent tool result, in KB. Enter a number directly; 0 means unlimited. Only subagents are affected. Large results still need to fit the selected model context window.</string>
 <string name="agent_tools_read_limit_kb">%1$d KB</string>
 <string name="agent_tools_resume_max_title">Auto-continue attempts</string>
-<string name="agent_tools_resume_max_desc">How many times a subagent may pick itself back up after being cut off mid-sentence, and also how many times an errored attempt is retried on the SAME model before falling back to the next one (a silent timeout switches immediately). Set to 0 to disable auto-retry entirely, so nothing continues without you asking.</string>
+<string name="agent_tools_resume_max_desc">Automatic continuation and same-model retry count. Enter a number directly; 0 disables automatic continuation. Exhausting this count still follows your existing fallback-model rules.</string>
 <string name="agent_tools_resume_max_off">Never auto-continue</string>
 <string name="agent_tools_resume_max_times">%1$d time(s)</string>
 <string name="agent_tools_max_steps_title">Steps per subagent run</string>
-<string name="agent_tools_max_steps_desc">One step = one model call (including the tools it wants to use that round). This cap only exists to stop a model from looping forever and burning money; hitting it is not a failure — the run is marked unfinished and picked up from where it stopped. Coding subagents automatically get 1.5x this number.</string>
+<string name="agent_tools_max_steps_desc">Model calls per subagent attempt. Enter a number directly; 0 means unlimited. Writable subagents keep the existing 1.5-times allowance. Your existing setting is kept.</string>
 <string name="agent_tools_max_steps_value">%1$d steps</string>
 <string name="round_table_setting_title">Round table (multi-model proposals)</string>
 <string name="round_table_setting_desc">Runs as "one main model decides, the others hunt for blind spots": pin down the task and facts, then every model and the main model draft in parallel, then one model rebuts claim by claim, and finally the main model decides after seeing everything. Each step is one page you can flip through. Look-up only: never edits files or runs commands.</string>
@@ -2056,6 +2058,8 @@
 <string name="round_table_summary_prompt_hint">Leave empty to use the built-in prompt</string>
 <string name="round_table_allow_readonly_tools">Allow look-up while proposing</string>
 <string name="round_table_allow_readonly_tools_desc">Lets every model use web search and read workspace files, so proposals are based on real material. Costs search quota and tokens per model. Actions that change anything are always disabled.</string>
+<string name="round_table_body_only_title">Keep only the spoken text</string>
+<string name="round_table_body_only_desc">When on, later turns only carry the spoken content of round-table pages saved to the main chat: reasoning, fetched source text and search results are no longer sent as context. The round-table page itself still keeps those records so you can review what was searched, and images/files are kept. Off = exactly as before.</string>
 <string name="round_table_add_member">Add model</string>
 <string name="round_table_remove_member">Remove</string>
 <string name="round_table_member_missing">Deleted model</string>
@@ -2418,4 +2422,10 @@
   <string name="workspace_ssh_editor_trust_new_key">Trust new key</string>
   <string name="workspace_ssh_editor_username">Username</string>
   <string name="workspace_ssh_editor_working_dir">Working directory</string>
+    <string name="agent_numeric_unlimited">Unlimited</string>
+    <string name="agent_numeric_input_hint">Enter a whole number. See the setting description for the meaning of 0.</string>
+    <string name="agent_numeric_positive_hint">Enter a positive whole number.</string>
+    <string name="agent_numeric_input_error">Enter a valid whole number within the supported integer range.</string>
+    <string name="chat_page_compress_background">Continue in background</string>
+    <string name="chat_page_compress_background_status">Compressing this conversation; you can switch chats</string>
 </resources>

@@ -11,24 +11,29 @@ import kotlinx.serialization.json.put
 import me.rerere.ai.core.InputSchema
 import me.rerere.ai.core.Tool
 import me.rerere.ai.ui.UIMessagePart
+import me.rerere.rikkahub.agent.model.AgentModelChoice
 import me.rerere.rikkahub.agent.model.AgentReport
 import me.rerere.rikkahub.agent.model.AgentErrorKind
 import me.rerere.rikkahub.agent.model.AgentPipelineStage
 import me.rerere.rikkahub.agent.model.AgentRole
 import me.rerere.rikkahub.agent.model.AgentSpawnRequest
 import me.rerere.rikkahub.agent.model.AgentVerdict
+import me.rerere.rikkahub.agent.model.resolveAgentModelRef
 // v321：这里不再引用裸常量 AGENT_RESUME_TOTAL_MAX —— 上限只有一个算法
 // （AgentThreadManager.effectiveResumeTotalMax），工具层一律通过 manager.resumeTotalMax() 取，
 // 所以这个 import 是多余的，留着就是「还有第二把尺子」的旧痕。
 import me.rerere.rikkahub.agent.runtime.AgentLimitReachedException
 import me.rerere.rikkahub.agent.runtime.AgentThreadManager
+import me.rerere.rikkahub.data.datastore.agentConcurrencyLabel
 
 /**
- * v218：主模型控制子代理的工具（Codex 风格）。v235 起 7 个，v236 起 8 个。
+ * v218：主模型控制子代理的工具（Codex 风格）。v235 起 7 个，v236 起 8 个，v1029 起 9 个。
  *
  * 只装配进普通聊天（sendMessage 路径），圆桌不装配（依赖边界测试守护）。
  * 子代理本身拿不到这些工具（禁止递归派发，第一版深度=0）。
  *
+ * - list_agent_models（v1029）：列出「默认子代理模型 + 备用模型 1~3」的可点名引用；
+ *   主模型据此用 model_ref 自主选择某一个备用模型，不必猜 UUID。
  * - spawn_agent：创建独立线程并立即返回 thread_id（不等待）
  * - wait_agents：等待若干线程并返回压缩报告摘要
  * - list_agents：列出本会话的代理线程
@@ -66,15 +71,23 @@ fun createAgentControlTools(
      * 会**明确报错**而不是悄悄降级成没有上文 —— 主模型必须知道自己没拿到。
      */
     fullContextProvider: (suspend (Int) -> String?)? = null,
+    /**
+     * v1029：主模型可点名的子代理模型清单（默认 + 备用 1~3）。
+     *
+     * 空列表 = 旧行为：spawn_agent 仍可用 model_id（精确 UUID）或什么都不传。
+     * 由 ChatService 按当前 Settings 组装；agent 包不反向依赖设置层。
+     */
+    agentModelCatalog: List<AgentModelChoice> = emptyList(),
 ): List<Tool> = listOf(
-    createSpawnTool(conversationId, manager, workspaceId, fullContextProvider),
+    createSpawnTool(conversationId, manager, workspaceId, fullContextProvider, agentModelCatalog),
+    createListAgentModelsTool(agentModelCatalog),
     createWaitTool(manager),
     createListTool(conversationId, manager),
     createSendMessageTool(manager),
     createStopTool(manager),
     createCloseTool(manager),
-    createResumeTool(conversationId, manager),
-    createPipelineTool(conversationId, manager, workspaceId, fullContextProvider),
+    createResumeTool(conversationId, manager, agentModelCatalog),
+    createPipelineTool(conversationId, manager, workspaceId, fullContextProvider, agentModelCatalog),
 )
 
 /** v239：没给 `full_context_max_chars` 时用的默认字符上限 */
@@ -139,18 +152,110 @@ private fun kotlinx.serialization.json.JsonObjectBuilder.putFullContextParams() 
     })
 }
 
+/**
+ * v1029：给工具描述用的一行模型清单。
+ *
+ * 放在 spawn_agent / run_agent_pipeline 的 description 里，主模型不用额外调用
+ * 就能看到「默认是谁、备用 1~3 是谁」，再用 model_ref 点名。
+ */
+private fun agentModelCatalogHint(catalog: List<AgentModelChoice>): String =
+    if (catalog.isEmpty()) {
+        " No subagent models are configured; ask the user to set a subagent model and backup models in the app first."
+    } else {
+        " Available subagent models (pass one as model_ref): " +
+            catalog.joinToString("; ") { "${it.ref} = ${it.label}" } +
+            ". Match the user's model name to the label, then pass that ref."
+    }
+
+/**
+ * v1029：把 model_ref 解析成真实模型 id。
+ *
+ * - 只给 ref：按清单解析；未知 ref 明确报错，并列出可用 ref；
+ * - 只给 model_id：保持旧行为，原样返回；
+ * - 两个都给：ref 优先（ref 是给主模型看的稳定名字，model_id 是精确 UUID 的旧入口）。
+ */
+private fun resolveModelForTool(
+    catalog: List<AgentModelChoice>,
+    modelRef: String?,
+    modelId: String?,
+): Result<String?> {
+    val ref = modelRef?.trim()?.takeIf { it.isNotEmpty() }
+    if (ref == null) {
+        return Result.success(modelId?.trim()?.takeIf { it.isNotEmpty() })
+    }
+    val choice = resolveAgentModelRef(catalog, ref)
+        ?: return Result.failure(
+            IllegalArgumentException(
+                "unknown model_ref '$ref'; available: " +
+                    catalog.joinToString(", ") { it.ref }.ifBlank { "(none configured)" } +
+                    ". Call list_agent_models for names."
+            )
+        )
+    return Result.success(choice.modelId)
+}
+
+/**
+ * v1029：把「默认子代理模型 + 备用模型 1~3」交给主模型。
+ *
+ * 只读，不调用任何模型、不改设置。返回 model_id 是为了让主模型在需要时还能走
+ * 旧的精确 UUID 入口；正常使用应该用 ref。
+ */
+private fun createListAgentModelsTool(
+    catalog: List<AgentModelChoice>,
+) = Tool(
+    name = "list_agent_models",
+    description = "List the subagent models configured in the app: the default subagent model " +
+        "and up to three backup models. Use the returned ref as model_ref when calling " +
+        "spawn_agent, run_agent_pipeline, or resume_agent. Read-only: never changes settings.",
+    parameters = {
+        InputSchema.Obj(
+            properties = buildJsonObject {},
+        )
+    },
+    execute = {
+        val models = catalog.map { choice ->
+            buildJsonObject {
+                put("ref", choice.ref)
+                put("label", choice.label)
+                put("model_id", choice.modelId)
+            }
+        }
+        listOf(
+            UIMessagePart.Text(
+                buildJsonObject {
+                    put("models", JsonArray(models))
+                    put(
+                        "hint",
+                        "Pass a ref as model_ref. Prefer ref over the exact model_id UUID. " +
+                            "If a backup is not listed, it is not configured in settings.",
+                    )
+                    if (catalog.isEmpty()) {
+                        put(
+                            "note",
+                            "No subagent models are configured. Set a subagent model and " +
+                                "backup models in the app first.",
+                        )
+                    }
+                }.toString()
+            )
+        )
+    },
+)
+
 private fun createSpawnTool(
     conversationId: String,
     manager: AgentThreadManager,
     workspaceId: String?,
     fullContextProvider: (suspend (Int) -> String?)?,
+    agentModelCatalog: List<AgentModelChoice>,
 ) = Tool(
     name = "spawn_agent",
     description = "Create a new subagent thread for an independent task and return its thread_id immediately. " +
         "The subagent runs in its own thread with read-only workspace tools (list/find/search/read); " +
         "it cannot see the full main conversation or other agents. Use wait_agents to collect the report. " +
-        "Do not exceed the configured concurrency limit (currently ${manager.maxConcurrent}); " +
+        "Do not exceed the configured concurrency limit (currently ${agentConcurrencyLabel(manager.maxConcurrent)}); " +
         "spawn_agent returns an error with max_concurrent when the limit is reached." +
+        agentModelCatalogHint(agentModelCatalog) +
         if (workspaceId.isNullOrBlank()) {
             " NOTE: no workspace is bound to the current assistant, so subagents cannot read any file this time."
         } else {
@@ -175,7 +280,16 @@ private fun createSpawnTool(
                 })
                 put("model_id", buildJsonObject {
                     put("type", "string")
-                    put("description", "Optional model id override. Defaults to the current assistant's model.")
+                    put("description", "Optional exact model UUID override. Prefer model_ref; model_id is kept for advanced/backward-compatible use.")
+                })
+                put("model_ref", buildJsonObject {
+                    put("type", "string")
+                    put(
+                        "description",
+                        "Optional model reference from list_agent_models: default, fallback_1, fallback_2, " +
+                            "fallback_3. Use this to run a specific backup model. Takes precedence over model_id. " +
+                            "If omitted, the normal subagent model chain is used.",
+                    )
                 })
                 put("context_summary", buildJsonObject {
                     put("type", "string")
@@ -209,6 +323,22 @@ private fun createSpawnTool(
         val role = params["role"]?.jsonPrimitive?.contentOrNull?.let { raw ->
             runCatching { AgentRole.valueOf(raw.uppercase()) }.getOrNull()
         } ?: AgentRole.DEFAULT
+        // v1029：主模型可以点名默认模型或某个备用模型。未知 ref 必须明确报错，
+        // 不能静默退回默认模型 —— 否则主模型以为自己选上了，实际没选。
+        val resolvedModel = resolveModelForTool(
+            catalog = agentModelCatalog,
+            modelRef = params["model_ref"]?.jsonPrimitive?.contentOrNull,
+            modelId = params["model_id"]?.jsonPrimitive?.contentOrNull,
+        )
+        if (resolvedModel.isFailure) {
+            return@Tool listOf(
+                UIMessagePart.Text(
+                    buildJsonObject {
+                        put("error", resolvedModel.exceptionOrNull()?.message ?: "invalid model_ref")
+                    }.toString()
+                )
+            )
+        }
         // v239：完整上文拿不到就必须明确报错，不能悄悄降级成「没有上文」
         val contextSummary = resolveContextSummary(params, fullContextProvider)
             .getOrElse { error ->
@@ -224,7 +354,7 @@ private fun createSpawnTool(
             conversationId = conversationId,
             task = task,
             role = role,
-            modelId = params["model_id"]?.jsonPrimitive?.contentOrNull,
+            modelId = resolvedModel.getOrNull(),
             // v220 修复：必须把当前助手绑定的工作区透传给子代理，
             // 否则 createAgentReadOnlyTools 会因 workspaceId 为空返回空工具列表，
             // 子代理将完全读不到任何文件（v219 的真实缺陷）。
@@ -410,12 +540,14 @@ private fun agentTaskPreview(task: String): String {
 private fun createResumeTool(
     conversationId: String,
     manager: AgentThreadManager,
+    agentModelCatalog: List<AgentModelChoice>,
 ) = Tool(
     name = "resume_agent",
     description = "Resume a truncated, stopped, interrupted or failed agent thread from where it " +
         "left off. Content produced before the interruption is preserved and not regenerated. " +
         "Use it when wait_agents reports can_resume=true, typically after a recoverable upstream " +
-        "error (rate limit, 5xx, connection reset). Fails if the thread cannot be resumed.",
+        "error (rate limit, 5xx, connection reset). Fails if the thread cannot be resumed." +
+        agentModelCatalogHint(agentModelCatalog),
     parameters = {
         InputSchema.Obj(
             properties = buildJsonObject {
@@ -434,10 +566,18 @@ private fun createResumeTool(
                     put("type", "string")
                     put(
                         "description",
-                        "Optional: switch to this model and continue from where it stopped. " +
-                            "Unlike a plain resume, this also works on a thread that is still " +
-                            "running: it stops the current generation first, keeps everything " +
-                            "already produced, then hands the rest to the new model.",
+                        "Optional exact model UUID. Prefer model_ref. Switching also works on a " +
+                            "thread that is still running: it stops the current generation first, " +
+                            "keeps everything already produced, then hands the rest to the new model.",
+                    )
+                })
+                put("model_ref", buildJsonObject {
+                    put("type", "string")
+                    put(
+                        "description",
+                        "Optional model reference from list_agent_models: default, fallback_1, " +
+                            "fallback_2, fallback_3. Takes precedence over model_id. Use it to " +
+                            "continue the thread on a specific backup model.",
                     )
                 })
             },
@@ -447,8 +587,24 @@ private fun createResumeTool(
     execute = {
         val threadId = it.jsonObject["thread_id"]?.jsonPrimitive?.contentOrNull.orEmpty()
         val extra = it.jsonObject["extra_instruction"]?.jsonPrimitive?.contentOrNull
-        // v241：带 model_id 就是「换个模型接着跑」，这条路允许对**还在跑**的线程用
-        val modelId = it.jsonObject["model_id"]?.jsonPrimitive?.contentOrNull?.trim()
+        // v1029：主模型可以用 model_ref 点名备用模型接着跑；未知 ref 明确报错，不静默换人。
+        val resolvedModel = resolveModelForTool(
+            catalog = agentModelCatalog,
+            modelRef = it.jsonObject["model_ref"]?.jsonPrimitive?.contentOrNull,
+            modelId = it.jsonObject["model_id"]?.jsonPrimitive?.contentOrNull,
+        )
+        if (resolvedModel.isFailure) {
+            return@Tool listOf(
+                UIMessagePart.Text(
+                    buildJsonObject {
+                        put("error", resolvedModel.exceptionOrNull()?.message ?: "invalid model_ref")
+                        put("thread_id", threadId)
+                    }.toString()
+                )
+            )
+        }
+        // v241：带模型就是「换个模型接着跑」，这条路允许对**还在跑**的线程用
+        val modelId = resolvedModel.getOrNull()
         val switching = !modelId.isNullOrBlank()
         if (threadId.isBlank()) {
             return@Tool listOf(UIMessagePart.Text("{\"error\":\"thread_id is required\"}"))
@@ -687,6 +843,7 @@ private fun createPipelineTool(
     manager: AgentThreadManager,
     workspaceId: String?,
     fullContextProvider: (suspend (Int) -> String?)?,
+    agentModelCatalog: List<AgentModelChoice>,
 ) = Tool(
     name = "run_agent_pipeline",
     description = "Run a sequential subagent pipeline in one call and return only the summary. " +
@@ -697,6 +854,7 @@ private fun createPipelineTool(
         "verdict=pass, or when a stage fails, is stopped, or times out. " +
         "Subagents never get a shell and never compile: run the build and the tests yourself " +
         "after the pipeline returns." +
+        agentModelCatalogHint(agentModelCatalog) +
         if (workspaceId.isNullOrBlank()) {
             " NOTE: no workspace is bound to the current assistant, so subagents cannot read or write any file."
         } else {
@@ -709,8 +867,9 @@ private fun createPipelineTool(
                     put("type", "array")
                     put(
                         "description",
-                        "Ordered stages. Each item: {task (required), role, model_id, " +
+                        "Ordered stages. Each item: {task (required), role, model_ref, model_id, " +
                             "writable_paths (array), gate (boolean)}. " +
+                            "Prefer model_ref (default, fallback_1, fallback_2, fallback_3) over model_id. " +
                             "Set gate=true on a reviewer stage so its verdict decides whether to continue.",
                     )
                     put("items", buildJsonObject {
@@ -750,19 +909,39 @@ private fun createPipelineTool(
                     )
                 )
             }
-        val stages = rawStages.mapNotNull { element ->
+        val stageErrors = mutableListOf<String>()
+        val stages = rawStages.mapIndexedNotNull { index, element ->
             val obj = element.jsonObject
             val task = obj["task"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
-            if (task.isBlank()) return@mapNotNull null
+            if (task.isBlank()) return@mapIndexedNotNull null
+            // v1029：每一棒都可以点名默认/备用模型；未知 ref 在开跑前就报错，不能跑一半才发现。
+            val resolvedModel = resolveModelForTool(
+                catalog = agentModelCatalog,
+                modelRef = obj["model_ref"]?.jsonPrimitive?.contentOrNull,
+                modelId = obj["model_id"]?.jsonPrimitive?.contentOrNull,
+            )
+            if (resolvedModel.isFailure) {
+                stageErrors += "stage ${index + 1}: ${resolvedModel.exceptionOrNull()?.message}"
+                return@mapIndexedNotNull null
+            }
             AgentPipelineStage(
                 task = task,
                 role = obj["role"]?.jsonPrimitive?.contentOrNull
                     ?.let { raw -> runCatching { AgentRole.valueOf(raw.uppercase()) }.getOrNull() }
                     ?: AgentRole.DEFAULT,
-                modelId = obj["model_id"]?.jsonPrimitive?.contentOrNull,
+                modelId = resolvedModel.getOrNull(),
                 writablePaths = obj.stringList("writable_paths"),
                 gate = obj["gate"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull() ?: false,
                 contextSummary = sharedContext,
+            )
+        }
+        if (stageErrors.isNotEmpty()) {
+            return@Tool listOf(
+                UIMessagePart.Text(
+                    buildJsonObject {
+                        put("error", stageErrors.joinToString("; "))
+                    }.toString()
+                )
             )
         }
         if (stages.isEmpty()) {

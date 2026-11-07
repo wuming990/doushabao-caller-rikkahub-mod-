@@ -207,9 +207,9 @@ fun SettingAboutPage() {
                     val contentColor = MaterialTheme.colorScheme.onTertiaryContainer
                     CardGroup {
                         item(
-                            onClick = { context.openUrl("https://rikka-ai.com/") },
+                            onClick = { context.openUrl("https://github.com/wuming990/doushabao-caller-rikkahub-mod-") },
                             leadingContent = { CardGroupIcon(HugeIcons.Earth, containerColor = containerColor, contentColor = contentColor) },
-                            supportingContent = { Text("https://rikka-ai.com") },
+                            supportingContent = { Text("https://github.com/wuming990/doushabao-caller-rikkahub-mod-") },
                             headlineContent = { Text(stringResource(R.string.about_page_website)) },
                         )
                         item(

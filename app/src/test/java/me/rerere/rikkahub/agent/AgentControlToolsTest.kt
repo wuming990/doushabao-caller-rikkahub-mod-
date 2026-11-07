@@ -16,6 +16,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import me.rerere.rikkahub.agent.model.AgentEvent
 import me.rerere.rikkahub.agent.model.AgentMessage
+import me.rerere.rikkahub.agent.model.AgentModelChoice
 import me.rerere.rikkahub.agent.model.AgentReport
 import me.rerere.rikkahub.agent.model.AgentThread
 import me.rerere.rikkahub.agent.model.AgentThreadStatus
@@ -30,7 +31,8 @@ import org.junit.Test
 
 /**
  * v218：第 3 阶段门禁测试（控制工具，假后端，不调用任何模型）。
- * v235 起 7 个工具，v236 起 8 个（新增 run_agent_pipeline）。
+ * v235 起 7 个工具，v236 起 8 个（新增 run_agent_pipeline），v1029 起 9 个
+ * （新增 list_agent_models）。
  *
  * 验证：
  * - spawn_agent 返回 thread_id；缺 task 返回错误；并发超限返回错误（含上限值）；
@@ -55,10 +57,18 @@ class AgentControlToolsTest {
             maxConcurrent = maxConcurrent,
         )
 
-    private fun tools(manager: AgentThreadManager) = createAgentControlTools("conv-1", manager)
+    private fun tools(
+        manager: AgentThreadManager,
+        catalog: List<AgentModelChoice> = emptyList(),
+    ) = createAgentControlTools("conv-1", manager, agentModelCatalog = catalog)
 
-    private fun exec(toolName: String, manager: AgentThreadManager, args: String): String {
-        val tool = tools(manager).first { it.name == toolName }
+    private fun exec(
+        toolName: String,
+        manager: AgentThreadManager,
+        args: String,
+        catalog: List<AgentModelChoice> = emptyList(),
+    ): String {
+        val tool = tools(manager, catalog).first { it.name == toolName }
         val result = runBlocking {
             tool.execute(Json.parseToJsonElement(args))
         }
@@ -87,6 +97,73 @@ class AgentControlToolsTest {
         val manager = newManager()
         val out = exec("spawn_agent", manager, """{}""")
         assertEquals("task is required", textOf(out, "error"))
+    }
+
+    private fun catalog() = listOf(
+        AgentModelChoice("default", "模型A · 供应商A", "id-a"),
+        AgentModelChoice("fallback_1", "模型B · 供应商B", "id-b"),
+        AgentModelChoice("fallback_2", "模型C · 供应商C", "id-c"),
+    )
+
+    @Test
+    fun `list_agent_models 返回可点名的默认与备用模型`() {
+        val out = exec("list_agent_models", newManager(), "{}", catalog())
+        val models = Json.parseToJsonElement(out).jsonObject["models"]!!.jsonArray
+        assertEquals(3, models.size)
+        assertEquals("default", models[0].jsonObject["ref"]!!.jsonPrimitive.content)
+        assertEquals("fallback_2", models[2].jsonObject["ref"]!!.jsonPrimitive.content)
+        assertEquals(
+            "模型C · 供应商C",
+            models[2].jsonObject["label"]!!.jsonPrimitive.content,
+        )
+    }
+
+    @Test
+    fun `spawn_agent 的 model_ref 能选中备用模型`() = runBlocking {
+        val manager = newManager()
+        val out = exec(
+            "spawn_agent",
+            manager,
+            """{"task":"t","model_ref":"fallback_2"}""",
+            catalog(),
+        )
+        val id = textOf(out, "thread_id")
+        assertTrue("应返回 thread_id: $out", id != null && id!!.isNotBlank())
+        assertEquals("id-c", manager.list("conv-1").first { it.id == id }.modelId)
+    }
+
+    @Test
+    fun `spawn_agent 的 model_ref 优先于 model_id`() = runBlocking {
+        val manager = newManager()
+        val out = exec(
+            "spawn_agent",
+            manager,
+            """{"task":"t","model_ref":"fallback_1","model_id":"id-a"}""",
+            catalog(),
+        )
+        val id = textOf(out, "thread_id")
+        assertTrue("应返回 thread_id: $out", id != null && id!!.isNotBlank())
+        assertEquals("id-b", manager.list("conv-1").first { it.id == id }.modelId)
+    }
+
+    @Test
+    fun `spawn_agent 的 model_ref 无效时明确报错且不创建线程`() = runBlocking {
+        val manager = newManager()
+        val out = exec(
+            "spawn_agent",
+            manager,
+            """{"task":"t","model_ref":"fallback_9"}""",
+            catalog(),
+        )
+        assertTrue(
+            "必须列出可用引用: $out",
+            textOf(out, "error")?.contains("unknown model_ref") == true,
+        )
+        assertTrue(
+            "必须列出可用引用",
+            textOf(out, "error")?.contains("fallback_1") == true,
+        )
+        assertEquals(0, manager.list("conv-1").size)
     }
 
     @Test

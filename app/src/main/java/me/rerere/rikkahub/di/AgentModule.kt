@@ -18,6 +18,7 @@ import me.rerere.rikkahub.agent.runtime.AgentThreadManager
 import me.rerere.rikkahub.agent.runtime.GenerationAgentBackend
 import me.rerere.rikkahub.agent.runtime.ResumeModelCandidate
 import me.rerere.rikkahub.agent.runtime.resolveModelChain
+import me.rerere.rikkahub.data.datastore.normalizeAgentLimit
 import me.rerere.rikkahub.data.datastore.findModelById
 import me.rerere.rikkahub.data.datastore.findProvider
 import org.koin.dsl.module
@@ -67,13 +68,15 @@ val agentModule = module {
                 workspaceRepository = get(),
                 agentRepository = get(),
                 conversationRepository = get(),
+                // v1027：只在「允许子代理调用 MCP」开关打开时才会被用到；关着时不碰。
+                mcpManager = get(),
             ),
             scope = get(),
             maxConcurrent = 4,
             // v241：自动续跑次数跟随设置（0 = 完全不自动续跑），每次用到时现读现用，
             // 用户改完设置立刻生效，不需要重启 App。
             autoResumeMax = {
-                settingsStore.settingsFlow.first().agentAutoResumeMax.coerceIn(0, 10)
+                normalizeAgentLimit(settingsStore.settingsFlow.first().agentAutoResumeMax, 2, true)
             },
             // v242：换模型前先确认这个模型 id 在设置里真的存在。
             // 旧行为是照样把 id 钉到线程上，候选链解析时找不到就静默跳过、回落到
@@ -89,7 +92,7 @@ val agentModule = module {
             // 注意这个设置项从 v244 起的语义是「多久没有新内容算卡住」，不是总时长。
             idleTimeoutMillis = {
                 val minutes = settingsStore.settingsFlow.first()
-                    .agentThreadTimeoutMinutes.coerceIn(0, 120)
+                    .agentThreadTimeoutMinutes.coerceAtLeast(0)
                 if (minutes <= 0) 0L else minutes * 60_000L
             },
             // v304：续跑次数用完 → 自动换下一个候选模型接着跑。
@@ -112,7 +115,7 @@ val agentModule = module {
         val agentScope: CoroutineScope = get()
         agentScope.launch {
             settingsStore.settingsFlow.collect { settings ->
-                manager.maxConcurrent = settings.agentMaxConcurrent.coerceIn(1, 8)
+                manager.maxConcurrent = normalizeAgentLimit(settings.agentMaxConcurrent, 4, true)
             }
         }
         manager

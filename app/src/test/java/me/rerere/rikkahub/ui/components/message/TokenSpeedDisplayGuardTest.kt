@@ -38,6 +38,12 @@ class TokenSpeedDisplayGuardTest {
         assertTrue(nerd.contains("chat_message_usage_response_speed"))
         assertTrue(nerd.contains("SpeedReadout"))
         assertTrue(nerd.contains("headlineTps"))
+        // v1018 复审：底部必须有最后一步用量才能显示，不能把累计账冒充上下文。
+        // 限定在收起态调用方，避免展开面板的同名资源键让错误标签假通过。
+        val footer = nerd.substringBefore("private fun UsageDetails(")
+        assertTrue(footer.contains("val usage = message.usage\n"))
+        assertTrue(footer.contains("|| usage == null) return"))
+        assertTrue(footer.contains("StatsIcon(HugeIcons.Zap, stringResource(R.string.chat_message_usage_response_speed))"))
     }
 
     @Test
