@@ -1,6 +1,7 @@
 package me.rerere.rikkahub.ui.pages.chat
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -51,6 +52,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import me.rerere.ai.provider.ModelType
@@ -65,11 +67,23 @@ import me.rerere.rikkahub.agent.model.AgentMessage
 import me.rerere.rikkahub.agent.model.AgentReport
 import me.rerere.rikkahub.agent.model.AgentThread
 import me.rerere.rikkahub.agent.model.AgentThreadStatus
+import me.rerere.rikkahub.agent.model.AgentThreadUsage
+import me.rerere.rikkahub.agent.model.agentThreadUsageOf
 import me.rerere.rikkahub.agent.repo.AgentThreadRepository
 import me.rerere.rikkahub.agent.runtime.AgentThreadManager
 import me.rerere.rikkahub.data.datastore.displayLabel
 import me.rerere.rikkahub.data.datastore.findModelById
+import me.rerere.rikkahub.data.db.dao.ConversationTokenStats
+import me.rerere.rikkahub.ui.components.ai.ConversationCost
+import me.rerere.rikkahub.ui.components.ai.ConversationTokenStatsDialog
 import me.rerere.rikkahub.ui.components.ai.ModelListSheet
+import me.rerere.rikkahub.ui.components.ai.ModelPrice
+import me.rerere.rikkahub.ui.components.ai.ModelUsageSlice
+import me.rerere.rikkahub.ui.components.ai.computeConversationCost
+import me.rerere.rikkahub.ui.components.ai.formatCacheHitRate
+import me.rerere.rikkahub.ui.components.ai.formatCost
+import me.rerere.rikkahub.ui.components.ai.formatTokenTotal
+import me.rerere.rikkahub.ui.components.ai.modelPriceLookup
 import me.rerere.rikkahub.ui.components.ai.rememberModelListState
 import me.rerere.rikkahub.ui.context.LocalNavController
 import me.rerere.rikkahub.ui.hooks.rememberUserSettingsState
@@ -100,10 +114,33 @@ fun AgentThreadPage(
     val messages by repository.messagesFlow(threadId).collectAsStateWithLifecycle(initialValue = emptyList())
     val events by repository.eventsFlow(threadId).collectAsStateWithLifecycle(initialValue = emptyList())
 
+    // v1032：这次子代理花掉的 token。
+    //
+    // 数据源与聊天页面板完全同一个（agent_events 里的 TOKEN_USAGE 事件 + Room Flow 自己推新值），
+    // 所以「面板看到的合计」与「这页看到的分项」不可能对不上。
+    // 事件按「续跑代次 + 候选模型序号 + 第几次尝试」各存一条，失败重试与换备用模型的花费都在里面 ——
+    // 那些钱是真出去了，不算进去就等于少报。
+    val tokenUsage by repository.tokenUsageEventsFlow(conversationId)
+        .map { rows -> agentThreadUsageOf(rows.filter { it.threadId == threadId })[threadId] }
+        .collectAsStateWithLifecycle(initialValue = null)
+    var showTokenUsageDialog by remember { mutableStateOf(false) }
+
     // v237：把「这次实际是哪个模型跑的」显示出来。
     // activeModelId 从 v236 起就落库、也回传给主模型了，但界面一个字都不显示，
     // 用户因此完全看不出备用模型到底有没有换过人（真实反馈）。
     val settings by rememberUserSettingsState()
+    // v1032：这次子代理折算出来的金额。
+    //
+    // 必须放在 settings 之后（单价在设置里），也必须放在页面级：
+    // 列表项滚出视野时组合会被销毁，把 AlertDialog 画在 item 里会出现
+    // 「正看着明细、一滚就自己关掉」的怪事。
+    // 查价用的是与「本对话token明细」同一个 modelPriceLookup，两处不可能算出两个钱。
+    val tokenUsageCost: ConversationCost? = tokenUsage?.let { usage ->
+        if (settings.init) null else computeAgentUsageCost(
+            usage = usage,
+            priceOf = modelPriceLookup(settings),
+        )
+    }
     // v1028：运行中优先用实时信号。落库值只有收尾才写，只认它等于「跑完才告诉你」。
     val stage by manager.stageFlow.collectAsStateWithLifecycle()
     val liveModelLabel = stage[threadId]?.modelLabel?.takeIf { it.isNotBlank() }
@@ -634,6 +671,22 @@ fun AgentThreadPage(
                                 },
                             )
                         }
+                        // v1032：token 消耗。没取到用量时整行不出现（不写个 0 骗人）；
+                        // 点开是与「本对话token明细」同一个弹窗，分项口径两边一致。
+                        val usage = tokenUsage
+                        if (usage != null && !usage.isEmpty) {
+                            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+                            Text(
+                                text = agentUsageDetailText(usage, tokenUsageCost),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(MaterialTheme.shapes.small)
+                                    .clickable { showTokenUsageDialog = true }
+                                    .padding(vertical = 4.dp),
+                            )
+                        }
                     }
                 }
             }
@@ -814,6 +867,30 @@ fun AgentThreadPage(
     // v238：换模型继续 —— 选完直接把模型钉进这条线程再续跑（已产出内容保留）
     // v241：改用 switchModelAndResume，运行中的线程也能直接换 ——
     // 它会先停下当前那次生成、等它真的停住，再换人从断点接着写。
+    // v1032：子代理 token 明细。与「本对话token明细」同一个弹窗组件、同一套算价函数，
+    // 只有标题和口径说明换成子代理自己的说法（那句「不含子代理消耗」用在这里就是假话）。
+    tokenUsage?.takeIf { !it.isEmpty }?.let { usage ->
+        if (showTokenUsageDialog) {
+            ConversationTokenStatsDialog(
+                stats = ConversationTokenStats(
+                    promptTokens = usage.promptTokens,
+                    completionTokens = usage.completionTokens,
+                    cachedTokens = usage.cachedTokens,
+                    reasoningTokens = usage.reasoningTokens,
+                    usageMessages = usage.attempts,
+                    requestCount = usage.requests,
+                ),
+                cost = tokenUsageCost,
+                title = "子代理 token 明细",
+                note = "这里只算这个子代理自己发出的模型请求：每一次尝试、每一次续跑、" +
+                    "换备用模型的每一次都各算一条；失败或超时那几次，只要服务商回了用量也计入。" +
+                    "服务商整趟都没回报用量的那一次计不进来，所以这份数只会偏小不会偏大。" +
+                    "金额按你在「编辑模型」里填的单价折算，没填价的那一组不计入。",
+                onDismiss = { showTokenUsageDialog = false },
+            )
+        }
+    }
+
     ModelListSheet(
         state = switchModelPicker,
         onSelect = { model ->
@@ -839,6 +916,48 @@ internal fun formatAgentDuration(totalSeconds: Long): String {
     val seconds = totalSeconds % 60
     return if (seconds == 0L) "$minutes 分" else "$minutes 分 $seconds 秒"
 }
+
+// v1039：外层卡片与详情页都按实际模型计价，备用模型不能按最终模型的价格算。
+internal fun computeAgentUsageCost(
+    usage: AgentThreadUsage,
+    priceOf: (String?) -> ModelPrice?,
+): ConversationCost = computeConversationCost(
+    slices = usage.byModel.map { item ->
+        ModelUsageSlice(
+            modelId = item.modelId,
+            promptTokens = item.promptTokens,
+            completionTokens = item.completionTokens,
+            cachedTokens = item.cachedTokens,
+            // 一次模型尝试当作「一条」：与主对话那边每条回答算一条同一量级
+            messageCount = item.attempts,
+            requestCount = item.requests,
+        )
+    },
+    priceOf = priceOf,
+)
+
+/**
+ * v1032：详情页那句 token 消耗（纯函数，单测直接钉文案口径）。
+ *
+ * 刻意不显示「0」：服务商没回报用量时这里根本没有数据，写个 0 会让人以为「这次没花钱」，
+ * 而实际是数没拿到（与「本对话token明细」同一条取舍）。
+ */
+internal fun agentUsageDetailText(usage: AgentThreadUsage, cost: ConversationCost?): String =
+    buildString {
+        append("token 消耗：Σ ${formatTokenTotal(usage.totalTokens)}")
+        append("（↑${formatTokenTotal(usage.promptTokens)} ↓${formatTokenTotal(usage.completionTokens)}）")
+        if (usage.cachedTokens > 0 && usage.promptTokens > 0) {
+            append(" · 缓存命中率 ${formatCacheHitRate(usage.cachedTokens, usage.promptTokens)}")
+        }
+        if (usage.reasoningTokens > 0) {
+            append(" · 思考 ${formatTokenTotal(usage.reasoningTokens)}")
+        }
+        append(" · ${usage.attempts} 次尝试 ${usage.requests} 次请求")
+        if (cost != null && cost.hasAnyPrice) {
+            append(" · 约 ${formatCost(cost.cost)}")
+        }
+        append("（点我看明细）")
+    }
 
 /** v239：详情页默认只渲染这么多字的上下文，避免几万字原文把页面卡死 */
 private const val CONTEXT_PREVIEW_CHARS = 300

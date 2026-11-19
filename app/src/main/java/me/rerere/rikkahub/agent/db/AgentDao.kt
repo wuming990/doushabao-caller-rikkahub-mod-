@@ -60,12 +60,32 @@ interface AgentThreadDao {
     /**
      * v251：普通事件流必须排除续跑检查点 —— 检查点是隐藏的内部原文，
      * 不是可见阶段事件，界面不得展示。
+     *
+     * v1032：TOKEN_USAGE 同样属于内部记账事件，也必须排除。
+     * 不排除的话它会混进详情页的「工具调用轨迹（N 项动作）」把计数虚报，
+     * 还会被 agentPhaseText 当成最近一次阶段读出来（界面写着写着变成「TOKEN_USAGE」）。
      */
     @Query(
         "SELECT * FROM agent_events WHERE thread_id = :threadId " +
-            "AND type != 'RESUME_CHECKPOINT' ORDER BY created_at ASC"
+            "AND type NOT IN ('RESUME_CHECKPOINT', 'TOKEN_USAGE') ORDER BY created_at ASC"
     )
     fun eventsFlow(threadId: String): Flow<List<AgentEventEntity>>
+
+    /**
+     * v1032：某段对话下所有子代理的 token 用量事件。
+     *
+     * 为什么按 conversation 而不是按 thread 查：聊天页的活动面板要一次列出多条线程，
+     * 每条线程单独建一个 Flow 会变成 N 份订阅；这里一条 Flow 全覆盖，
+     * 而且 agent_events 里 TOKEN_USAGE 每种尝试只有一行（稳定 id + REPLACE），量很小。
+     * 用 Room 的 Flow 而不是自己攒内存状态，是为了让「内存实时值」和「重开App后的值」
+     * 是同一份数据 —— 两处口径不一致是最难查的一类毛病。
+     */
+    @Query(
+        "SELECT * FROM agent_events WHERE type = 'TOKEN_USAGE' " +
+            "AND thread_id IN (SELECT id FROM agent_threads WHERE conversation_id = :conversationId) " +
+            "ORDER BY created_at ASC"
+    )
+    fun tokenUsageEventsFlow(conversationId: String): Flow<List<AgentEventEntity>>
 
     /**
      * v251：读取该线程最近一次续跑检查点（未裁剪的完整原文）。

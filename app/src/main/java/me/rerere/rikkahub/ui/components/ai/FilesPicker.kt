@@ -20,6 +20,8 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
@@ -61,6 +63,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Job
+import me.rerere.ai.core.ReasoningLevel
 import me.rerere.ai.provider.ModelType
 import me.rerere.ai.provider.ProviderSetting
 import me.rerere.hugeicons.HugeIcons
@@ -111,6 +114,10 @@ import me.rerere.workspace.WorkspaceShellStatus
 import org.koin.compose.koinInject
 import kotlin.uuid.Uuid
 
+// v1037：视频附件沿用 Google 请求通路；只扩反重力账号入口，不改变音频。
+internal fun canAttachVideo(provider: ProviderSetting?): Boolean =
+    provider is ProviderSetting.Google || provider is ProviderSetting.GeminiOAuth
+
 /** 特殊模型触发值的快捷档位，单位 K。与助手级自定义触发值用同一套档位。 */
 private val SPECIAL_MODEL_THRESHOLD_OPTIONS = listOf(32, 64, 128, 272, 372, 500, 1_000)
 
@@ -128,7 +135,8 @@ internal fun FilesPicker(
     mcpManager: McpManager,
     onCompressContext: (additionalPrompt: String, modelSource: CompressionModelSource, customPrompt: String) -> Job,
     // v268：经典压缩（官方旧版流程）入口
-    onCompressContextClassic: (additionalPrompt: String, keepRecentMessages: Int) -> Job = { _, _ -> Job() },
+    // v1032：第三个参数 = 「用户发言保护」，只作用于经典压缩；智能压缩本来就保留用户原话，不受影响。
+    onCompressContextClassic: (additionalPrompt: String, keepRecentMessages: Int, protectUserMessages: Boolean) -> Job = { _, _, _ -> Job() },
     // v1024：离开后重新打开时附着原对话的应用级压缩任务。
     runningCompressionJob: Job? = null,
     onUpdateAssistant: (Assistant) -> Unit,
@@ -192,9 +200,11 @@ internal fun FilesPicker(
 
             ImagePickButton(onClick = onPickImage)
 
-            if (provider != null && provider is ProviderSetting.Google) {
+            if (canAttachVideo(provider)) {
                 VideoPickButton(onClick = onPickVideo)
+            }
 
+            if (provider != null && provider is ProviderSetting.Google) {
                 AudioPickButton(onClick = onPickAudio)
             }
 
@@ -1316,6 +1326,12 @@ internal fun FilesPicker(
                     onClick = { agentModelPicker.open() },
                 )
 
+                // v1040：所有子代理共用一个档位，默认跟随主助手。
+                AgentReasoningLevelRow(
+                    level = settings.agentReasoningLevel,
+                    onSelect = { onUpdateSettings(settings.copy(agentReasoningLevel = it)) },
+                )
+
                 // v219：子代理最大并发数（1~8，运行时生效）
                 ListItem(
                     headlineContent = {
@@ -1842,9 +1858,11 @@ internal fun FilesPicker(
             },
             // v268：双模式——初始模式记住上次选择；经典模式走官方旧版流程
             initialClassicMode = settings.compressUseClassicMode,
+            // v1032：经典压缩的「用户发言保护」同样记住上次选择
+            initialClassicProtectUserMessages = settings.compressClassicProtectUserMessages,
             runningJob = runningCompressionJob,
-            onConfirmClassic = { additionalPrompt, keepRecentMessages ->
-                onCompressContextClassic(additionalPrompt, keepRecentMessages)
+            onConfirmClassic = { additionalPrompt, keepRecentMessages, protectUserMessages ->
+                onCompressContextClassic(additionalPrompt, keepRecentMessages, protectUserMessages)
             },
         )
     }
@@ -1918,6 +1936,68 @@ private fun RoundTableModelRow(
             .clip(MaterialTheme.shapes.large)
             .clickable { onClick() },
     )
+}
+
+private fun agentReasoningLabel(level: ReasoningLevel?): Int = when (level) {
+    null -> R.string.agent_tools_reasoning_follow_main
+    ReasoningLevel.OFF -> R.string.reasoning_off
+    ReasoningLevel.AUTO -> R.string.reasoning_auto
+    ReasoningLevel.LOW -> R.string.reasoning_light
+    ReasoningLevel.MEDIUM -> R.string.reasoning_medium
+    ReasoningLevel.HIGH -> R.string.reasoning_heavy
+    ReasoningLevel.XHIGH -> R.string.reasoning_xhigh
+    ReasoningLevel.MAX -> R.string.reasoning_max
+}
+
+@Composable
+private fun AgentReasoningLevelRow(
+    level: ReasoningLevel?,
+    onSelect: (ReasoningLevel?) -> Unit,
+) {
+    val title = stringResource(R.string.agent_tools_reasoning_title)
+    var selecting by remember { mutableStateOf(false) }
+    ListItem(
+        headlineContent = { Text(title) },
+        supportingContent = { Text(stringResource(agentReasoningLabel(level))) },
+        colors = ListItemDefaults.colors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+        modifier = Modifier
+            .clip(MaterialTheme.shapes.large)
+            .clickable { selecting = true },
+    )
+    if (selecting) {
+        AlertDialog(
+            onDismissRequest = { selecting = false },
+            title = { Text(title) },
+            text = {
+                Column(
+                    Modifier.heightIn(max = 360.dp)
+                        .verticalScroll(rememberScrollState())
+                        .selectableGroup(),
+                ) {
+                    Text(stringResource(R.string.agent_tools_reasoning_desc))
+                    (listOf<ReasoningLevel?>(null) + ReasoningLevel.entries).forEach { option ->
+                        val selected = option == level
+                        Row(
+                            modifier = Modifier.fillMaxWidth()
+                                .selectable(selected = selected, role = Role.RadioButton) {
+                                    selecting = false
+                                    onSelect(option)
+                                }
+                                .heightIn(min = 48.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            RadioButton(selected = selected, onClick = null)
+                            Text(stringResource(agentReasoningLabel(option)))
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { selecting = false }) { Text(stringResource(android.R.string.cancel)) }
+            },
+        )
+    }
 }
 
 @Composable

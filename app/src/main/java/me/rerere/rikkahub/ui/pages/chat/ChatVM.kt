@@ -45,7 +45,7 @@ import me.rerere.rikkahub.data.db.dao.MessageNodeDAO
 import me.rerere.rikkahub.data.db.dao.getConversationTokenStats
 import me.rerere.rikkahub.data.db.dao.getConversationTokenStatsByModel
 import me.rerere.rikkahub.ui.components.ai.ConversationCost
-import me.rerere.rikkahub.ui.components.ai.ModelPrice
+import me.rerere.rikkahub.ui.components.ai.modelPriceLookup
 import me.rerere.rikkahub.ui.components.ai.ModelUsageSlice
 import me.rerere.rikkahub.ui.components.ai.computeConversationCost
 import me.rerere.rikkahub.data.datastore.Settings
@@ -70,9 +70,12 @@ import me.rerere.rikkahub.data.model.NodeFavoriteTarget
 import me.rerere.rikkahub.data.model.getAssistantOf
 import me.rerere.rikkahub.data.model.getChatModelOf
 import me.rerere.rikkahub.data.repository.FavoriteRepository
+import me.rerere.rikkahub.service.BackgroundShellManager
+import me.rerere.rikkahub.service.BackgroundShellTask
 import me.rerere.rikkahub.service.ChatError
 import me.rerere.rikkahub.service.CompressionModelSource
 import me.rerere.rikkahub.service.ChatService
+import me.rerere.rikkahub.service.SessionActivity
 import me.rerere.rikkahub.service.GroupPickOutcome
 import me.rerere.rikkahub.service.GroupRunState
 import me.rerere.rikkahub.service.RoundTableGapDecision
@@ -91,6 +94,7 @@ private const val TAG = "ChatVM"
 class ChatVM(
     id: String,
     private val context: Application,
+    private val backgroundShellManager: BackgroundShellManager,
     private val settingsStore: SettingsStore,
     private val chatService: ChatService,
     val updateChecker: UpdateChecker,
@@ -180,6 +184,11 @@ class ChatVM(
             .getGenerationJobStateFlow(_conversationId)
             .stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
+    val sessionActivity: StateFlow<SessionActivity?> =
+        chatService
+            .getActivityFlow(_conversationId)
+            .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+
     val processingStatus: StateFlow<String?> =
         chatService
             .getProcessingStatusFlow(_conversationId)
@@ -233,23 +242,11 @@ class ChatVM(
                 val settings = settingsStore.settingsFlow.value
                 if (!settings.init) {
                     val slices = messageNodeDAO.getConversationTokenStatsByModel(_conversationId.toString())
-                    val modelsById = settings.providers.flatMap { provider -> provider.models }
-                        .associateBy { model -> model.id }
+                    // v1032：查价改成与子代理明细共用同一份实现（modelPriceLookup），
+                    // 逐字搬移，取值顺序与兜底规则一个字都没变 —— 两处算出同一个数才有意义。
                     _conversationTokenCost.value = computeConversationCost(
                         slices = slices.map { it.toCostSlice() },
-                        priceOf = { rawModelId ->
-                            rawModelId
-                                ?.let { runCatching { Uuid.parse(it) }.getOrNull() }
-                                ?.let { modelsById[it] }
-                                ?.let { model ->
-                                    ModelPrice(
-                                        inputPerMillion = model.inputPricePerMillion,
-                                        outputPerMillion = model.outputPricePerMillion,
-                                        cachedPerMillion = model.cachedPricePerMillion,
-                                        perRequest = model.requestPrice,
-                                    )
-                                }
-                        },
+                        priceOf = modelPriceLookup(settings),
                     )
                 }
             } catch (e: CancellationException) {
@@ -403,16 +400,23 @@ class ChatVM(
 
     fun clearAllErrors() = chatService.clearAllErrors()
 
-    val messageQueue = chatService.getMessageQueueFlow(_conversationId)
+    val messageQueue = chatService.getInboxFlow(_conversationId)
 
-    fun removeQueuedMessage(id: Uuid) = chatService.removeQueuedMessage(_conversationId, id)
+    fun removeQueuedMessage(id: Uuid) = chatService.removeInboxItem(_conversationId, id)
 
     fun beginEditQueuedMessage(id: Uuid) = chatService.beginEditQueuedMessage(_conversationId, id)
 
     fun finishEditQueuedMessage(id: Uuid, parts: List<UIMessagePart>?) =
         chatService.finishEditQueuedMessage(_conversationId, id, parts)
 
-    fun resumeMessageQueue() = chatService.resumeMessageQueue(_conversationId)
+    fun resumeMessageQueue() = chatService.resumeInbox(_conversationId)
+
+    // 这个会话启动的后台命令，按启动时间排序
+    val backgroundTasks: StateFlow<List<BackgroundShellTask>> = backgroundShellManager.tasks
+        .map { tasks -> tasks.values.filter { it.conversationId == _conversationId }.sortedBy { it.startedAt } }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    suspend fun stopBackgroundTask(id: String) = backgroundShellManager.stop(id)
 
     // 生成完成
     val generationDoneFlow: SharedFlow<Uuid> = chatService.generationDoneFlow
@@ -837,6 +841,8 @@ class ChatVM(
     fun handleCompressContextClassic(
         additionalPrompt: String,
         keepRecentMessages: Int,
+        // v1032：经典压缩的「用户发言保护」，由压缩弹窗里的开关带进来。
+        protectUserMessages: Boolean,
     ): Job {
         // v1024：下面保留旧流程备注；任务与写设置已迁到服务，统计由任务状态订阅刷新。
         // v268：记住用户选择了经典模式，下次打开对话框默认停在经典。
@@ -846,7 +852,7 @@ class ChatVM(
         // 用户看到的还是压缩前那个数，像是「压缩后没重新计算、还在叠加」。
         // v1019：经典已改为保留原节点，真实累计花费仍保留；上下文占用由检查点重新估算。
         return chatService.startManualClassicCompression(
-            _conversationId, additionalPrompt, keepRecentMessages,
+            _conversationId, additionalPrompt, keepRecentMessages, protectUserMessages,
         )
     }
 
@@ -912,6 +918,7 @@ class ChatVM(
             // v1024：先等原压缩取消/提交收尾，再删除，避免删除后请求继续或提交复活数据。
             chatService.cancelManualCompression(conversation.id)
             conversationRepo.deleteConversation(conversation)
+            chatService.killBackgroundTasks(conversation.id)
             // v318：对话没了就要停掉它的讨论群与状态转发订阅。
             // v317 之前这里只是两张表里留个无用条目；v318 加了订阅之后不取消就是
             // 一个永远挂着的协程（审查位 v318 抓的 P2，因本轮改动升级为必修）。

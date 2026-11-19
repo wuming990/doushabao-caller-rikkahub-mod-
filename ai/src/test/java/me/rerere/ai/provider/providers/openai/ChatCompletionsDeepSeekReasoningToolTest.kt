@@ -46,11 +46,15 @@ class ChatCompletionsDeepSeekReasoningToolTest {
         alwaysIncludeReasoning: Boolean,
         includeHistoryReasoning: Boolean = true,
     ): JsonArray {
+        // v1034 合并官方 3.2.0：buildMessages 的第 3 个参数从 Boolean（是否回传 OpenRouter
+        // reasoning_details）换成了 ReasoningReplayFormat 三档枚举。反射是按**完整签名**找方法的，
+        // 这里不同步就是 NoSuchMethodException（手册里写过：给私有方法加/改参数，
+        // 必须顺手查有没有反射在按旧签名找它 —— 本文件就是 v1034 第一轮漏掉的那一处）。
         val method = ChatCompletionsAPI::class.java.getDeclaredMethod(
             "buildMessages",
             List::class.java,
             Boolean::class.javaPrimitiveType,
-            Boolean::class.javaPrimitiveType,
+            ReasoningReplayFormat::class.java,
             List::class.java,
             Boolean::class.javaPrimitiveType,
         )
@@ -59,7 +63,7 @@ class ChatCompletionsDeepSeekReasoningToolTest {
             api,
             messages,
             includeHistoryReasoning,
-            false,
+            ReasoningReplayFormat.REASONING_CONTENT,
             listOf(Modality.TEXT, Modality.IMAGE),
             alwaysIncludeReasoning,
         ) as JsonArray

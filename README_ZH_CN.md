@@ -4,12 +4,12 @@
 
 一个原生 Android LLM 聊天客户端，支持切换不同的供应商进行聊天 💬
 
-[English](README.md) | [繁體中文](README_ZH_TW.md) | 简体中文 ｜ **上游基线 RikkaHub 3.1.1** ｜ 本版 **3.1.1-mod15**
+[English](README.md) | [繁體中文](README_ZH_TW.md) | 简体中文 ｜ **上游基线 RikkaHub 3.2.0** ｜ 本版 **3.2.0-mod38**
 
 </div>
 
 > [!NOTE]
-> 这里是**二改版「豆沙包调用器」**的仓库：下方介绍页正文来自上游 RikkaHub（AGPL-3.0），我们只删掉了官方 QQ 群 / Discord / 赞助商 / 捐赠等内容，功能介绍仍属上游。
+> 这里是**二改版「豆沙包调用器」**的仓库：下方介绍页正文来自上游 RikkaHub（AGPL-3.0），我们已删掉官方 QQ 群 / Discord / 赞助商 / 捐赠等内容，二改功能与更新日志请看 [中文主页](README.md)。
 > 二改版安装包在本仓库 **Releases** 页面下载；官方原版请到上游仓库获取。
 
 ## 🚀 下载

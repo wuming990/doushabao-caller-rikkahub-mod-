@@ -1,8 +1,12 @@
 package me.rerere.rikkahub.data.gemini
 
 import android.util.Log
+import java.io.IOException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -23,7 +27,9 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import me.rerere.common.http.await
+import okhttp3.Call
 import okhttp3.FormBody
+import okhttp3.Response
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -51,6 +57,59 @@ class GeminiAccountRepository internal constructor(
     }
     private val _accounts = MutableStateFlow(state.accounts)
     val accounts: StateFlow<List<GeminiAccount>> = _accounts.asStateFlow()
+
+    // v1038：导入是独立的验证路径；不让临时坏RT把已登录账号标INVALID。
+    internal suspend fun importRefreshTokens(
+        input: String,
+        onProgress: (Int, Int) -> Unit = { _, _ -> },
+    ): GeminiRtImportReport = withContext(Dispatchers.IO) {
+        runGeminiRtImport(
+            input = input,
+            json = json,
+            importOne = { refreshToken -> importRefreshToken(refreshToken).email },
+            onProgress = onProgress,
+        )
+    }
+
+    private suspend fun importRefreshToken(refreshToken: String): GeminiAccount {
+        val token = exchangeGeminiRefreshToken(refreshToken, client, json)
+        val identity = fetchGeminiRtImportIdentity(token.accessToken, client, json, USERINFO_URL)
+        val projectId = resolveGeminiRtImportProject {
+            discoverProject(token.accessToken, rtImport = true)
+        }
+        currentCoroutineContext().ensureActive()
+        // Network discovery is above this lock, so importing does not block an active chat's account selection.
+        return mutex.withLock {
+            currentCoroutineContext().ensureActive()
+            val verified = GeminiAccount(
+                id = identity.email,
+                name = identity.name.ifBlank { identity.email },
+                email = identity.email,
+                projectId = projectId,
+                accessToken = token.accessToken,
+                refreshToken = token.refreshToken,
+                expiresAt = System.currentTimeMillis().let { now ->
+                    now + (token.expiresIn.takeIf { it <= (Long.MAX_VALUE - now) / 1000 } ?: 3600L) * 1000
+                },
+                tokenStatus = GeminiTokenStatus.AVAILABLE,
+            )
+            val account = mergeGeminiRtImportedAccount(state.accounts, verified)
+            val updated = state.copy(accounts = state.accounts.filterNot { it.id == account.id } + account)
+            try {
+                // Once a commit starts, finish disk + memory together; cancellation stops before the next account.
+                withContext(NonCancellable) {
+                    store.write(updated)
+                    state = updated
+                    _accounts.value = updated.accounts
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                throw GeminiRtImportException(GeminiRtImportError.STORAGE_FAILED)
+            }
+            account
+        }
+    }
 
     /**
      * Persist a freshly exchanged token set.
@@ -289,6 +348,10 @@ class GeminiAccountRepository internal constructor(
             )
         }
 
+    // v1038：仅RT导入显式启用新取消桥；原网页登录默认仍走原await，不影响主对话。
+    private suspend fun Call.awaitProjectRequest(rtImport: Boolean): Response =
+        if (rtImport) awaitGeminiRtImportResponse(this) else await()
+
     /**
      * Resolve the `cloudaicompanionProject` this account generates against.
      *
@@ -296,7 +359,7 @@ class GeminiAccountRepository internal constructor(
      * or reports the tier to onboard against, and an account that has never used Code Assist is
      * provisioned one by onboardUser.
      */
-    private suspend fun discoverProject(accessToken: String): String = withContext(Dispatchers.IO) {
+    private suspend fun discoverProject(accessToken: String, rtImport: Boolean = false): String = withContext(Dispatchers.IO) {
         val loadResponse = client.newCall(
             Request.Builder()
                 .url("$CODE_ASSIST_ENDPOINT/v1internal:loadCodeAssist")
@@ -309,9 +372,10 @@ class GeminiAccountRepository internal constructor(
                     ).toRequestBody(JSON_MEDIA_TYPE)
                 )
                 .build()
-        ).await()
+        ).awaitProjectRequest(rtImport)
         val loadBody = loadResponse.body.string()
         if (!loadResponse.isSuccessful) {
+            if (rtImport) throw GeminiRtImportException(GeminiRtImportError.PROJECT_FAILED, loadResponse.code)
             error("loadCodeAssist failed: ${loadResponse.code} $loadBody")
         }
         val load = json.parseToJsonElement(loadBody).jsonObject
@@ -321,7 +385,7 @@ class GeminiAccountRepository internal constructor(
 
         val tierId = selectGeminiTier(load)?.get("id")?.jsonPrimitive?.contentOrNull ?: TIER_LEGACY
         val diagnosis = summarizeCodeAssistTiers(load, tierId)
-        Log.i(TAG, "discoverProject: $diagnosis")
+        if (!rtImport) Log.i(TAG, "discoverProject: $diagnosis")
 
         // onboardUser returns a long-running operation that is usually already finished. When it
         // is not, Antigravity re-sends the same request rather than polling the operation by name,
@@ -342,15 +406,17 @@ class GeminiAccountRepository internal constructor(
         //   所以请求体里只能有 tierId + metadata。
         val selfServe = requiresUserDefinedProject(load, tierId)
         var lastOperation: JsonObject? = null
+        var lastNetworkFailure: IOException? = null
 
         if (!selfServe) {
             for (attempt in 0 until ONBOARD_MAX_ATTEMPTS) {
                 if (attempt > 0) delay(ONBOARD_RETRY_INTERVAL_MS)
-                val result = onboardOnce(accessToken, tierId, DAILY_CODE_ASSIST_ENDPOINT)
+                val result = onboardOnce(accessToken, tierId, DAILY_CODE_ASSIST_ENDPOINT, rtImport)
                 if (result.failureBody != null) {
                     // 第一次就 HTTP 失败（401 / 403 / 资格不符这类）是硬错误，照旧立刻报出来；
                     // 后续尝试的偶发失败不打断重试。
                     if (attempt == 0) {
+                        if (rtImport) throw GeminiRtImportException(GeminiRtImportError.PROJECT_FAILED, result.httpCode)
                         error("onboardUser failed: ${result.httpCode} ${result.failureBody}")
                     }
                     continue
@@ -364,11 +430,15 @@ class GeminiAccountRepository internal constructor(
         // 官方把 onboardUser 放在 daily（v279 照此改过），但有第三方实现反馈 prod 对
         // 「解析托管项目」支持得更好。这一次调用成本极低，失败也不影响后面的路。
         val prodAttempt = try {
-            onboardOnce(accessToken, tierId, CODE_ASSIST_ENDPOINT)
+            onboardOnce(accessToken, tierId, CODE_ASSIST_ENDPOINT, rtImport)
         } catch (cancel: CancellationException) {
             throw cancel
         } catch (e: Exception) {
-            Log.w(TAG, "onboardUser on prod failed: ${e.message}")
+            if (rtImport) {
+                if (e is IOException) lastNetworkFailure = e
+            } else {
+                Log.w(TAG, "onboardUser on prod failed: ${e.message}")
+            }
             null
         }
         prodAttempt?.let { result ->
@@ -377,10 +447,16 @@ class GeminiAccountRepository internal constructor(
         }
 
         // v287 后备路径 2：直接问「这个账号名下有哪些项目」，两个端点各试一次。
-        listCompanionProject(accessToken, DAILY_CODE_ASSIST_ENDPOINT)
-            ?.let { return@withContext it }
-        listCompanionProject(accessToken, CODE_ASSIST_ENDPOINT)
-            ?.let { return@withContext it }
+        suspend fun fallbackProject(endpoint: String): String? = try {
+            listCompanionProject(accessToken, endpoint, rtImport)
+        } catch (e: IOException) {
+            if (!rtImport) throw e
+            lastNetworkFailure = e
+            null
+        }
+        fallbackProject(DAILY_CODE_ASSIST_ENDPOINT)?.let { return@withContext it }
+        fallbackProject(CODE_ASSIST_ENDPOINT)?.let { return@withContext it }
+        if (rtImport) lastNetworkFailure?.let { throw it }
 
         val reason = if (selfServe) SELF_SERVE_PROJECT_MESSAGE else ONBOARD_NO_PROJECT_MESSAGE
         error("$reason（诊断：$diagnosis；最后一次响应：$lastOperation）")
@@ -403,6 +479,7 @@ class GeminiAccountRepository internal constructor(
         accessToken: String,
         tierId: String,
         endpoint: String,
+        rtImport: Boolean = false,
     ): OnboardAttempt {
         val response = client.newCall(
             Request.Builder()
@@ -417,7 +494,7 @@ class GeminiAccountRepository internal constructor(
                     ).toRequestBody(JSON_MEDIA_TYPE)
                 )
                 .build()
-        ).await()
+        ).awaitProjectRequest(rtImport)
         val body = response.body.string()
         if (!response.isSuccessful) {
             return OnboardAttempt(httpCode = response.code, failureBody = body)
@@ -441,7 +518,7 @@ class GeminiAccountRepository internal constructor(
      * 它是兜底手段，任何失败都只当「这条路走不通」返回 null，绝不把整个登录带崩；
      * 但**协程取消必须原样上抛**，否则用户点取消会被吞成「这条路失败，继续下一条」。
      */
-    private suspend fun listCompanionProject(accessToken: String, endpoint: String): String? {
+    private suspend fun listCompanionProject(accessToken: String, endpoint: String, rtImport: Boolean = false): String? {
         val response = try {
             client.newCall(
                 Request.Builder()
@@ -449,10 +526,14 @@ class GeminiAccountRepository internal constructor(
                     .antigravityHeaders(accessToken)
                     .post("{}".toRequestBody(JSON_MEDIA_TYPE))
                     .build()
-            ).await()
+            ).awaitProjectRequest(rtImport)
         } catch (cancel: CancellationException) {
             throw cancel
         } catch (e: Exception) {
+            if (rtImport) {
+                if (e is IOException) throw e
+                return null
+            }
             Log.w(TAG, "listCloudAICompanionProjects on $endpoint failed: ${e.message}")
             return null
         }
@@ -559,6 +640,23 @@ private data class GeminiIdentity(
  * （sipeed/picoclaw 的 antigravity_provider.go 用的就是 `antigravity/<ver> linux/amd64`）。
  * 版本号继续取 [ANTIGRAVITY_VERSION]，必须跟着官方最新版走：太旧的版本会被直接拒绝
  * （"This version of Antigravity is no longer supported"，badlogic/pi-mono issue #1079）。
+ *
+ * v1031：**这一行字符串不只是"报个版本"，它是谷歌决定"给你哪份模型目录"的开关**，
+ * 缺了客户端家族段（`hub/` `cli/` `ide/`）就被当成旧客户端发旧目录。裸形态
+ * `antigravity/2.11.0 linux/amd64` 实测拿不到 `gemini-4-argon-*`（sub2api issue #8062：
+ * 同账号同端点同 project，只换 UA——裸 `antigravity/2.9.1` 26 个模型无 argon，
+ * `antigravity/hub/2.23.0` 29 个模型有 argon；lbjlaq/Antigravity-Manager issue #3665：
+ * `ide/2.23.0` 35 个无 argon，`hub/2.17.0`/`cli/1.3.5` 38 个有 argon）。
+ * 家族选 **cli** 不选 hub 的两条理由：
+ * 1. 我们是手机 App，没有桌面客户端的 GUI/Canvas 遥测。CLIProxyAPI issue #6185 记录
+ *    `hub/` 身份在无遥测环境（VPS/Docker/无头）里被风控判 `403 VALIDATION_REQUIRED` 的比例明显高，
+ *    而 `cli/` 身份本来就是给终端/无头环境设计的。
+ * 2. 配额接口 `retrieveUserQuotaSummary` 同样按这个字符串发配额组：omarchy issue #16906 实测
+ *    `antigravity`、`antigravity/cli`、`antigravity/cli/1.0.0` 只回 `Claude and GPT models` 一组，
+ *    `antigravity/cli/1.3.3` 与 `1.4.12` 才补齐 `Gemini Models` 与 `Gemini 4 Argon`（含 5 小时 Session 桶）。
+ *    ——这也顺带解释了用户反复报的「额度面板没有 5 小时那一栏」。**
+ * 全链路（loadCodeAssist / onboardUser / fetchAvailableModels / retrieveUserQuotaSummary /
+ * streamGenerateContent）都用同一个身份，不拆：jcode PR #1834 就是这么做的并实测通过。
  */
 internal fun Request.Builder.antigravityHeaders(accessToken: String): Request.Builder =
     header("Authorization", "Bearer $accessToken")
@@ -575,12 +673,27 @@ internal fun clientMetadataJson(): JsonObject = buildJsonObject {
 // 官方 2.11.0 changelog 明确修过「cold-start token endpoint routing 引发的 429 resource
 // exhaustion」，且 Cloud Code Assist 后端按自报客户端版本路由模型与配额——旧版本号
 // 会被分进旧的待遇桶。2.11.0 修复清单见 antigravity.google/changelog。
-internal const val ANTIGRAVITY_VERSION = "2.11.0"
+// v1031：改成 **agy CLI** 这条官方真实发布线，不是随手把裸版本号抬大。
+// 严格控制变量的实测都指向同一件事：只抬版本号、不加客户端家族段，目录一个字节都不会变
+// （sub2api #8062：`antigravity/9.9.9 windows/amd64` 仍是 26 个模型、无 argon）。
+// 而加了家族段又配错版本线（把 Hub 的号写进 cli 里），造出来的是官方不存在的客户端指纹，
+// CLIProxyAPI #6185 明确点过这个雷。所以这里取的必须是 **CLI 线自己的当前真实版本**：
+// 官方自动更新清单 antigravity-cli-auto-updater-974169037036.us-central1.run.app
+// 的 manifests/linux_amd64.json 与 manifests/linux_arm64.json 都是 1.5.3（2026-11-08 抓取），
+// 也就是 `os_type=linux; arch=arm64` 是官方真实存在、且与我们设备 ABI 相符的构建组合。
+// `cl=`（changelist）段**刻意不填**：拿不到可信的真实值，编一个反而像假指纹；
+// jcode PR #1834 与 sub2api #8062 用的简版形态都实测 HTTP 200。
+internal const val ANTIGRAVITY_VERSION = "1.5.3"
 
 // v279：必须声明在 ANTIGRAVITY_VERSION 之后 —— Kotlin 顶层 const val 的初始化器不允许前向
 // 引用同文件里更靠后声明的 const，写在前面会直接编译失败（"Variable 'ANTIGRAVITY_VERSION'
 // must be initialized"）。函数体里引用不受此限，只有属性初始化器有这个顺序要求。
-internal const val ANTIGRAVITY_USER_AGENT = "antigravity/$ANTIGRAVITY_VERSION linux/amd64"
+// v1031：补上 `cli/` 家族段，并把形态改成官方 agy CLI 抓包里的括号形态。
+// 这一行是谷歌用来决定「发给你哪份模型目录、算哪几组配额」的开关，详见
+// [antigravityHeaders] 上方的说明。旧的裸形态 `antigravity/<ver> linux/amd64`
+// 会被当成旧客户端，目录里永远没有 `gemini-4-argon-*`。
+internal const val ANTIGRAVITY_USER_AGENT =
+    "antigravity/cli/$ANTIGRAVITY_VERSION (aidev_client; os_type=linux; arch=arm64)"
 
 internal fun isGeminiRefreshAuthenticationFailure(
     statusCode: Int,

@@ -16,6 +16,7 @@ import me.rerere.rikkahub.data.files.OfficialImportSession
 import me.rerere.rikkahub.data.files.OfficialSourceEntry
 import me.rerere.rikkahub.data.files.OfficialWorkspaceMigrationManager
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
+import me.rerere.rikkahub.service.BackgroundShellManager
 import me.rerere.rikkahub.service.OfficialTransferService
 
 class WorkspaceVM(
@@ -24,6 +25,7 @@ class WorkspaceVM(
     private val officialImportSession: OfficialImportSession,
     private val context: Context,
     private val terminalSessionManager: WorkspaceTerminalSessionManager,
+    private val backgroundShellManager: BackgroundShellManager,
 ) : ViewModel() {
     val workspaces = repository.listFlow()
         .stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
@@ -107,8 +109,9 @@ class WorkspaceVM(
 
     fun delete(workspace: WorkspaceEntity) {
         viewModelScope.launch {
-            repository.delete(workspace.id)
             terminalSessionManager.closeWorkspace(workspace.root)
+            backgroundShellManager.killWorkspace(workspace.id)
+            repository.delete(workspace.id)
         }
     }
 }

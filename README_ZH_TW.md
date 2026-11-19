@@ -1,16 +1,16 @@
 <div align="center">
-  <img src="docs/icon.png" alt="豆沙包调用器" width="100" />
+  <img src="docs/icon.png" alt="豆沙包調用器" width="100" />
   <h1>豆沙包調用器（基於 RikkaHub 二開）</h1>
 
 一個原生 Android LLM 聊天客戶端，支持切換不同的供應商進行聊天 🤖💬
 
-[English](README.md) | 繁體中文 | [简体中文](README_ZH_CN.md) ｜ **上游基線 RikkaHub 3.1.1** ｜ 本版 **3.1.1-mod15**
+[English](README.md) | 繁體中文 | [简体中文](README_ZH_CN.md) ｜ **上游基線 RikkaHub 3.2.0** ｜ 本版 **3.2.0-mod38**
 
 </div>
 
 > [!NOTE]
-> 这里是**二改版「豆沙包调用器」**的仓库：下方介绍页正文来自上游 RikkaHub（AGPL-3.0），我们只删掉了官方 QQ 群 / Discord / 赞助商 / 捐赠等内容，功能介绍仍属上游。
-> 二改版安装包在本仓库 **Releases** 页面下载；官方原版请到上游仓库获取。
+> 這裏是**二改版「豆沙包調用器」**的倉庫：下方介紹頁正文來自上游 RikkaHub（AGPL-3.0），我們已刪掉官方 QQ 群 / Discord / 贊助商 / 捐贈等內容，二改功能與更新日誌請看 [中文主頁](README.md)。
+> 二改版安裝包在本倉庫 **Releases** 頁面下載；官方原版請到上游倉庫獲取。
 
 ## 🚀 下載
 

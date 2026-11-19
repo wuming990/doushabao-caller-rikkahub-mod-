@@ -390,6 +390,178 @@ internal const val AGENT_EVENT_TYPE_RESUME_CHECKPOINT = "RESUME_CHECKPOINT"
 internal const val AGENT_EVENT_TYPE_MODEL_ACTIVE = "MODEL_ACTIVE"
 
 /**
+ * v1032：子代理 token 用量的**内部事件**（与续跑检查点同一套路）。
+ *
+ * 为什么要新增而不是复用主库的 usage_record：
+ * - 子代理的请求走 GenerationLoop，那条路从来没被 UsageRecorder 包过（全包 8 处 wrap 都在
+ *   ChatRequestFactory / 元信息 / 记忆 / 翻译 / OCR），所以子代理花的 token 以前**一个字都没记**；
+ * - usage_record 没有 thread_id 列，同一段对话里并发跑好几个子代理时分不清是谁花的；
+ * - 往 agent_threads 加列要把 AgentDatabase 从 3 升到 4，而数据库版本是用户红线。
+ * 现有 agent_events 表已经支持「按稳定 id 覆盖写」（insertEvent 是 REPLACE），足够用。
+ *
+ * 三条约定（与 RESUME_CHECKPOINT 完全一致，破其中任何一条都会把界面弄脏）：
+ * - 事件 id 按「线程 + 续跑代次 + 候选模型序号 + 尝试次数」稳定，同一次尝试反复上报只覆盖自己不累加；
+ * - eventsFlow 必须排除它（界面「动作轨迹」与 phaseText 都不许看到它）；
+ * - 只有模型真的报了用量才发事件；一次都没报就整块不显示（不显示成 0 骗人）。
+ */
+internal const val AGENT_EVENT_TYPE_TOKEN_USAGE = "TOKEN_USAGE"
+
+/**
+ * v1032：一次模型尝试的用量快照，存在 TOKEN_USAGE 事件的 detail 里。
+ *
+ * 必须带 modelId：备用模型链中途会换人，各家的单价不一样，不带模型就没法定价
+ * （与「本对话token明细」按模型分组算钱的同一条理由）。
+ * requests = 这一次尝试里发出去多少次模型请求（工具轮、重试轮都算），按次计价要用。
+ */
+@Serializable
+data class AgentUsageSnapshot(
+    val modelId: String = "",
+    val promptTokens: Long = 0,
+    val completionTokens: Long = 0,
+    val cachedTokens: Long = 0,
+    val reasoningTokens: Long = 0,
+    val requests: Int = 0,
+) {
+    companion object {
+        private val json = Json { ignoreUnknownKeys = true }
+
+        fun encode(snapshot: AgentUsageSnapshot): String = json.encodeToString(snapshot)
+
+        /** 坏 JSON / 空 detail 一律当「没有用量」，不猜、不用 0 冒充。 */
+        fun decode(text: String?): AgentUsageSnapshot? =
+            if (text.isNullOrBlank()) null else runCatching { json.decodeFromString<AgentUsageSnapshot>(text) }.getOrNull()
+    }
+}
+
+/**
+ * v1032：从「本次尝试新产出的 assistant 消息」里取出用量快照。
+ *
+ * 口径照「本对话token明细」的 SQL（MessageNodeDAO.CONVERSATION_TOKEN_STATS_BY_MODEL_SQL）来，
+ * 但有一处刻意不同，理由要写清：那条 SQL 把 `totalTokens > 0` 也算「这条有用量」，我们不算 ——
+ * 只报 totalTokens 的服务商给不出输入/输出分项，记进来只能让界面显示「Σ 0」这种看着像免费数。
+ * 也就是说子代理这份数只会因为「拿不到分项」而偏小，不会因为口径差异而偏大。
+ * - 优先 `cumulativeUsage`（同一条消息里工具轮 / 续跑轮的累计），没有才退回 `usage`；
+ * - 请求次数优先 `cumulativeRequestCount`，老数据没有就按「至少 1 次」兜底；
+ * - 思考量只单列展示，**绝不加进总数**（各家都把思考算在输出里计费，加了就是数两遍）；
+ * - 服务商一个分项都没报 → 返回 null，界面整块不出现（不显示成 0 骗人）。
+ */
+fun agentUsageSnapshotOf(modelId: String, messages: List<me.rerere.ai.ui.UIMessage>): AgentUsageSnapshot? {
+    var prompt = 0L
+    var completion = 0L
+    var cached = 0L
+    var reasoning = 0L
+    var requests = 0
+    var reported = false
+    messages.forEach { message ->
+        val usage = message.cumulativeUsage ?: message.usage ?: return@forEach
+        if (usage.promptTokens <= 0 && usage.completionTokens <= 0 && usage.cachedTokens <= 0) return@forEach
+        reported = true
+        prompt += usage.promptTokens
+        completion += usage.completionTokens
+        cached += usage.cachedTokens
+        reasoning += usage.reasoningTokens
+        requests += message.cumulativeRequestCount?.takeIf { it > 0 } ?: 1
+    }
+    if (!reported) return null
+    return AgentUsageSnapshot(
+        modelId = modelId,
+        promptTokens = prompt,
+        completionTokens = completion,
+        cachedTokens = cached,
+        reasoningTokens = reasoning,
+        requests = requests,
+    )
+}
+
+/**
+ * v1032：某条线程里**同一个模型**的用量合计。
+ *
+ * 分开到模型这一层才能按各自单价算钱（备用模型链中途会换人）；
+ * `attempts` 是这个模型被跑了几次（含失败重试与续跑），界面用它说明「这数怎么来的」。
+ */
+data class AgentModelUsage(
+    val modelId: String = "",
+    val promptTokens: Long = 0,
+    val completionTokens: Long = 0,
+    val cachedTokens: Long = 0,
+    val reasoningTokens: Long = 0,
+    val requests: Int = 0,
+    val attempts: Int = 0,
+)
+
+/**
+ * v1032：某条线程的用量合计（按模型分组后相加）。
+ *
+ * 与 [AgentUsageSnapshot] 的区别：snapshot 是**一次尝试**，这个是**整条线程累计**，
+ * 按模型分开是因为算钱要拿各自单价。
+ */
+data class AgentThreadUsage(
+    val promptTokens: Long = 0,
+    val completionTokens: Long = 0,
+    val cachedTokens: Long = 0,
+    val reasoningTokens: Long = 0,
+    val requests: Int = 0,
+    val attempts: Int = 0,
+    /** 按模型分开的用量，modelId 为 Model.id 的字符串形式（定价要用它查单价）。 */
+    val byModel: List<AgentModelUsage> = emptyList(),
+) {
+    val totalTokens: Long get() = promptTokens + completionTokens
+    /** 一次有用的用量都没记到 —— 界面这时整块不出现。 */
+    val isEmpty: Boolean get() = attempts == 0 && totalTokens == 0L
+}
+
+/**
+ * v1032：把 TOKEN_USAGE 事件汇总成「线程 → 用量」。
+ *
+ * 纯函数，输入就是仓库读回来的事件列表。口径：
+ * - 同一事件 id 只算一次（稳定 id + REPLACE 已经保证，这里再兜一层，防止手搭出来的重复行把数翻倍）；
+ * - 按 modelId 分组分别相加，最后再给一个总数；
+ * - requests 取各次尝试之和（按次计费看的就是次数）。
+ */
+fun agentThreadUsageOf(events: List<AgentEvent>): Map<String, AgentThreadUsage> {
+    // 同一事件 id 只算一次：稳定 id + Room 的 REPLACE 已经保证，这里再兜一层，
+    // 免得将来谁改成 INSERT 就把同一个模型的用量数两遍。
+    val distinct = LinkedHashMap<String, AgentUsageSnapshot>()
+    val threadOfEvent = LinkedHashMap<String, String>()
+    for (event in events) {
+        if (event.type != AGENT_EVENT_TYPE_TOKEN_USAGE) continue
+        val snapshot = AgentUsageSnapshot.decode(event.detail) ?: continue
+        distinct[event.id] = snapshot
+        threadOfEvent[event.id] = event.threadId
+    }
+    if (distinct.isEmpty()) return emptyMap()
+    return distinct
+        .entries
+        .groupBy { threadOfEvent.getValue(it.key) }
+        .mapValues { (_, rows) ->
+            val snapshots = rows.map { it.value }
+            val byModel = snapshots
+                .groupBy { it.modelId }
+                .map { (modelId, list) ->
+                    AgentModelUsage(
+                        modelId = modelId,
+                        promptTokens = list.sumOf { it.promptTokens },
+                        completionTokens = list.sumOf { it.completionTokens },
+                        cachedTokens = list.sumOf { it.cachedTokens },
+                        reasoningTokens = list.sumOf { it.reasoningTokens },
+                        requests = list.sumOf { it.requests },
+                        attempts = list.size,
+                    )
+                }
+                .sortedBy { it.modelId }
+            AgentThreadUsage(
+                promptTokens = snapshots.sumOf { it.promptTokens },
+                completionTokens = snapshots.sumOf { it.completionTokens },
+                cachedTokens = snapshots.sumOf { it.cachedTokens },
+                reasoningTokens = snapshots.sumOf { it.reasoningTokens },
+                requests = snapshots.sumOf { it.requests },
+                attempts = snapshots.size,
+                byModel = byModel,
+            )
+        }
+}
+
+/**
  * 子代理结构化报告：结论 + 证据 + 不确定项 + 建议（+ v236 审查结论）。
  */
 @Serializable

@@ -124,7 +124,14 @@ class GeminiProviderRequestTest {
     fun `the self-reported client is a shape Antigravity actually ships`() {
         // The old `antigravity/hub/<ver> android/<arch>` was invented here; the backend routes
         // quota on this string, so it has to match a real build.
-        assertTrue(ANTIGRAVITY_USER_AGENT.startsWith("antigravity/$ANTIGRAVITY_VERSION "))
+        // v1031：同一条判据换了对象。裸形态 `antigravity/<ver> <goos>/<goarch>` 是官方 IDE 时代
+        // 的写法，实测拿不到 `gemini-4-argon-*`，配额接口也只回一组，所以钉的改成
+        // 「cli 家族段 + 官方 CLI 自动更新清单里的真实版本 + 与设备相符的 linux/arm64」。
+        // 禁止 `android/` 这一段 v279 的判断仍然成立：官方没有 Android 客户端。
+        assertEquals("1.5.3", ANTIGRAVITY_VERSION)
+        assertTrue(ANTIGRAVITY_USER_AGENT.startsWith("antigravity/cli/$ANTIGRAVITY_VERSION "))
+        assertTrue(ANTIGRAVITY_USER_AGENT.contains("os_type=linux"))
+        assertTrue(ANTIGRAVITY_USER_AGENT.contains("arch=arm64"))
         assertFalse(ANTIGRAVITY_USER_AGENT.contains("hub/"))
         assertFalse(ANTIGRAVITY_USER_AGENT.contains("android/"))
     }

@@ -4,6 +4,21 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlin.uuid.Uuid
 
+/**
+ * 按空格分隔的关键词筛选模型：忽略大小写，每个关键词都要命中模型 ID 或显示名称的一部分，
+ * 关键词之间不要求顺序。没有关键词时返回原列表。
+ */
+fun List<Model>.filterByKeywords(query: String): List<Model> {
+    val keywords = query.split(" ").filter { it.isNotBlank() }
+    if (keywords.isEmpty()) return this
+    return filter { model ->
+        keywords.all { keyword ->
+            model.modelId.contains(keyword, ignoreCase = true) ||
+                model.displayName.contains(keyword, ignoreCase = true)
+        }
+    }
+}
+
 @Serializable
 data class Model(
     val modelId: String = "",
@@ -75,6 +90,3 @@ sealed class BuiltInTools {
     @SerialName("image_generation")
     data object ImageGeneration : BuiltInTools()
 }
-
-
-

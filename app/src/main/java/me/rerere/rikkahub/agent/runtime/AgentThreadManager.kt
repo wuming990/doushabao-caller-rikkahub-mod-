@@ -19,6 +19,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import me.rerere.rikkahub.agent.model.AGENT_EVENT_TYPE_MODEL_ACTIVE
 import me.rerere.rikkahub.agent.model.AGENT_EVENT_TYPE_RESUME_CHECKPOINT
+import me.rerere.rikkahub.agent.model.AGENT_EVENT_TYPE_TOKEN_USAGE
 import me.rerere.rikkahub.agent.model.AgentEvent
 import me.rerere.rikkahub.agent.model.AgentErrorKind
 import me.rerere.rikkahub.agent.model.AgentMessage
@@ -1598,7 +1599,12 @@ class AgentThreadManager(
                     touchActivity(threadId)
                     // v251：续跑检查点不是可见的阶段事件（UI 看不到），但说明后端在持续产出，
                     // 仍算「有动静」；只有普通事件才更新阶段信号。
-                    if (it.type != AGENT_EVENT_TYPE_RESUME_CHECKPOINT) {
+                    // v1032：TOKEN_USAGE 同属内部记账事件，也必须排除 —— 不然 agentPhaseTextFrom
+                    // 会把 lastEventType 读成 "TOKEN_USAGE"，阶段那行会显示一个英文事件名，
+                    // 「工具执行中」这类真正有用的判据也被它冲掉。
+                    if (it.type != AGENT_EVENT_TYPE_RESUME_CHECKPOINT &&
+                        it.type != AGENT_EVENT_TYPE_TOKEN_USAGE
+                    ) {
                         noteStageEvent(threadId, it.type)
                     }
                     // v1028：模型一确定就把名字写进实时信号（第一个模型与换备用模型都会发）。

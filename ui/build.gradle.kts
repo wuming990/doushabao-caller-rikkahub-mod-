@@ -27,10 +27,11 @@ dependencies {
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
     implementation(libs.huge.icons)
-    implementation(libs.jetbrains.markdown)
-    implementation(libs.jsoup)
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.kotlinx.serialization.json)
+    // 保留旧 markdown 渲染包：官方 3.1.2 已删，但我们的快照里仍有 ui/markdown（不丢历史文件）
+    implementation(libs.jetbrains.markdown)
+    implementation(libs.jsoup)
 
     testImplementation(libs.junit)
 }

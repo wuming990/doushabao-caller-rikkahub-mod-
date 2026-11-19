@@ -79,6 +79,10 @@ import me.rerere.rikkahub.ui.components.ui.Select
 import me.rerere.rikkahub.ui.components.ui.CardGroupIcon
 import me.rerere.rikkahub.ui.components.ui.ConnectedChoiceButtons
 import me.rerere.rikkahub.ui.components.ui.ConnectedChoiceLabel
+import me.rerere.rikkahub.ui.components.ui.permission.LocalNetworkPermissionCard
+import me.rerere.rikkahub.ui.components.ui.permission.NotificationPermissionCard
+import me.rerere.rikkahub.ui.components.ui.permission.rememberLocalNetworkPermissionState
+import me.rerere.rikkahub.ui.components.ui.permission.rememberNotificationPermissionState
 import me.rerere.rikkahub.ui.context.LocalNavController
 import me.rerere.rikkahub.ui.hooks.rememberColorMode
 import me.rerere.rikkahub.ui.theme.ColorMode
@@ -98,6 +102,8 @@ fun SettingPage(vm: SettingVM = koinViewModel()) {
     val settings by vm.settings.collectAsStateWithLifecycle()
     val launchCount by vm.launchCount.collectAsStateWithLifecycle()
     val filesManager: FilesManager = koinInject()
+    val localNetworkPermission = rememberLocalNetworkPermissionState()
+    val notificationPermission = rememberNotificationPermissionState()
 
     // 二创版移除赞助提醒弹窗（原本启动超过 100 次后，每 50 次进设置页就弹一次）
 
@@ -127,6 +133,18 @@ fun SettingPage(vm: SettingVM = koinViewModel()) {
                     ProviderConfigWarningCard(
                         onClick = { navController.navigate(Screen.SettingProvider) }
                     )
+                }
+            }
+
+            if (localNetworkPermission?.allRequiredPermissionsGranted == false) {
+                item("localNetworkPermission") {
+                    LocalNetworkPermissionCard(permissionState = localNetworkPermission)
+                }
+            }
+
+            if (notificationPermission?.allRequiredPermissionsGranted == false) {
+                item("notificationPermission") {
+                    NotificationPermissionCard(permissionState = notificationPermission)
                 }
             }
 

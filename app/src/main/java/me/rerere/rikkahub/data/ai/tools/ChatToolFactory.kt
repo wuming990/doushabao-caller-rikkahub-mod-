@@ -17,8 +17,10 @@ import me.rerere.rikkahub.data.gemini.GeminiSearchClient
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.repository.ConversationRepository
 import me.rerere.rikkahub.data.repository.MemoryRepository
+import me.rerere.rikkahub.service.BackgroundShellManager
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
 import me.rerere.workspace.WorkspaceShellStatus
+import kotlin.uuid.Uuid
 
 private const val TAG = "ChatToolFactory"
 
@@ -79,11 +81,13 @@ class ChatToolFactory(
     private val skillManager: SkillManager,
     private val workspaceRepository: WorkspaceRepository,
     private val geminiSearchClient: GeminiSearchClient,
+    private val backgroundShellManager: BackgroundShellManager,
 ) {
     suspend fun createTools(
         settings: Settings,
         assistant: Assistant,
         model: Model,
+        conversationId: Uuid,
         workspaceCwd: String? = null,
     ): List<Tool> = buildList {
         if (assistant.enableMemory) {
@@ -102,7 +106,7 @@ class ChatToolFactory(
         if (assistant.enableRecentChatsReference) {
             addAll(createConversationTools(conversationRepository, assistant.id))
         }
-        addAll(createWorkspaceToolsIfReady(assistant.workspaceId?.toString(), workspaceCwd))
+        addAll(createWorkspaceToolsIfReady(assistant.workspaceId?.toString(), workspaceCwd, conversationId))
         if (assistant.enabledSkills.isNotEmpty()) {
             addAll(
                 createSkillTools(
@@ -134,7 +138,11 @@ class ChatToolFactory(
         }
     }
 
-    private suspend fun createWorkspaceToolsIfReady(workspaceId: String?, cwd: String?): List<Tool> {
+    private suspend fun createWorkspaceToolsIfReady(
+        workspaceId: String?,
+        cwd: String?,
+        conversationId: Uuid,
+    ): List<Tool> {
         if (workspaceId.isNullOrBlank()) return emptyList()
         val workspace = workspaceRepository.getById(workspaceId) ?: return emptyList()
         if (workspace.shellStatus != WorkspaceShellStatus.READY.name) {
@@ -144,6 +152,12 @@ class ChatToolFactory(
             )
             return emptyList()
         }
-        return createWorkspaceTools(workspaceId, workspaceRepository, cwd)
+        return createWorkspaceTools(
+            workspaceId = workspaceId,
+            workspaceRepository = workspaceRepository,
+            cwd = cwd,
+            conversationId = conversationId,
+            backgroundShellManager = backgroundShellManager,
+        )
     }
 }

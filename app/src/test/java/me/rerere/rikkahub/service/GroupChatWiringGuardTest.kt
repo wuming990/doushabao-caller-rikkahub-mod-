@@ -339,7 +339,8 @@ class GroupChatWiringGuardTest {
         )
         assertFalse(
             "群插话不许把消息塞进队列（那会触发助手的普通回复）",
-            Regex("messageQueue\\s*\\.").containsMatchIn(interjection),
+            // 官方 3.1.2 把 messageQueue 改名 inbox：判据跟着收紧，两个名字都不许出现。
+            Regex("(messageQueue|inbox)\\s*\\.").containsMatchIn(interjection),
         )
         assertFalse(
             "群插话不许调用 handleMessageComplete",

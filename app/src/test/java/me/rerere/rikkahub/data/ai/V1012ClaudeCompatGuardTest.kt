@@ -487,9 +487,19 @@ class V1012ClaudeCompatGuardTest {
         // 说明这条「固定税」光靠注释提醒不住，必须把「两处一起改」做成能被机器发现的形式。
         // v1026：起用机器门禁 —— full_chain 在编译之前就会扫所有 versionCode/versionName
         // 字面断言并与本次发布号比对，漏改会在几十秒内被拦下，不用等一轮全量测试。
-        // v1029：三处一起改（1029 / 3.1.1-mod27）。机器门禁已在岗，漏改会在编译前被拦。
-        assertTrue("版本号必须前进，否则用户装不上", gradle.contains("versionCode = 1029"))
-        assertTrue(gradle.contains("versionName = \"3.1.1-mod27\""))
+        // v1030：三处一起改（1030 / 3.1.2-mod28）。机器门禁已在岗，漏改会在编译前被拦。
+        // v1031：Antigravity 身份 + `-disabled` 过滤 + 裸名补档位 + 拉取失败可见，1031 / 3.1.2-mod29。
+        // v1032：经典压缩「用户发言保护」（原话逐字附在摘要末尾），1032 / 3.1.2-mod30。
+        // v1033：保护口径升级为「全量永久逐字 + 不设上限」，1033 / 3.1.2-mod31。
+        // v1034：兼容官方 3.2.0，1034 / 3.2.0-mod32。（旧版保护口径继续保留）
+        // v1035：仅修小窗实时回复接线，递增版本以便覆盖安装。
+        // v1036：经典压缩参数排除接线修复，递增覆盖安装版本。
+        // v1037：反重力视频入口兼容，递增覆盖安装版本。
+        // v1038：新增RT/JSON导入，继续递增覆盖安装版本。
+        // v1039：Codex 模型目录与子代理外层用量，递增覆盖安装版本。
+        // v1040：子代理共享思考等级，递增覆盖安装版本。
+        assertTrue("版本号必须前进，否则用户装不上", gradle.contains("versionCode = 1040"))
+        assertTrue(gradle.contains("versionName = \"3.2.0-mod38\""))
         // 三依赖保持官方版本，不许锁回旧版
         val libs = source("gradle/libs.versions.toml")
         assertTrue(libs.contains("haze"))

@@ -84,8 +84,27 @@ class GenerationAgentBackendTest {
         assertTrue(isolated.lorebookIds.isEmpty())
         // 主助手 system prompt 不进入子代理
         assertFalse(isolated.systemPrompt.contains("主助手系统提示词"))
-        // 模型/推理档位继承主助手（不改动）
+        // 未选择子代理档位时，仍继承主助手的推理档位。
         assertEquals(ReasoningLevel.MAX, isolated.reasoningLevel)
+    }
+
+    @Test
+    fun `子代理各角色可用最大思考而不改变主助手低档`() {
+        val main = baseAssistant().copy(reasoningLevel = ReasoningLevel.LOW)
+        for (role in AgentRole.entries) {
+            val isolated = buildIsolatedAssistant(main, thread(role = role), reasoningLevelOverride = ReasoningLevel.MAX)
+            assertEquals(role.name, ReasoningLevel.MAX, isolated.reasoningLevel)
+            assertEquals(ReasoningLevel.LOW, main.reasoningLevel)
+        }
+    }
+
+    @Test
+    fun `独立自动和关闭均不等于跟随主助手`() {
+        val main = baseAssistant().copy(reasoningLevel = ReasoningLevel.HIGH)
+        assertEquals(ReasoningLevel.HIGH, buildIsolatedAssistant(main, thread(), reasoningLevelOverride = null).reasoningLevel)
+        assertEquals(ReasoningLevel.AUTO, buildIsolatedAssistant(main, thread(), reasoningLevelOverride = ReasoningLevel.AUTO).reasoningLevel)
+        assertEquals(ReasoningLevel.OFF, buildIsolatedAssistant(main, thread(), reasoningLevelOverride = ReasoningLevel.OFF).reasoningLevel)
+        assertEquals(ReasoningLevel.HIGH, main.reasoningLevel)
     }
 
     @Test

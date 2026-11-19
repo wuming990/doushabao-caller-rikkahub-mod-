@@ -115,9 +115,15 @@ class GeminiProvider(
         params: TextGenerationParams,
     ): Flow<StreamChunk> = callbackFlow {
         val account = repository.acquireAccount()
+        // v1031：Antigravity 这条通道只认带档位的真实 id，裸名在这里补一档（详见
+        // [antigravityWireModelId]）。补过就记一条日志，别静默改用户看到的东西。
+        val wireModelId = antigravityWireModelId(params.model.modelId)
+        if (wireModelId != params.model.modelId) {
+            Logging.log(TAG, "Antigravity 模型名补档位: ${params.model.modelId} → $wireModelId")
+        }
         val requestBody = buildJsonObject {
             put("project", account.projectId)
-            put("model", params.model.modelId)
+            put("model", wireModelId)
             // v279：官方 Antigravity 在信封上自报流量类型，缺这三个字段的请求会被 Cloud Code
             // Assist 当成非 agent 流量拒掉。badlogic/pi-mono issue #554 是一模一样的症状
             // （userAgent 不是 "antigravity"、没有 requestType 时全部 429），PR #571 补上
@@ -134,7 +140,7 @@ class GeminiProvider(
                         )
                     ),
                     messages,
-                ).also { logAntigravityToolShape(it, params.model.modelId) }
+                ).also { logAntigravityToolShape(it, wireModelId) }
             )
         }
         val request = Request.Builder()
@@ -392,8 +398,44 @@ private fun parseErrorMessage(body: String?, json: Json): String? {
 internal val DENIED_MODEL_IDS = setOf("gemini-3.1-pro-high")
 
 /**
+ * v1031：谷歌给「这个账号在当前订阅档位下用不了」的 Argon 留的是**占位条目**，不是普通条目加个
+ * 标志：id 自己就带 `-disabled` 尾巴，显示名却仍写 "Gemini 4 Argon"，拿它发请求**每一次**都是
+ * `404 Requested entity was not found`（yetone/magpie issue #3339；lbjlaq/Antigravity-Manager
+ * 的 `model_mapping.rs` 用的是同一条判据：`contains("-disabled") || ends_with("_disabled")`）。
+ *
+ * 只按 **id 形态** 判，**不看 `disabled: true` 标志**：两边证据互相矛盾 —— magpie 明确说普通
+ * id 上的 `disabled:true` 是「模型在，只是这个会话没开」，仍应列出；oh-my-pi 则连标志一起跳。
+ * 在这种矛盾下不新增本地黑名单、目录照谷歌返回（与 §5.3 网页版那条纪律同一口径），
+ * 只把「怎么调都必失败」的占位 id 挡掉。
+ */
+internal fun isDisabledPlaceholderModelId(modelId: String): Boolean {
+    val lower = modelId.lowercase()
+    return lower.contains("-disabled") || lower.endsWith("_disabled")
+}
+
+/**
+ * v1031：Antigravity 这条通道上，Argon **没有裸名**。上游有效的 id 只有带档位的三个：
+ * `gemini-4-argon-low` / `-medium` / `-high`；裸 `gemini-4-argon` 即使身份正确也 404
+ * （Wei-Shaw/sub2api issue #8062 实测）。用户在旧版本里手填过裸名，或者从别处复制来裸名时，
+ * 这里兜一档，而不是让请求必失败。
+ *
+ * 默认落 `-medium`：谷歌官方开发者文档写 Argon 的 default thinking = medium
+ * （aistudio.google.com/learn/gemini-4-argon-developer-guide），jcode PR #1834 也映射到 medium。
+ *
+ * **刻意只兜 Argon**：`gemini-3.8-flash`、`claude-*-5-5` 这些裸名有没有同样的问题，公开证据里
+ * 没有结论，而它们现在是能用的 —— 给能用的东西改行为就是制造新故障，不在本轮做。
+ * 已经带档位后缀的 id 一律原样透传（后缀是真实 id 的一部分，不是我们该剥掉的思考档位别名，
+ * 见 NoeFabris/opencode-antigravity-auth 的 `advertisedModelIds` 说明）。
+ */
+internal fun antigravityWireModelId(modelId: String): String = when (modelId) {
+    "gemini-4-argon" -> "gemini-4-argon-medium"
+    else -> modelId
+}
+
+/**
  * Parses the `fetchAvailableModels` response body's `models` object into the list of [Model]s the
- * provider offers, filtering out internal-only entries and [DENIED_MODEL_IDS]. An absent or empty
+ * provider offers, filtering out internal-only entries, [DENIED_MODEL_IDS] and the
+ * `-disabled` placeholder ids (v1031). An absent or empty
  * `models` object yields an empty list.
  */
 private fun mapAvailableModels(body: String, json: Json): List<Model> {
@@ -403,6 +445,8 @@ private fun mapAvailableModels(body: String, json: Json): List<Model> {
         val item = element as? JsonObject ?: return@mapNotNull null
         if (item["isInternal"]?.jsonPrimitive?.booleanOrNull == true) return@mapNotNull null
         if (modelId in DENIED_MODEL_IDS) return@mapNotNull null
+        // v1031：必 404 的 `-disabled` 占位条目不进目录（见 isDisabledPlaceholderModelId）。
+        if (isDisabledPlaceholderModelId(modelId)) return@mapNotNull null
         val supportsImages = item["supportsImages"]?.jsonPrimitive?.booleanOrNull == true
         Model(
             modelId = modelId,

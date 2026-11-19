@@ -39,6 +39,7 @@ val viewModelModule = module {
             analytics = get(),
             filesManager = get(),
             favoriteRepository = get(),
+            backgroundShellManager = get(),
             agentThreadManager = get(),
             // v297：本对话 token 累计
             messageNodeDAO = get(),
@@ -99,6 +100,7 @@ val viewModelModule = module {
             id = it.get(),
             repository = get(),
             terminalSessionManager = get(),
+            backgroundShellManager = get(),
         )
     }
     viewModel<WorkspaceSshEditorVM> {

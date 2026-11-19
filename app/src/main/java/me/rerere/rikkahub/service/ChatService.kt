@@ -34,6 +34,8 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonObject
@@ -129,6 +131,8 @@ import me.rerere.rikkahub.data.model.clampResumeMax
 import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.AssistantMemory
 import me.rerere.rikkahub.data.model.AutoCompressModelSource
+// v1034 合并官方 3.2.0：自动压缩阈值要读上一轮真实上下文占用
+import me.rerere.rikkahub.data.model.lastContextTokens
 import me.rerere.rikkahub.data.model.AssistantAffectScope
 import me.rerere.rikkahub.data.model.MessageNode
 import me.rerere.rikkahub.data.model.sanitizeGroupMembers
@@ -409,6 +413,8 @@ class ChatService(
     private val agentThreadManager: me.rerere.rikkahub.agent.runtime.AgentThreadManager,
     // v310：谷歌账号通道的独立搜索工具（google_search）用同一个客户端执行
     private val geminiSearchClient: GeminiSearchClient,
+    // 官方 3.1.2：后台命令的生命周期与完成通知
+    private val backgroundShellManager: BackgroundShellManager,
 ) {
     // workspace 系统提示注入 (依赖 workspaceRepository, 故在类内构造)
     private val workspaceReminderTransformer = WorkspaceReminderTransformer(workspaceRepository)
@@ -526,14 +532,23 @@ class ChatService(
         conversationId: Uuid,
         additionalPrompt: String,
         keepRecentMessages: Int,
+        // v1032：用户发言保护，和「上次选的是哪种压缩模式」一样全局记住，下次打开对话框还停在用户上次的选择。
+        protectUserMessages: Boolean = false,
     ): Job = manualCompressionTasks.launch(conversationId.toString()) {
         sessionManager.withSession(conversationId) {
             try {
                 // v1024：经典模式同样固定本任务设置；后续切对话不改变已发起任务的模型上下文。
                 val taskSettings = settingsStore.awaitLoaded()
-                settingsStore.update { it.copy(compressUseClassicMode = true) }
-                compressConversationClassic(conversationId, additionalPrompt, keepRecentMessages,
-                    manualSettingsOverride = taskSettings).getOrThrow()
+                settingsStore.update {
+                    it.copy(
+                        compressUseClassicMode = true,
+                        compressClassicProtectUserMessages = protectUserMessages,
+                    )
+                }
+                compressConversationClassic(
+                    conversationId, additionalPrompt, keepRecentMessages, protectUserMessages,
+                    manualSettingsOverride = taskSettings,
+                ).getOrThrow()
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -549,16 +564,91 @@ class ChatService(
 
     fun cleanup() = runCatching { sessionManager.cleanup() }
 
+    init {
+        appScope.launch {
+            backgroundShellManager.noticeEvents.collect { event ->
+                when (event) {
+                    is BackgroundShellNoticeEvent.Posted -> postNotice(event.conversationId, event.key, event.notice)
+                    is BackgroundShellNoticeEvent.Withdrawn ->
+                        sessionManager.get(event.conversationId)?.inbox?.withdraw(event.key)
+                }
+            }
+        }
+    }
+
     // ---- Session 管理 ----
 
     private fun onSessionGenerationFinished(session: ConversationSession, cause: Throwable?) {
-        if (cause != null) session.messageQueue.pause()
+        // 取消只来自停止（已自行暂停）或删除，这里再暂停会盖掉停止后用户发送时恢复的队列
+        if (cause != null && cause !is CancellationException) session.inbox.pause()
         if (session.state.value.currentMessages.any { message ->
                 message.parts.any { it is UIMessagePart.Tool && it.isPending }
             }) {
-            session.messageQueue.failReplyWaiters(context.getString(R.string.chat_page_voice_tool_approval))
+            session.inbox.failReplyWaiters(context.getString(R.string.chat_page_voice_tool_approval))
         }
-        appScope.launch { dispatchNextQueuedMessage(session.id) }
+        appScope.launch {
+            // v1034 合并官方 3.2.0：先试自动压缩，压缩任务结束时会自己再回到 dispatchInbox。
+            // 开关默认关闭（settings.enableAutoCompress = false），关掉时这里直接返回 null，
+            // 与 v1033 行为逐字节一致。
+            if (cause == null && launchAutoCompressIfNeeded(session) != null) return@launch
+            dispatchInbox(session.id)
+        }
+    }
+
+    /**
+     * v1034：官方 3.2.0 新增的「对话过长时自动压缩历史」——**只收官方的触发时机，
+     * 执行一律走我们已有的那条压缩（智能 / 经典二选一）**。
+     *
+     * 为什么不照抄官方的 insertCompressionCheckpoint：
+     * ① 官方那条只用它自己的摘要提示词、不读我们的 compressModelId（固定压缩模型）、
+     *    也不带「用户原话逐字账本」——照抄等于把用户在我们设置里做的选择悄悄作废，
+     *    这正是合并上游最该防的静默退化（PROJECT-MANUAL §5）；
+     * ② 官方把压缩塞进生成任务槽（期间界面卡住、消息排队），而 v1024 是用户明确要的
+     *    「压缩期间照样能切对话、能发消息」。
+     * 所以这里分派给 startManualCompression / startManualClassicCompression：模式、
+     * 压缩模型、用户发言保护、错误提示、后台任务登记全部沿用现状。
+     */
+    private fun launchAutoCompressIfNeeded(session: ConversationSession): Job? {
+        synchronized(session) {
+            val settings = settingsStore.settingsFlow.value
+            if (!settings.enableAutoCompress || !session.isInitialized) return null
+            // 正在生成 / 等审批 / 队列暂停时都不插队
+            if (!session.canStartNextTurn || session.inbox.state.value.paused) return null
+            val conversation = session.state.value
+            val reply = conversation.currentMessages.lastOrNull { it.role == MessageRole.ASSISTANT } ?: return null
+            // 同一条回复只试一次：压缩失败过就不再反复压（官方 3.2.0 的 autoCompressedReplyId 判据）
+            if (reply.id == session.autoCompressedReplyId) return null
+            val model = settings.getChatModelOf(conversation) ?: return null
+            if (!reachesAutoCompressThreshold(model, conversation.lastContextTokens())) return null
+
+            session.autoCompressedReplyId = reply.id
+            return if (settings.compressUseClassicMode) {
+                startManualClassicCompression(
+                    conversationId = session.id,
+                    additionalPrompt = "",
+                    keepRecentMessages = 0,
+                    protectUserMessages = settings.compressClassicProtectUserMessages,
+                )
+            } else {
+                startManualCompression(
+                    conversationId = session.id,
+                    additionalPrompt = "",
+                    modelSource = CompressionModelSource.FIXED,
+                    customPrompt = settings.compressPrompt,
+                )
+            }
+        }
+    }
+
+    /**
+     * v1034 官方 3.2.0 的阈值判据：本轮上下文占用 ≥ 聊天模型窗口 × autoCompressThreshold。
+     * 只在 enableAutoCompress 打开时才可能为 true；读不到占用、或模型没声明窗口长度时不压
+     * （宁可不压，也不能拿 0 去比，那样每轮都会压一次）。
+     */
+    private fun reachesAutoCompressThreshold(model: Model, contextTokens: Int?): Boolean {
+        val settings = settingsStore.settingsFlow.value
+        if (!settings.enableAutoCompress || contextTokens == null || model.contextLength <= 0) return false
+        return contextTokens >= model.contextLength * settings.autoCompressThreshold
     }
 
     private fun getOrCreateSession(conversationId: Uuid): ConversationSession =
@@ -604,6 +694,7 @@ class ChatService(
     private fun launchGenerationJob(
         conversationId: Uuid,
         keepAliveInBackground: Boolean = true,
+        activity: SessionActivity = SessionActivity.Generating,
         block: suspend () -> Unit,
     ): Job {
         if (!keepAliveInBackground) return appScope.launch(start = CoroutineStart.LAZY) { block() }
@@ -614,6 +705,7 @@ class ChatService(
                 context = context,
                 generationId = generationId,
                 conversationId = conversationId,
+                activity = activity,
             )
             try {
                 block()
@@ -626,6 +718,10 @@ class ChatService(
     }
 
     fun getConversationJobs(): Flow<Map<Uuid, Job?>> = sessionManager.getConversationJobs()
+
+    /** 任务槽里的任务在做什么，槽空着时是 null（v1034 合并官方 3.2.0） */
+    fun getActivityFlow(conversationId: Uuid): Flow<SessionActivity?> =
+        sessionManager.getActivityFlow(conversationId)
 
     // ---- 初始化对话 ----
 
@@ -676,25 +772,25 @@ class ChatService(
 
     // ---- 发送消息 ----
 
-    fun getMessageQueueFlow(conversationId: Uuid): StateFlow<MessageQueueState> =
-        getOrCreateSession(conversationId).messageQueue.state
+    fun getInboxFlow(conversationId: Uuid): StateFlow<InboxState> =
+        getOrCreateSession(conversationId).inbox.state
 
-    fun removeQueuedMessage(conversationId: Uuid, messageId: Uuid) {
-        sessionManager.get(conversationId)?.messageQueue?.remove(messageId)?.let(::cleanupQueuedAttachments)
-        dispatchNextQueuedMessage(conversationId)
+    fun removeInboxItem(conversationId: Uuid, messageId: Uuid) {
+        (sessionManager.get(conversationId)?.inbox?.remove(messageId) as? QueuedMessage)?.let(::cleanupQueuedAttachments)
+        dispatchInbox(conversationId)
     }
 
     fun beginEditQueuedMessage(conversationId: Uuid, messageId: Uuid): QueuedMessage? =
-        sessionManager.get(conversationId)?.messageQueue?.beginEdit(messageId)
+        sessionManager.get(conversationId)?.inbox?.beginEdit(messageId)
 
     fun finishEditQueuedMessage(
         conversationId: Uuid,
         messageId: Uuid,
         parts: List<UIMessagePart>? = null
     ) {
-        sessionManager.get(conversationId)?.messageQueue?.finishEdit(messageId, parts)
+        sessionManager.get(conversationId)?.inbox?.finishEdit(messageId, parts)
             ?.let(::cleanupQueuedAttachments)
-        dispatchNextQueuedMessage(conversationId)
+        dispatchInbox(conversationId)
     }
 
     private fun cleanupQueuedAttachments(previous: QueuedMessage) {
@@ -711,7 +807,7 @@ class ChatService(
                     previous = previous,
                     conversations = currentSessions.map { it.state.value },
                     pendingMessages = currentSessions.flatMap {
-                        it.messageQueue.state.value.messages + listOfNotNull(it.submittingMessage)
+                        it.inbox.state.value.messages + listOfNotNull(it.submittingMessage)
                     },
                 ) - persistedReferences
                 if (unusedFiles.isNotEmpty()) {
@@ -725,9 +821,9 @@ class ChatService(
         }
     }
 
-    fun resumeMessageQueue(conversationId: Uuid) {
-        sessionManager.get(conversationId)?.messageQueue?.resume()
-        dispatchNextQueuedMessage(conversationId)
+    fun resumeInbox(conversationId: Uuid) {
+        sessionManager.get(conversationId)?.inbox?.resume()
+        dispatchInbox(conversationId)
     }
 
     fun sendMessage(conversationId: Uuid, content: List<UIMessagePart>, answer: Boolean = true) {
@@ -739,9 +835,9 @@ class ChatService(
         if (answer && tryGroupInterjection(conversationId, content)) return
         val session = getOrCreateSession(conversationId)
         synchronized(session) {
-            if (session.messageQueue.state.value.messages.isEmpty()) session.messageQueue.resume()
-            session.messageQueue.enqueue(content, answer)
-            dispatchNextQueuedMessage(conversationId)
+            if (session.inbox.state.value.messages.isEmpty()) session.inbox.resume()
+            session.inbox.enqueue(content, answer)
+            dispatchInbox(conversationId)
         }
     }
 
@@ -751,36 +847,86 @@ class ChatService(
         val reply = CompletableDeferred<String?>()
         synchronized(session) {
             check(text.isNotBlank()) { context.getString(R.string.chat_page_voice_empty) }
-            check(!session.messageQueue.state.value.paused || session.messageQueue.state.value.messages.isEmpty()) {
+            check(!session.inbox.state.value.paused || session.inbox.state.value.messages.isEmpty()) {
                 context.getString(R.string.chat_page_voice_resume_queue)
             }
             check(session.state.value.currentMessages.none { message ->
                 message.parts.any { it is UIMessagePart.Tool && it.isPending }
             }) { context.getString(R.string.chat_page_voice_tools_before_resume) }
-            if (session.messageQueue.state.value.messages.isEmpty()) session.messageQueue.resume()
-            session.messageQueue.enqueue(listOf(UIMessagePart.Text(text)), reply = reply)
-            dispatchNextQueuedMessage(conversationId)
+            if (session.inbox.state.value.messages.isEmpty()) session.inbox.resume()
+            session.inbox.enqueue(listOf(UIMessagePart.Text(text)), reply = reply)
+            dispatchInbox(conversationId)
         }
         return reply
     }
 
-    private fun dispatchNextQueuedMessage(conversationId: Uuid): Job? {
+    /**
+     * 放入一条运行时通知，例如后台命令结束。
+     * 正在生成时这一轮在下一步请求模型前取走；空闲时主动开一轮，不用等用户再发消息。
+     */
+    fun postNotice(conversationId: Uuid, key: String, notice: UIMessagePart.Notice) {
+        sessionManager.getOrCreate(conversationId).inbox.post(key, notice)
+        dispatchInbox(conversationId)
+    }
+
+    /** 会话空闲时从收件箱开始下一轮：先发用户输入，只剩通知时单独开一轮 */
+    private fun dispatchInbox(conversationId: Uuid): Job? {
         val session = sessionManager.get(conversationId) ?: return null
         synchronized(session) {
             // A pending tool approval is still part of the current turn.
-            if (session.getJob() != null || session.state.value.currentMessages.any { message ->
+            // v1034：官方 3.2.0 把「任务槽被占（含压缩任务）+ 等审批」收成一条 canStartNextTurn；
+            // 我们原来那条「压缩中就不插队」的标记判据跟着没了（会话里这个字段已被官方删除），
+            // 但**我们自己的「任何待处理工具」判据保留**——它比官方的 isAwaitingToolApproval 更严，
+            // 是 v306 时代为了不重复回复加的，不能因为官方换了写法就放宽。
+            if (!session.canStartNextTurn) return null
+            if (session.state.value.currentMessages.any { message ->
                     message.parts.any { it is UIMessagePart.Tool && it.isPending }
                 }) return null
-            val next = session.messageQueue.takeNext() ?: return null
-            session.submittingMessage = next
-            return sendQueuedMessage(session, next)
+            return when (val next = session.inbox.takeNext() ?: return null) {
+                is InboxTurn.Message -> {
+                    session.submittingMessage = next.message
+                    sendQueuedMessage(session, next.message)
+                }
+
+                InboxTurn.Notices -> sendQueuedNotices(session)
+            }
         }
     }
+
+    /** 只有通知在等时开的一轮：通知存成一个 user 节点，模型的回复是它的下一个节点 */
+    private fun sendQueuedNotices(session: ConversationSession): Job {
+        val conversationId = session.id
+        session.replyMessageId.value = null
+        val job = launchGenerationJob(conversationId = conversationId) {
+            try {
+                val notices = session.inbox.takeNotices()
+                if (notices.isEmpty()) return@launchGenerationJob
+                val currentConversation = session.state.value
+                val newConversation = currentConversation.copy(
+                    messageNodes = currentConversation.messageNodes + notices.toNoticeNode(),
+                )
+                saveConversation(conversationId, newConversation)
+                handleMessageComplete(conversationId)
+                _generationDoneFlow.emit(conversationId)
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                session.inbox.pause()
+                addError(e, conversationId, title = context.getString(R.string.error_title_generation))
+            }
+        }
+        session.setJob(job)
+        return job
+    }
+
+    private fun List<UIMessagePart.Notice>.toNoticeNode() =
+        UIMessage(role = MessageRole.USER, parts = this).toMessageNode()
 
     private fun sendQueuedMessage(session: ConversationSession, queued: QueuedMessage): Job {
         val conversationId = session.id
         val content = queued.parts
         val answer = queued.answer
+        // v1035：新回复在附件预处理前清掉旧小窗预览；只保存用户消息时不清。
+        if (answer) session.trackFloatingReply(emptyList())
         val job = launchGenerationJob(
             conversationId = conversationId,
             keepAliveInBackground = answer,
@@ -795,11 +941,15 @@ class ChatService(
                 val processedContent = preprocessUserInputParts(content, assistant)
 
                 // 添加消息到列表
+                // 等待中的通知存成用户消息之前的节点；不回复时留在收件箱，这一轮结束后单独开一轮
+                val notices = if (answer) session.inbox.takeNotices() else emptyList()
                 val newConversation = currentConversation.copy(
-                    messageNodes = currentConversation.messageNodes + UIMessage(
-                        role = MessageRole.USER,
-                        parts = processedContent,
-                    ).toMessageNode(),
+                    messageNodes = currentConversation.messageNodes +
+                        listOfNotNull(notices.takeIf { it.isNotEmpty() }?.toNoticeNode()) +
+                        UIMessage(
+                            role = MessageRole.USER,
+                            parts = processedContent,
+                        ).toMessageNode(),
                 )
                 saveConversation(conversationId, newConversation)
                 session.submittingMessage = null
@@ -811,7 +961,7 @@ class ChatService(
 
                 queued.reply?.completeWith(runCatching {
                     val messages = session.state.value.currentMessages
-                    check(!session.messageQueue.state.value.paused) { context.getString(R.string.chat_page_voice_generation_failed) }
+                    check(!session.inbox.state.value.paused) { context.getString(R.string.chat_page_voice_generation_failed) }
                     check(messages.none { message -> message.parts.any { it is UIMessagePart.Tool && it.isPending } }) {
                         context.getString(R.string.chat_page_voice_tool_approval)
                     }
@@ -826,7 +976,7 @@ class ChatService(
                 queued.reply?.completeExceptionally(e)
                 e.printStackTrace()
                 if (e is CancellationException) throw e
-                session.messageQueue.pause()
+                session.inbox.pause()
                 addError(e, conversationId, title = context.getString(R.string.error_title_send_message))
             }
         }
@@ -867,6 +1017,8 @@ class ChatService(
     ) = synchronized(getOrCreateSession(conversationId)) {
         val session = getOrCreateSession(conversationId)
         val previousJob = session.getJob()
+        // v1035：重生成期间不能把另一条旧回复当作本轮预览；不生成时保持原状。
+        if (message.role == MessageRole.USER || regenerateAssistantMsg) session.trackFloatingReply(emptyList())
 
         val job = launchGenerationJob(
             conversationId = conversationId,
@@ -898,7 +1050,7 @@ class ChatService(
                 _generationDoneFlow.emit(conversationId)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
-                session.messageQueue.pause()
+                session.inbox.pause()
                 addError(e, conversationId, title = context.getString(R.string.error_title_regenerate_message))
             }
         }
@@ -3122,6 +3274,7 @@ class ChatService(
                     settings = settingsStore.settingsFlow.first(),
                     assistant = assistant,
                     model = model,
+                    conversationId = conversation.id,
                     workspaceCwd = conversation.workspaceCwd,
                 )
 
@@ -3887,7 +4040,7 @@ class ChatService(
                 }
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
-                session.messageQueue.pause()
+                session.inbox.pause()
                 addError(e, conversationId, title = context.getString(R.string.error_title_tool_approval))
             }
         }
@@ -3901,6 +4054,9 @@ class ChatService(
         conversationId: Uuid,
         messageRange: ClosedRange<Int>? = null
     ) {
+        // v1035：挂起读取设置或准备工具失败时，小窗也不能继续冒充上一轮回复。
+        val session = getOrCreateSession(conversationId)
+        session.trackFloatingReply(emptyList())
         val settings = settingsStore.settingsFlow.first()
         val initialConversation = getConversationFlow(conversationId).value
         // v323：必须用「会话视角」的助手与模型（官方 3.1 的 ChatRequestFactory.createContext 口径）。
@@ -3943,10 +4099,11 @@ class ChatService(
                     settings = settings,
                     assistant = assistant,
                     model = model,
+                    conversationId = conversation.id,
                     workspaceCwd = conversation.workspaceCwd,
                 )
             } catch (error: InvalidMcpServerNamesException) {
-                sessionManager.get(conversationId)?.messageQueue?.pause()
+                sessionManager.get(conversationId)?.inbox?.pause()
                 addError(
                     error = IllegalStateException(
                         context.getString(
@@ -3960,18 +4117,30 @@ class ChatService(
             }
 
             // start generating
-            val session = getOrCreateSession(conversationId)
+            // v1034：官方 3.2.0 的「中途压缩」需要在一轮回复内部续写，而不是重开一轮
+            // （重开会把「生成完成通知 / 语音朗读 / 标题 / 建议」重复触发一遍，
+            //   半截回复也会被当成一条完整回复收尾）。
+            // ⚠️ 用户没打开「自动压缩」时，钩子恒为 false → midTurnPaused 永远是 false
+            // → 这个 while 只跑一次，行为与 v1033 逐字节等价。
+            var generationMessages: List<UIMessage> = conversation.currentMessages.let {
+                if (messageRange != null) {
+                    it.subList(messageRange.start, messageRange.endInclusive + 1)
+                } else {
+                    it
+                }
+            }
+            var midTurnPaused = false
+            var afterMidTurnCompression = false
+            var midTurnCompressionUseless = false
+            while (true) {
+                midTurnPaused = false
+                // v1035：续写时预览实际输入的末条助手；中途压缩后的检查点则清空等待新回复。
+                session.trackFloatingReply(generationMessages)
             generationLoop.generateText(
                 settings = settings,
                 model = model,
                 processingStatus = session.processingStatus,
-                messages = conversation.currentMessages.let {
-                    if (messageRange != null) {
-                        it.subList(messageRange.start, messageRange.endInclusive + 1)
-                    } else {
-                        it
-                    }
-                },
+                messages = generationMessages,
                 assistant = assistant,
                 conversationId = conversationId,
                 conversationSystemPrompt = conversation.customSystemPrompt,
@@ -4003,6 +4172,29 @@ class ChatService(
                 // 带上游 stop_reason 原文的说明（判据与界面渲染用同一把尺子，不会误伤
                 // 「只回工具调用」「只回图片」）。圆桌/子代理/群组/压缩/翻译不传，行为不变。
                 reportEmptyReplyAsError = true,
+                // v1034：官方 3.2.0「一轮回复中途压缩上下文」的判断函数。
+                // ⚠️ 用户没打开「自动压缩」开关时，第一行就 return false —— 与 v1033 完全一致。
+                // 判据照官方 3.2.0 的 pauseAfterTools：① 这条回复必须是对话末尾正在写的那条
+                // （重新生成较早消息时后面还挂着别的节点，不压）；② 同一条回复只试一次；
+                // ③ 占用达到 模型窗口 × autoCompressThreshold 才压；④ 压缩后新开的那段
+                // 如果只走了一步就又到达阈值，说明"摘要+系统提示词本身就超了"，再压也没用，
+                // 本轮不再压（防来回压）。
+                pauseAfterTools = pause@{ message ->
+                    if (!settings.enableAutoCompress) return@pause false
+                    if (messageRange != null) return@pause false
+                    if (midTurnCompressionUseless) return@pause false
+                    if (message.id == session.autoCompressedReplyId) return@pause false
+                    if (!reachesAutoCompressThreshold(model, message.contextTokens())) return@pause false
+                    if (afterMidTurnCompression && (message.stepCount ?: 0) <= 1) {
+                        midTurnCompressionUseless = true
+                        return@pause false
+                    }
+                    session.autoCompressedReplyId = message.id
+                    midTurnPaused = true
+                    // v1034：这里只请求暂停，不在带 flowOn 的流生产端修改会话。
+                    // 下方 collect 把这一批工具结果完整写回以后，再执行选中的压缩模式。
+                    true
+                },
                 // v319：主对话拼上下文时剥掉「群组期间发言」的工具与搜索结果，只留方案与对话文字。
                 // 用户口径：解散群之后「不把群聊里的搜索/调用工具上文带出去」。
                 // 只影响这次发给模型的请求，对话记录本身一个字都不删（群里查过什么仍可回看）。
@@ -4127,22 +4319,28 @@ class ChatService(
                     is CancellationException -> GenerationEndReason.CANCELLED
                     else -> GenerationEndReason.FAILED
                 }
-                generationEndReported = true
-                appEventBus.tryEmit(
-                    AppEvent.ChatGenerationEnded(
-                        conversationId = conversationId,
-                        senderName = senderName,
-                        reason = reason,
-                        contentPreview = updatedConversation.currentMessages.lastOrNull()
-                            ?.toText()?.take(80)?.trim()?.takeIf { it.isNotBlank() },
+                // v1034：中途压缩造成的"这一趟先停下"不算本轮结束 —— 不发结束事件，
+                // 否则通知栏误报完成、语音抢先朗读半截内容、标题与建议也会提前生成一遍。
+                if (!midTurnPaused) {
+                    generationEndReported = true
+                    appEventBus.tryEmit(
+                        AppEvent.ChatGenerationEnded(
+                            conversationId = conversationId,
+                            senderName = senderName,
+                            reason = reason,
+                            contentPreview = updatedConversation.currentMessages.lastOrNull()
+                                ?.toText()?.take(80)?.trim()?.takeIf { it.isNotBlank() },
+                        )
                     )
-                )
+                }
             }.collect { chunk ->
                 when (chunk) {
                     is GenerationChunk.Messages -> {
                         val updatedConversation = getConversationFlow(conversationId).value
                             .updateCurrentMessages(chunk.messages)
                         updateConversation(conversationId, updatedConversation)
+                        // v1035：先让消息可读，再立即同步小窗回复 ID；不能等落库、通知或整轮结束。
+                        session.trackFloatingReply(chunk.messages)
 
                         // 低频检查点：避免切换页面、进程被杀或上游中断时丢掉整段输出。
                         val now = SystemClock.elapsedRealtime()
@@ -4165,6 +4363,29 @@ class ChatService(
                     }
                 }
             }
+                if (!midTurnPaused) break
+                // v1034：到这里 collect 已收完，工具结果不再滞留在跨线程缓冲区。
+                // 两个模式都只插检查点，原半截回复/已执行工具/历史节点不替换。
+                session.setActivity(SessionActivity.Compressing)
+                session.processingStatus.value = context.getString(R.string.chat_page_compressing)
+                val compressed = try {
+                    compressDuringActiveReply(conversationId, settings)
+                        .onFailure { error ->
+                            Log.w(TAG, "Mid-turn compression failed", error)
+                            addError(error, conversationId, title = context.getString(R.string.error_title_auto_compress))
+                        }.isSuccess
+                } finally {
+                    session.processingStatus.value = null
+                    if (currentCoroutineContext().isActive) session.setActivity(SessionActivity.Generating)
+                }
+                // 失败时没有新检查点，沿现有工具结果继续下一步；不重做已执行工具，
+                // 不把失败冒充压缩成功，也不偷偷追加“压缩失败就停主模型”的新限制。
+                if (compressed) afterMidTurnCompression = true
+                // 压完了：以压缩后的最新历史为输入继续这一轮。检查点已经插在末尾，
+                // 所以下一次请求的末尾是检查点卡片，模型会新开一条回复写在检查点之后
+                // （与官方 3.2.0「之后的步骤写进检查点后面新的一条回复」一致）。
+                generationMessages = getConversationFlow(conversationId).value.currentMessages
+            }
         }.onFailure {
             // 生成流建立前失败时 onCompletion 不会执行，这里补发一次结束事件。
             if (!generationEndReported) {
@@ -4182,7 +4403,7 @@ class ChatService(
                 )
             }
             if (it is CancellationException) throw it
-            sessionManager.get(conversationId)?.messageQueue?.pause()
+            sessionManager.get(conversationId)?.inbox?.pause()
 
             it.printStackTrace()
             addError(it, conversationId, title = context.getString(R.string.error_title_generation))
@@ -4400,6 +4621,46 @@ class ChatService(
         }
     }
 
+    /**
+     * v1034：中途压缩也尊重智能/经典二选一；只复用检查点提交，不替换历史。
+     * 智能分支的请求、提示词、保留原话预算仍完全由既有算法计算，结果回调不落原写回路径。
+     */
+    private suspend fun compressDuringActiveReply(conversationId: Uuid, settings: Settings): Result<Unit> = try {
+        if (settings.compressUseClassicMode) {
+            compressConversationClassic(
+                conversationId = conversationId,
+                additionalPrompt = "",
+                keepRecentMessages = 0,
+                protectUserMessages = settings.compressClassicProtectUserMessages,
+                allowWhileGenerating = true,
+                manualSettingsOverride = settings,
+            )
+        } else {
+            sessionManager.withSession(conversationId) { session ->
+                // 这里只借用“原节点不删、校验源未变、插卡片并保存”的公共提交过程，
+                // 不使用经典模式的摘要提示词，也不把经典的原话保护开关强加给智能模式。
+                session.compressClassicHistory(allowWhileGenerating = true) { source, _ ->
+                    var checkpointText: String? = null
+                    compressConversation(
+                        conversationId = conversationId,
+                        conversation = source,
+                        modelSource = CompressionModelSource.FIXED,
+                        manualSettingsOverride = settings,
+                        checkpointResult = { nodes ->
+                            checkpointText = nodes.joinToString("\n\n") { it.currentMessage.toText() }
+                        },
+                    ).getOrThrow()
+                    checkNotNull(checkpointText)
+                }
+            }
+            Result.success(Unit)
+        }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        Result.failure(e)
+    }
+
     // ---- 压缩对话历史 (照抄 Codex codex-rs/core/src/compact.rs 的本地 compaction) ----
 
     /**
@@ -4420,6 +4681,8 @@ class ChatService(
         expectedManualIncarnation: Int? = null,
         manualPromptOverride: String? = null,
         manualSettingsOverride: Settings? = null,
+        // v1034：中途压缩只取既有算法的结果去插检查点；null 时原写回路径一字不变。
+        checkpointResult: ((List<MessageNode>) -> Unit)? = null,
     ): Result<Unit> = runCatching {
         val settings = manualSettingsOverride ?: settingsStore.settingsFlow.first()
         val assistant = settings.getAssistantById(conversation.assistantId)
@@ -4507,7 +4770,9 @@ class ChatService(
             )
             add(UIMessage.user(CodexCompaction.withSummaryPrefix(summaryText)).toMessageNode())
         }
-        if (expectedManualSource != null) {
+        if (checkpointResult != null) {
+            checkpointResult(newMessageNodes)
+        } else if (expectedManualSource != null) {
             // v1024：只保护手动后台提交；摘要期间有新发言/编辑则不拿旧摘要覆盖。
             val session = getOrCreateSession(conversationId)
             commitManualSmartCompression(
@@ -4573,6 +4838,12 @@ class ChatService(
         conversationId: Uuid,
         additionalPrompt: String,
         keepRecentMessages: Int = 0,
+        // v1032：「用户发言保护」。默认 false —— 关掉时摘要正文与 v1031 完全一致。
+        // v1033：开启时附上「从对话第一条到本次压缩终点」的全部用户原话（逐字、不设长度上限），
+        // 连续多次压缩也都重新带全量；算法/提示词/模型来源都不换。
+        protectUserMessages: Boolean = false,
+        // v1034：仅「一轮中途压缩」传 true（默认 false = 「正在生成不许压」这条守卫原样生效）。
+        allowWhileGenerating: Boolean = false,
         // v1024：仅手动后台入口捕获；其他调用默认null，经典算法与提示词不变。
         manualSettingsOverride: Settings? = null,
     ): Result<Unit> = try {
@@ -4581,7 +4852,11 @@ class ChatService(
                 load = { conversationRepo.getConversationById(conversationId) },
                 create = { session.state.value },
             )
-            session.compressClassicHistory(keepRecentMessages) { conversation, messages ->
+            session.compressClassicHistory(
+                keepRecentMessages = keepRecentMessages,
+                protectUserMessages = protectUserMessages,
+                allowWhileGenerating = allowWhileGenerating,
+            ) { conversation, messages ->
                 val turn = requestFactory.createContext(manualSettingsOverride ?: settingsStore.awaitLoaded(), conversation)
                 requestFactory.generateCompressionSummary(
                     turn = turn,
@@ -4746,7 +5021,7 @@ class ChatService(
 
     private fun checkFilesDelete(newConversation: Conversation, oldConversation: Conversation) {
         val session = sessionManager.get(newConversation.id)
-        val queuedFiles = (session?.messageQueue?.state?.value?.messages.orEmpty() +
+        val queuedFiles = (session?.inbox?.state?.value?.messages.orEmpty() +
                 listOfNotNull(session?.submittingMessage))
             .flatMap { it.parts }.localFileUrls().map { it.toUri() }
         val newFiles = newConversation.files + queuedFiles
@@ -4789,7 +5064,7 @@ class ChatService(
 
         // 删除消息或切换分支也可能解除工具审批阻塞，保存成功后重新检查队列。
         // 调度器仍会检查当前生成任务、待审批工具、暂停状态及编辑占位。
-        dispatchNextQueuedMessage(conversationId)
+        dispatchInbox(conversationId)
     }
 
     /**
@@ -5132,7 +5407,7 @@ class ChatService(
         session.setJob(null)
 
         // v2.5.0 合并：官方语义 —— 停止时暂停消息队列，排队的消息不再派发
-        synchronized(session) { session.messageQueue.pause() }
+        synchronized(session) { session.inbox.pause() }
         session.processingStatus.value = null
 
         appScope.launch {
@@ -5261,20 +5536,28 @@ class ChatService(
     }
 
     suspend fun deleteConversation(conversationId: Uuid) {
-        // v1024：所有公开删除入口在删库前先取消并等待对应手动压缩。
-        cancelManualCompression(conversationId)
+        // v1024：所有公开删除入口在删库前先取消并等待对应手动压缩 + 释放讨论群运行态。
+        releaseGroupStateOnDelete(conversationId)
         conversationRepo.getConversationById(conversationId)?.let { conversationRepo.deleteConversation(it) }
+        // 官方 3.1.2：后台命令随会话一起终止；撤销删除不会恢复它们，终止等宽限期，不阻塞删除
+        appScope.launch { backgroundShellManager.killConversation(conversationId) }
     }
 
     suspend fun restoreConversation(conversation: Conversation) {
         conversationRepo.insertConversation(conversation)
     }
 
+    /** 官方 3.1.2：删除入口共用——后台命令随会话终止，撤销删除也不恢复。 */
+    fun killBackgroundTasks(conversationId: Uuid) {
+        appScope.launch { backgroundShellManager.killConversation(conversationId) }
+    }
+
     suspend fun deleteConversationsOfAssistant(assistantId: Uuid) {
         conversationRepo.getConversationsOfAssistant(assistantId).first().forEach {
             // v1024：按各自对话取消，不能误停其他助手或未删除的对话。
-            cancelManualCompression(it.id)
+            releaseGroupStateOnDelete(it.id)
             conversationRepo.deleteConversation(it)
+            killBackgroundTasks(it.id)
         }
     }
 

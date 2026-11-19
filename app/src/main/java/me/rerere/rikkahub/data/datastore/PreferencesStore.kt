@@ -221,6 +221,10 @@ class SettingsStore internal constructor(
         val OCR_MODEL = stringPreferencesKey("ocr_model")
         val OCR_PROMPT = stringPreferencesKey("ocr_prompt")
 
+        // 自动压缩
+        val ENABLE_AUTO_COMPRESS = booleanPreferencesKey("enable_auto_compress")
+        val AUTO_COMPRESS_THRESHOLD = floatPreferencesKey("auto_compress_threshold")
+
         // 子代理（v219）
         val AGENT_MAX_CONCURRENT = intPreferencesKey("agent_max_concurrent")
         val AGENT_ROLE_MODELS = stringPreferencesKey("agent_role_models")
@@ -292,6 +296,7 @@ class SettingsStore internal constructor(
         // v220 修复：这两项 v219 漏了持久化，导致设置过的子代理模型/开关会被 DataStore
         // 下一次发射用默认值覆盖（表现为“模型自己消失、恢复默认”）。
         val AGENT_ENABLED = booleanPreferencesKey("agent_tools_enabled")
+        val AGENT_REASONING_LEVEL = stringPreferencesKey("agent_reasoning_level")
 
         /**
          * v288：续跑方式。用户二选一：
@@ -344,6 +349,13 @@ class SettingsStore internal constructor(
 
         /** v268：手动压缩上次选择的模式（true = 经典压缩）。 */
         val COMPRESS_USE_CLASSIC_MODE = booleanPreferencesKey("compress_use_classic_mode")
+
+        /**
+         * v1032：经典压缩「用户发言保护」。默认关 —— 缺 key 时必须拿到 false，
+         * 所以读取一律用 `== true`（写成 `!= false` 会让老存档被判成开启，等于偷偷改行为）。
+         */
+        val COMPRESS_CLASSIC_PROTECT_USER_MESSAGES =
+            booleanPreferencesKey("compress_classic_protect_user_messages")
 
         /**
          * v280：允许**子代理**检索用户的历史对话（默认关）。
@@ -489,6 +501,13 @@ class SettingsStore internal constructor(
                     settings.groupChatConfigs.mapKeys { it.key.toString() }
                 )
                 preferences[COMPRESS_USE_CLASSIC_MODE] = settings.compressUseClassicMode
+                // v1032：漏了这一环，用户开完保护、下一次 DataStore 发射就恢复默认（与上面几处同一坑）。
+                preferences[COMPRESS_CLASSIC_PROTECT_USER_MESSAGES] = settings.compressClassicProtectUserMessages
+                // v1034：官方 3.2.0 的自动压缩两项。这条是**备份恢复/整份写**的手写路径，
+                // 与上面的 SETTINGS_FIELDS 是两套；漏写的话导入备份后这两个设置会被抹掉
+                // （v1007 审查位抓过同族问题）。阈值按官方同一区间夹住，不自己发明边界。
+                preferences[ENABLE_AUTO_COMPRESS] = settings.enableAutoCompress
+                preferences[AUTO_COMPRESS_THRESHOLD] = settings.autoCompressThreshold.coerceIn(AUTO_COMPRESS_THRESHOLD_RANGE)
                 // v316：用户方案列表（数组保序，无需转键）。空列表也照写 ——
                 // 只在「一条都没有」时删掉这个键会让 DataStore 里残留旧数据，反而更糟。
                 preferences[GROUP_CHAT_PRESETS] = JsonInstant.encodeToString(settings.groupChatPresets)
@@ -500,6 +519,7 @@ class SettingsStore internal constructor(
                 preferences[AGENT_MAX_STEPS] = normalizeAgentLimit(settings.agentMaxSteps, 32, true)
                 // v220 修复：子代理开关与默认模型必须落盘，否则下一次 DataStore 发射会恢复默认
                 preferences[AGENT_ENABLED] = settings.enableAgentTools
+                AGENT_REASONING_LEVEL_FIELD.write(preferences, settings)
                 settings.agentModelId?.let {
                     preferences[AGENT_MODEL] = it.toString()
                 } ?: preferences.remove(AGENT_MODEL)
@@ -648,6 +668,14 @@ class SettingsStore internal constructor(
                     }.getOrDefault(emptyMap())
                 } ?: emptyMap(),
                 compressUseClassicMode = preferences[COMPRESS_USE_CLASSIC_MODE] == true,
+                // v1032：缺 key 必须读到 false，所以同样只用 `== true`。
+                compressClassicProtectUserMessages = preferences[COMPRESS_CLASSIC_PROTECT_USER_MESSAGES] == true,
+                // v1034 合并官方 3.2.0：官方只把这两个键加进了写路径（SETTINGS_FIELDS），
+                // 而我们的读取是**逐字段手写**的（v1004 起就这样，官方新版已改成通用读取）。
+                // 少读一行 = 用户打开「自动压缩」后，改任何其它设置都会整份落盘把它打回关闭，
+                // 开关变成假的（PROJECT-MANUAL §5.1 记录过同族事故）。缺 key 必须得 false / 0.8f。
+                enableAutoCompress = preferences[ENABLE_AUTO_COMPRESS] == true,
+                autoCompressThreshold = (preferences[AUTO_COMPRESS_THRESHOLD] ?: 0.8f).coerceIn(AUTO_COMPRESS_THRESHOLD_RANGE),
                 // v316：方案列表。坏 JSON / 坏结构一律退回空表 —— 与 groupChatConfigs 同一理由：
                 // 这份设置坏了绝不能连带把整个 Settings 读崩。条数在读取时夹住上限，
                 // 免得手改或旧版本残留把界面撑爆。
@@ -663,6 +691,7 @@ class SettingsStore internal constructor(
                 agentMaxSteps = normalizeAgentLimit((preferences[AGENT_MAX_STEPS] ?: 32), 32, true),
                 // v220 修复：读回子代理开关与默认模型（v219 只写不读/只读不写，会被默认值覆盖）
                 enableAgentTools = preferences[AGENT_ENABLED] != false,
+                agentReasoningLevel = decodeAgentReasoningLevel(preferences[AGENT_REASONING_LEVEL]),
                 agentModelId = preferences[AGENT_MODEL]
                     ?.let { raw -> runCatching { Uuid.parse(raw) }.getOrNull() },
                 agentRoleModelOverrides = decodeAgentRoleModelOverrides(preferences[AGENT_ROLE_MODELS]),

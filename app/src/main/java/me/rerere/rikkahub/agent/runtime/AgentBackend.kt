@@ -19,6 +19,17 @@ import java.time.Instant
 internal fun resumeCheckpointEventId(threadId: String): String = "$threadId:resume_checkpoint"
 
 /**
+ * v1032：token 用量事件的稳定 id。
+ *
+ * 「续跑代次 + 候选模型序号 + 该模型第几次尝试」三段缺一不可：
+ * - 少了代次：续跑后同一模型的新尝试会覆盖上一代的花费，钱被记丢；
+ * - 少了尝试序号：同一个模型重试两次会互相覆盖，只算一次，钱被记少；
+ * - 三段都全：Room 的 REPLACE 覆盖的是「同一次尝试的最新累计值」，既不重复也不遗漏。
+ */
+internal fun agentTokenUsageEventId(threadId: String, resumeCount: Int, ordinal: String): String =
+    "$threadId:token_usage:$resumeCount:$ordinal"
+
+/**
  * v251：续跑模式。
  *
  * - [SUFFIX]：只补缺失的后半段（真正被截断时用），禁止重抄、禁止只回「无需重复」；

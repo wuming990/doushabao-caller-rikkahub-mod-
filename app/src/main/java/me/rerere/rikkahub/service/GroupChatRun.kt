@@ -166,6 +166,9 @@ internal fun groupUtteranceHasKeptContent(message: UIMessage?): Boolean {
             // ⚠️ 这一条是**编译器抓出来的**：我原本用「data class」找全部分片类型，
             // 而 Search 写成 `data object`，漏了。故意不写 else 才让它当场报错而不是静默漏判。
             is UIMessagePart.Search -> false
+            // 官方 3.1.2 新增：运行时通知（后台命令结束等）。它是要交给模型的事实，
+            // 宁可留着也不当“没出声”撤掉。
+            is UIMessagePart.Notice -> true
             // ⚠️ 刻意**不写 else**：官方以后新增一种分片时，编译器会直接报错，
             // 逼着人重新判断「这算不算已经出声」。写成 else 会把新类型默默归进「可以删」那一侧，
             // 那是会丢用户内容的错法（手册 §7.4「静默退化」同一族）。

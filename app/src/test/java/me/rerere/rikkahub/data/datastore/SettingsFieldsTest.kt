@@ -4,6 +4,8 @@ import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.mutablePreferencesOf
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.descriptors.elementNames
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import me.rerere.ai.core.ReasoningLevel
 import me.rerere.ai.provider.ProviderSetting
 import me.rerere.asr.ASRProviderSetting
@@ -18,6 +20,7 @@ import me.rerere.rikkahub.data.model.QuickMessage
 import me.rerere.rikkahub.data.model.Tag
 import me.rerere.rikkahub.data.sync.s3.S3Config
 import me.rerere.rikkahub.ui.theme.CustomTheme
+import me.rerere.rikkahub.utils.JsonInstant
 import me.rerere.search.SearchCommonOptions
 import me.rerere.search.SearchServiceOptions
 import org.junit.Assert.assertEquals
@@ -57,6 +60,7 @@ class SettingsFieldsTest {
         assertEquals(false, stored["dynamic_color"])
         assertEquals(9090, stored["web_server_port"])
         assertEquals(1.5f, stored["default_tts_playback_speed"])
+        assertEquals(0.9f, stored["auto_compress_threshold"])
         assertEquals("title", stored["title_prompt"])
         assertEquals("00000000-0000-0000-0000-000000000001", stored["chat_model"])
         assertEquals("LOW", stored["fast_model_reasoning_level"])
@@ -85,6 +89,38 @@ class SettingsFieldsTest {
         val preferences = mutablePreferencesOf(SettingsStore.FAST_MODEL_REASONING_LEVEL to "REMOVED_LEVEL")
 
         assertEquals(ReasoningLevel.AUTO, preferences.toSettings().fastModelReasoningLevel)
+    }
+
+    @Test
+    fun `saved subagent reasoning reaches the backup without changing the main assistant`() {
+        val preferences = mutablePreferencesOf().apply { putSettings(SAMPLE) }
+        preferences[SettingsStore.AGENT_REASONING_LEVEL] = "MAX"
+        val settings = preferences.toSettings()
+        val backup = JsonInstant.encodeToJsonElement(Settings.serializer(), settings) as JsonObject
+
+        assertEquals(SAMPLE.assistants, settings.assistants)
+        assertEquals(JsonPrimitive("max"), backup["agentReasoningLevel"])
+        assertEquals(ReasoningLevel.MAX, JsonInstant.decodeFromJsonElement(Settings.serializer(), backup).agentReasoningLevel)
+    }
+
+    @Test
+    fun `old backups and unrecognized preferences leave subagent reasoning inherited`() {
+        assertEquals(null, JsonInstant.decodeFromString(Settings.serializer(), "{}").agentReasoningLevel)
+        assertEquals(null, emptyPreferences().toSettings().agentReasoningLevel)
+        val preferences = mutablePreferencesOf(SettingsStore.AGENT_REASONING_LEVEL to "FUTURE_LEVEL")
+        assertEquals(null, preferences.toSettings().agentReasoningLevel)
+    }
+
+    @Test
+    fun `explicit subagent auto is stored and follow clears the override`() {
+        val auto = SAMPLE.copy(agentReasoningLevel = ReasoningLevel.AUTO)
+        val preferences = mutablePreferencesOf().apply { putSettings(auto) }
+        assertEquals("AUTO", preferences[SettingsStore.AGENT_REASONING_LEVEL])
+        assertEquals(ReasoningLevel.AUTO, preferences.toSettings().agentReasoningLevel)
+
+        preferences.putSettings(auto.copy(agentReasoningLevel = null), persisted = auto)
+        assertFalse(SettingsStore.AGENT_REASONING_LEVEL in preferences)
+        assertEquals(null, preferences.toSettings().agentReasoningLevel)
     }
 
     @Test
@@ -137,6 +173,8 @@ private val SAMPLE = Settings(
     suggestionPrompt = "suggestion",
     ocrModelId = id(5),
     ocrPrompt = "ocr",
+    enableAutoCompress = true,
+    autoCompressThreshold = 0.9f,
     assistantId = id(20),
     providers = listOf(ProviderSetting.OpenAI(id = id(31), name = "Provider")),
     assistants = listOf(Assistant(id = id(20), name = "Assistant")),
@@ -180,6 +218,8 @@ private val SAMPLE = Settings(
     conversationModelIds = mapOf(id(40) to id(41)),
     groupChatConfigs = mapOf(id(42) to GroupChatConfig(memberModelIds = listOf(id(45)))),
     compressUseClassicMode = true,
+    // v1032：二改自建字段，必须取与默认值（false）不同的值，否则 round-trip 测不出读写。
+    compressClassicProtectUserMessages = true,
     groupChatPresets = listOf(GroupChatPreset(id = id(46), name = "preset")),
     groupChatCleanContext = true,
     allowAgentConversationSearch = true,
@@ -188,6 +228,7 @@ private val SAMPLE = Settings(
     agentMaxSteps = 40,
     enableAgentTools = false,
     agentModelId = id(43),
+    agentReasoningLevel = ReasoningLevel.XHIGH,
     agentRoleModelOverrides = mapOf("programmer" to id(44)),
     agentFallbackModelIds = listOf(id(47)),
     compressModelId = id(48),
@@ -223,6 +264,8 @@ private val STORED_KEYS = setOf(
     "suggestion_prompt",
     "ocr_model",
     "ocr_prompt",
+    "enable_auto_compress",
+    "auto_compress_threshold",
     "providers",
     "select_assistant",
     "assistants",
@@ -263,12 +306,14 @@ private val STORED_KEYS = setOf(
     "conversation_model_ids",
     "group_chat_configs",
     "compress_use_classic_mode",
+    "compress_classic_protect_user_messages",
     "group_chat_presets",
     "group_chat_clean_context",
     "agent_conversation_search",
     "agent_mcp",
     "agent_max_steps_readonly",
     "agent_tools_enabled",
+    "agent_reasoning_level",
     "agent_model",
     "agent_role_models",
     "agent_fallback_models",

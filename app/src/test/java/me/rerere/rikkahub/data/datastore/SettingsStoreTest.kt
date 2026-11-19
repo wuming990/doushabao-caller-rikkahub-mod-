@@ -19,6 +19,7 @@ import kotlinx.coroutines.job
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import me.rerere.ai.core.ReasoningLevel
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -53,6 +54,24 @@ class SettingsStoreTest {
     }
 
     private suspend fun reopened(): Settings = open().store.awaitLoaded()
+
+    @Test
+    fun `subagent reasoning is independent and survives real disk reload`() = runBlocking {
+        val store = open().store
+        store.update { settings ->
+            settings.copy(assistants = settings.assistants.map { it.copy(reasoningLevel = ReasoningLevel.LOW) })
+        }
+        store.update { it.copy(agentReasoningLevel = ReasoningLevel.MAX) }
+
+        val fromDisk = reopened()
+        assertEquals(ReasoningLevel.MAX, fromDisk.agentReasoningLevel)
+        assertEquals(ReasoningLevel.LOW, fromDisk.getCurrentAssistant().reasoningLevel)
+
+        checkNotNull(opened).store.update { it.copy(agentReasoningLevel = null) }
+        val cleared = reopened()
+        assertEquals(null, cleared.agentReasoningLevel)
+        assertEquals(ReasoningLevel.LOW, cleared.getCurrentAssistant().reasoningLevel)
+    }
 
     @Test
     fun `typing faster than the disk can write loses no keystroke`() = runBlocking {

@@ -99,10 +99,15 @@ fun ConversationTokenStatsDialog(
     onDismiss: () -> Unit,
     // v301：花费估算（调用方没传 / 没填过价时为 null）
     cost: ConversationCost? = null,
+    // v1032：标题与末尾的口径说明可覆盖 —— 子代理明细要用同一套分项，
+    // 但那句「不含后台调用与子代理」的说明放进子代理弹窗里就成了假话。
+    // 默认值就是原来那两条文案，所以主对话的调用点一个字都不用改。
+    title: String = stringResource(R.string.chat_conversation_token_detail_title),
+    note: String = stringResource(R.string.chat_conversation_token_note),
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(stringResource(R.string.chat_conversation_token_detail_title)) },
+        title = { Text(title) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 StatsRow(
@@ -169,7 +174,7 @@ fun ConversationTokenStatsDialog(
                     )
                 }
                 Text(
-                    text = stringResource(R.string.chat_conversation_token_note),
+                    text = note,
                     style = MaterialTheme.typography.bodySmall,
                     color = Color.Gray,
                     modifier = Modifier.padding(top = 8.dp),

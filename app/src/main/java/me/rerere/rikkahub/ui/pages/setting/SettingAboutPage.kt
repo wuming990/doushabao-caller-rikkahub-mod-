@@ -213,9 +213,10 @@ fun SettingAboutPage() {
                             headlineContent = { Text(stringResource(R.string.about_page_website)) },
                         )
                         item(
-                            onClick = { context.openUrl("https://github.com/rikkahub/rikkahub") },
+                            // v1030 用户要求：GitHub 直达链接也换成我们的仓库（上次只改了官网）
+                            onClick = { context.openUrl("https://github.com/wuming990/doushabao-caller-rikkahub-mod-") },
                             leadingContent = { CardGroupIcon(HugeIcons.Github, containerColor = containerColor, contentColor = contentColor) },
-                            supportingContent = { Text("https://github.com/rikkahub/rikkahub") },
+                            supportingContent = { Text("https://github.com/wuming990/doushabao-caller-rikkahub-mod-") },
                             headlineContent = { Text(stringResource(R.string.about_page_github)) },
                         )
                         item(

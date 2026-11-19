@@ -17,6 +17,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import me.rerere.ai.agent.expandNotices
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.core.TokenUsage
 import me.rerere.ai.core.Tool
@@ -566,6 +567,19 @@ class GenerationLoop(
          * 行为与改前逐字节一致。
          */
         reportEmptyReplyAsError: Boolean = false,
+        /**
+         * v1034：官方 3.2.0「一轮回复中途压缩上下文」的挂载点。
+         *
+         * ⚠️ 默认 `{ false }` —— 每次都不压，行为与 v1033 逐字节一致。
+         * **只有主对话**在用户打开「自动压缩」开关时才传真正的判断函数；
+         * 圆桌 / 子代理 / 群组 / 压缩 / 翻译一律不传（与 v248 工具上限、v263 续跑、
+         * v1011 空回上报同一套隔离规矩：新能力默认关闭，谁要谁显式打开）。
+         *
+         * 调用时机：**一批工具全部执行完并写回消息之后、下一次请求模型之前**。
+         * 返回 true = "上下文要爆了，先去压缩"，本次运行就此正常结束（不是失败、不报错、
+         * 不计入续跑次数），由调用方压缩完再重新发起，继续这一轮。
+         */
+        pauseAfterTools: suspend (UIMessage) -> Boolean = { false },
         // v323：显式给 flow 一个类型参数。Kotlin 2.4 的 K2 在推断这个超长 lambda 的
         // 公共父类型时会崩（Expected some types），显式标注可绕开，不改任何逻辑。
     ): Flow<GenerationChunk> = flow<GenerationChunk> {
@@ -821,6 +835,11 @@ class GenerationLoop(
                     )
                 )
             )
+
+            // v1034：工具批次刚全部跑完、还没拿结果去请求下一次模型 —— 这是唯一安全的压缩点：
+            // 工具都有结果了（不会留下无法续跑的工具调用），模型也还没往下写。
+            // 钩子默认 { false }，用户没打开「自动压缩」时这一行不产生任何影响。
+            if (messages.lastOrNull()?.let { pauseAfterTools(it) } == true) break
         }
 
     }.flowOn(Dispatchers.IO)
@@ -915,6 +934,9 @@ class GenerationLoop(
                             it
                         }
                     }
+                    // 官方 3.1.2：Notice 是运行时事件，发给模型前在所在位置拆成一条 user 消息；
+                    // 只改请求视图，外层 messages/对话记录一个字不裁（与 v1029 同一位置纪律）。
+                    .expandNotices()
                     .limitContext(assistant.contextMessageLimit)
             )
         }.transforms(

@@ -17,11 +17,30 @@ class DefaultProvidersTest {
 
         val provider = vercelProviders.single()
         assertEquals("https://ai-gateway.vercel.sh/v1", provider.baseUrl)
-        assertFalse(provider.enabled)
+        // v1034：官方 3.2.0 把一批内置供应商的默认开关从 false 改成 true（Vercel 也在其中），
+        // 但**没有同步它自己的这份测试** —— 官方这版跑自家单测就是红的。
+        // 这里跟随官方代码钉真实默认值，不是放宽判据：仍然精确断言 enabled / builtIn /
+        // quotaQuery 三项的具体值。广告位另有一条独立守卫（见下面那条用例），不受影响。
+        assertTrue("官方 3.2.0 起 Vercel AI Gateway 默认开启（官方改了代码没改测试）", provider.enabled)
         assertTrue(provider.builtIn)
         assertTrue(provider.quotaQuery.enabled)
         assertEquals("{{baseUrl}}/credits", provider.quotaQuery.url)
         assertEquals("balance", provider.quotaQuery.resultPath)
+    }
+
+    /**
+     * v1034：官方 3.2.0 把一批内置供应商改成默认开启，但**我们自己加的账号登录通道必须继续
+     * 默认关闭**（Codex / Grok / Gemini OAuth / Gemini 网页版）——它们要靠用户自己登录或填 Cookie
+     * 才能用，默认打开等于在新装列表里放一排不能用的条目。官方没有这几家，所以这条判据只能我们自己钉。
+     */
+    @Test
+    fun `我方账号登录通道必须继续默认关闭`() {
+        val byName = DEFAULT_PROVIDERS.associateBy { it.name }
+        listOf("Codex", "Grok", "Gemini OAuth", "Gemini 网页版").forEach { name ->
+            val p = byName[name]
+            assertTrue("内置清单缺了我们自己的账号通道：$name", p != null)
+            assertFalse("$name 不该被官方默认值带成开启", p!!.enabled)
+        }
     }
 
     /**

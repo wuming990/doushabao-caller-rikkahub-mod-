@@ -1,5 +1,6 @@
 package me.rerere.rikkahub.ui.components.ai
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -10,6 +11,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ContainedLoadingIndicator
 import androidx.compose.material3.FilledTonalIconButton
@@ -20,18 +24,20 @@ import androidx.compose.material3.RadioButton
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Job
@@ -59,9 +65,11 @@ fun CompressContextDialog(
     fixedModelName: String,
     initialCustomPrompt: String,
     initialClassicMode: Boolean = false,
+    // v1032：经典压缩「用户发言保护」的上次选择（默认关）。
+    initialClassicProtectUserMessages: Boolean = false,
     onDismiss: () -> Unit,
     onConfirm: (additionalPrompt: String, modelSource: CompressionModelSource, customPrompt: String) -> Job,
-    onConfirmClassic: (additionalPrompt: String, keepRecentMessages: Int) -> Job,
+    onConfirmClassic: (additionalPrompt: String, keepRecentMessages: Int, protectUserMessages: Boolean) -> Job,
     runningJob: Job? = null,
 ) {
     var additionalPrompt by remember { mutableStateOf("") }
@@ -69,7 +77,10 @@ fun CompressContextDialog(
     var modelSource by remember { mutableStateOf(CompressionModelSource.FIXED) }
     // v268：双模式状态 + 经典模式的两个参数
     var classicMode by remember { mutableStateOf(initialClassicMode) }
-    var keepRecentMessages by remember { mutableIntStateOf(0) }
+    var keepRecentText by remember { mutableStateOf("0") }
+    val keepRecentMessages = keepRecentText.toIntOrNull() ?: 0
+    // v1032：经典模式的第三个参数 —— 用户发言保护。默认关，行为与 v1031 一致。
+    var protectUserMessages by remember { mutableStateOf(initialClassicProtectUserMessages) }
     var currentJob by remember { mutableStateOf<Job?>(runningJob) }
     // v1024：重新打开时接回原对话正在压缩的任务，不重复发请求。
     LaunchedEffect(runningJob) {
@@ -145,19 +156,35 @@ fun CompressContextDialog(
                                     modifier = Modifier.weight(1f),
                                 )
                                 FilledTonalIconButton(
-                                    onClick = { keepRecentMessages-- },
+                                    onClick = { keepRecentText = (keepRecentMessages - 1).toString() },
                                     enabled = keepRecentMessages > 0,
                                 ) {
                                     Icon(HugeIcons.Remove01, contentDescription = "Decrease")
                                 }
-                                Text(
-                                    text = keepRecentMessages.toString(),
-                                    style = MaterialTheme.typography.titleMediumEmphasized,
-                                    textAlign = TextAlign.Center,
-                                    modifier = Modifier.widthIn(min = 40.dp),
+                                BasicTextField(
+                                    value = keepRecentText,
+                                    onValueChange = { input ->
+                                        val digits = input.filter { it.isDigit() }.take(4)
+                                        keepRecentText = digits.trimStart('0').ifEmpty { digits.take(1) }
+                                    },
+                                    singleLine = true,
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                    textStyle = MaterialTheme.typography.titleMediumEmphasized.copy(
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                        textAlign = TextAlign.Center,
+                                    ),
+                                    cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                                    modifier = Modifier
+                                        .padding(horizontal = 4.dp)
+                                        .width(56.dp)
+                                        .background(
+                                            color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                                            shape = RoundedCornerShape(12.dp),
+                                        )
+                                        .padding(vertical = 8.dp),
                                 )
                                 FilledTonalIconButton(
-                                    onClick = { keepRecentMessages++ },
+                                    onClick = { keepRecentText = (keepRecentMessages + 1).toString() },
                                     enabled = keepRecentMessages < Int.MAX_VALUE,
                                 ) {
                                     Icon(HugeIcons.Add01, contentDescription = "Increase")
@@ -165,6 +192,28 @@ fun CompressContextDialog(
                             }
                             Text(
                                 text = stringResource(R.string.chat_page_compress_keep_recent_desc),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            // v1032：用户发言保护。经典压缩照官方流程会把范围内的用户发言
+                            // 一起写进摘要，用户反馈"原话被转述走样"，这里给回选择权。
+                            // 默认关 —— 关掉时摘要正文与 v1031 一字节不差。
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    text = stringResource(R.string.chat_page_compress_classic_protect_user),
+                                    style = MaterialTheme.typography.titleSmall,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                Switch(
+                                    checked = protectUserMessages,
+                                    onCheckedChange = { protectUserMessages = it },
+                                )
+                            }
+                            Text(
+                                text = stringResource(R.string.chat_page_compress_classic_protect_user_desc),
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -249,7 +298,7 @@ fun CompressContextDialog(
             } else {
                 TextButton(onClick = {
                     currentJob = if (classicMode) {
-                        onConfirmClassic(additionalPrompt, keepRecentMessages)
+                        onConfirmClassic(additionalPrompt, keepRecentMessages, protectUserMessages)
                     } else {
                         onConfirm(additionalPrompt, modelSource, customPrompt)
                     }

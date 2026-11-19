@@ -36,6 +36,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.map
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.ArrowDown01
 import me.rerere.hugeicons.stroke.ArrowUp01
@@ -43,6 +44,14 @@ import me.rerere.hugeicons.stroke.Cancel01
 import me.rerere.rikkahub.agent.model.AgentEvent
 import me.rerere.rikkahub.agent.model.AgentReport
 import me.rerere.rikkahub.agent.model.AgentThread
+import me.rerere.rikkahub.agent.model.AgentThreadUsage
+import me.rerere.rikkahub.agent.model.agentThreadUsageOf
+import me.rerere.rikkahub.agent.repo.AgentThreadRepository
+import me.rerere.rikkahub.ui.components.ai.ConversationCost
+import me.rerere.rikkahub.ui.components.ai.formatCacheHitRate
+import me.rerere.rikkahub.ui.components.ai.formatCost
+import me.rerere.rikkahub.ui.components.ai.formatTokenTotal
+import me.rerere.rikkahub.ui.components.ai.modelPriceLookup
 import me.rerere.rikkahub.agent.model.AgentThreadStatus
 import me.rerere.rikkahub.agent.runtime.AgentThreadManager
 import me.rerere.rikkahub.data.datastore.displayLabel
@@ -90,8 +99,22 @@ fun AgentActivityPanel(
     // 时长。而主模型在等子代理时用户看的就是这个面板，看不出进度只能干等。
     // 计时器只在**有活动线程**时才开，避免整个聊天页每秒重组。
     val manager: AgentThreadManager = koinInject()
+    // v1032：token 用量。只订阅 agent_events 里 TOKEN_USAGE 这一条 Flow（Room 在写入后自己推新值）。
+    //
+    // 为什么不在这里攒一份内存计数：那样「正在跑时看到的数」和「重开 App 后看到的数」会有两套来源，
+    // 对不上时谁也说不清谁错。数据库那一份既是历史也是实时值。
+    // conversationId 为空串时查不到任何事件，自然退化成不显示，不需要额外的分支。
+    val repository: AgentThreadRepository = koinInject()
+    val usageConversationId = visible.firstOrNull()?.conversationId.orEmpty()
+    val usageByThread by repository.tokenUsageEventsFlow(usageConversationId)
+        .map { agentThreadUsageOf(it) }
+        .collectAsStateWithLifecycle(initialValue = emptyMap())
     // v1028：行上也要能显示模型名（终态回落到落库值，运行中只认实时信号）。
     val settings by rememberUserSettingsState()
+    // v1039：单价随设置刷新，不跟着秒表每秒为所有模型重新建表。
+    val priceOf = remember(settings.providers, settings.init) {
+        if (settings.init) null else modelPriceLookup(settings)
+    }
     val activity by manager.activityFlow.collectAsStateWithLifecycle()
     // v246：面板还要说清「为什么没动静」—— 用户在这里看到红色的「没动静 7 分 49 秒」，
     // 其实是正卡在一次工具调用里，不说原因就像死机（真机反馈）。
@@ -169,6 +192,13 @@ fun AgentActivityPanel(
                     visible.forEach { thread ->
                         val active = !thread.status.isTerminal
                         val signal = stage[thread.id]
+                        // v1032：这次子代理已经花掉的 token（没取到用量时为 null，整块不显示）
+                        val tokenUsage = usageByThread[thread.id]?.takeIf { !it.isEmpty }
+                        val usageSummary = remember(tokenUsage, priceOf) {
+                            tokenUsage?.let { usage ->
+                                agentUsageSummaryText(usage, priceOf?.let { computeAgentUsageCost(usage, it) })
+                            }
+                        }
                         AgentThreadRow(
                             thread = thread,
                             ranSeconds = thread.startedAt
@@ -184,6 +214,7 @@ fun AgentActivityPanel(
                                 hasMessages = signal?.hasMessages == true,
                             ),
                             toolRunning = (signal?.pendingTools ?: 0) > 0,
+                            usageSummary = usageSummary,
                             // v1028：运行中实时显示当前模型；终态才回落到落库值（避免拿上一轮的旧值冒充）。
                             modelLabel = signal?.modelLabel ?: thread.activeModelId
                                 ?.takeIf { thread.status.isTerminal }
@@ -252,6 +283,8 @@ private fun AgentThreadRow(
     toolRunning: Boolean = false,
     /** v1028：当前正在使用的模型（模型名 · 供应商名）；null = 还不知道（排队/未开始） */
     modelLabel: String? = null,
+    /** v1032：这次子代理累计的 token 用量；null = 一次都没取到用量（不显示成 0） */
+    usageSummary: String? = null,
 ) {
     Surface(
         modifier = Modifier
@@ -312,6 +345,17 @@ private fun AgentThreadRow(
                             else "没动静 ${formatAgentDuration(idleSeconds)}"
                         )
                     }
+                }
+                // v1032：token 用量单独一行，不塞进上面那行 timing ——
+                // timing 已经有「阶段 · 已跑 · 没动静」三段，maxLines=1，再塞一定被省略号吃掉
+                // （模型名当初就是因为这个才单独成行的，同一个坑不踩第二次）。
+                if (usageSummary != null) {
+                    // v1039：允许换行，避免小屏和大字体时用省略号藏掉命中率与金额。
+                    Text(
+                        text = usageSummary,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
                 if (timing.isNotEmpty()) {
                     Text(
@@ -441,6 +485,32 @@ internal fun agentPhaseTextFrom(
                 "TIMEOUT" -> "刚判过卡死，正在重来"
                 else -> if (hasMessages) "正在输出" else "等待模型返回"
             }
+        }
+    }
+}
+
+/**
+ * v1032：面板行上那句 token 合计（纯函数，方便单测钉死口径）。
+ *
+ * v1039：保留原来的「输入 / 输出 / 合计」，另行直显命中率与预估消耗。
+ * 已存用量不能区分「未上报缓存」与「真实零命中」，两者都用破折号而不冒充 0%。
+ */
+internal fun agentUsageSummaryText(usage: AgentThreadUsage, cost: ConversationCost? = null): String = buildString {
+    append("已用 ↑${formatTokenTotal(usage.promptTokens)} ↓${formatTokenTotal(usage.completionTokens)}")
+    append(" Σ${formatTokenTotal(usage.totalTokens)}")
+    if (usage.attempts > 1) append(" · ${usage.attempts} 次尝试")
+    val hitRate = if (usage.promptTokens > 0 && usage.cachedTokens > 0) {
+        formatCacheHitRate(usage.cachedTokens, usage.promptTokens)
+    } else {
+        "—"
+    }
+    append("\n缓存命中率 $hitRate · ")
+    when {
+        cost == null -> append("预估消耗 —")
+        !cost.hasAnyPrice -> append("预估消耗 —（未设单价）")
+        else -> {
+            append("预估消耗 ${formatCost(cost.cost)}")
+            if (cost.unpricedMessages > 0) append("（部分未计）")
         }
     }
 }

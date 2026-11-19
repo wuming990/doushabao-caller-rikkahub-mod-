@@ -1,6 +1,8 @@
 package me.rerere.rikkahub.ui.components.ai
 
 import java.util.Locale
+import kotlin.uuid.Uuid
+import me.rerere.rikkahub.data.datastore.Settings
 
 /**
  * v301：按用户自己填的单价，把「本对话 token 明细」里的花费估出来。
@@ -14,6 +16,30 @@ import java.util.Locale
  * 所以这里全部是纯函数：输入「按模型分组的用量」+「单价查询」，输出一个数。
  * 真单测见 ConversationTokenCostTest（不读源码字符串，直接喂数据）。
  */
+
+/**
+ * v1032：「模型 id 字符串 → 用户填的单价」这条查表，全项目只留这一份。
+ *
+ * 为什么要抽出来：本对话明细与子代理明细必须按同一套单价算钱。两处各写一遍的话，
+ * 任何一处漏了缓存价或按次价，同一个模型在两个界面会算出两个不同的金额，
+ * 用户拿哪个都对不上账单 —— 这类「同一件事两个数」是最难自查的毛病。
+ */
+fun modelPriceLookup(settings: Settings): (String?) -> ModelPrice? {
+    val modelsById = settings.providers.flatMap { provider -> provider.models }.associateBy { model -> model.id }
+    return { rawModelId ->
+        rawModelId
+            ?.let { runCatching { Uuid.parse(it) }.getOrNull() }
+            ?.let { modelsById[it] }
+            ?.let { model ->
+                ModelPrice(
+                    inputPerMillion = model.inputPricePerMillion,
+                    outputPerMillion = model.outputPricePerMillion,
+                    cachedPerMillion = model.cachedPricePerMillion,
+                    perRequest = model.requestPrice,
+                )
+            }
+    }
+}
 
 /** 一个模型的单价（每 100 万 token）。null = 用户没填这一项。 */
 data class ModelPrice(

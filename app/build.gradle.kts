@@ -26,8 +26,8 @@ android {
         applicationId = "me.rerere.rikkahub.mod"
         minSdk = 26
         targetSdk = 37
-        versionCode = 1029
-        versionName = "3.1.1-mod27"
+        versionCode = 1040
+        versionName = "3.2.0-mod38"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -323,7 +323,13 @@ dependencies {
     implementation(libs.image.viewer)
 
     // JLatexMath
-    // https://github.com/rikkahub/jlatexmath-android
+    // https://github.com/re-ovo/bettertext
+    implementation(platform(libs.bettertext.bom))
+    implementation(libs.bettertext.text)
+    implementation(libs.bettertext.markdown)
+    implementation(libs.bettertext.latex)
+    implementation(libs.bettertext.highlight)
+    // 保留旧渲染件：MarkdownNew.kt / LatexText.kt 仍引用，避免“合并即删我方文件”
     implementation(libs.jlatexmath)
     implementation(libs.jlatexmath.font.greek)
     implementation(libs.jlatexmath.font.cyrillic)
@@ -345,7 +351,6 @@ dependencies {
     implementation(project(":ai"))
     implementation(project(":web"))
     implementation(project(":document"))
-    implementation(project(":highlight"))
     implementation(project(":search"))
     implementation(project(":speech"))
     implementation(project(":mediagen"))

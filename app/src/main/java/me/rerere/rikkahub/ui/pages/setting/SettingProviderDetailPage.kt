@@ -64,6 +64,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.rememberBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -78,11 +79,11 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.util.fastFilter
 import androidx.compose.ui.util.fastForEach
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import me.rerere.ui.toast.ToastType
 import kotlin.uuid.Uuid
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import me.rerere.ai.provider.BuiltInTools
@@ -93,6 +94,7 @@ import me.rerere.ai.provider.ModelType
 import me.rerere.ai.provider.ProviderManager
 import me.rerere.ai.provider.ProviderSetting
 import me.rerere.ai.provider.TextGenerationParams
+import me.rerere.ai.provider.filterByKeywords
 import me.rerere.ai.provider.supportsQuota
 import me.rerere.ai.registry.ModelRegistry
 import me.rerere.ai.ui.UIMessage
@@ -104,6 +106,7 @@ import me.rerere.hugeicons.stroke.Connect
 import me.rerere.hugeicons.stroke.Delete01
 import me.rerere.hugeicons.stroke.FloppyDisk
 import me.rerere.hugeicons.stroke.Package01
+import me.rerere.hugeicons.stroke.Refresh01
 import me.rerere.hugeicons.stroke.Settings03
 import me.rerere.hugeicons.stroke.Share01
 import me.rerere.hugeicons.stroke.Tick01
@@ -476,28 +479,52 @@ private fun ModelList(
     var webLoadError by remember(providerSetting) { mutableStateOf<String?>(null) }
     var webLoading by remember(providerSetting) { mutableStateOf(false) }
     var webRetryKey by remember(providerSetting.id) { mutableStateOf(0) }
-    val modelList by produceState(emptyList<Model>(), providerSetting, webRetryKey) {
+    // v1034 合并官方 3.2.0：官方用 listKey 把「已添加模型的增删/排序」从拉取键里摘掉，
+    // 编辑模型不再重复请求远端清单；并新增 refreshCount 支撑「手动刷新可用模型列表」。
+    // ⚠️ 我们的失败重试键 webRetryKey 保留不动（V1031AntigravityCatalogTest 钉着它，
+    // 也不许把两条路合成一条来改测试凑绿）：两个键都写进 produceState 的 key 里，各自都真能驱动重取。
+    val listKey = remember(providerSetting) { providerSetting.copyProvider(models = emptyList()) }
+    var refreshCount by remember { mutableIntStateOf(0) }
+    val remoteModels by produceState(RemoteModels(), listKey, webRetryKey, refreshCount) {
+        value = value.copy(loading = true, error = null)
         if (providerSetting is ProviderSetting.GeminiWeb) {
             // v1020：网页目录读取失败必须看得见，换账号/重试时先清掉旧目录。
-            value = emptyList()
+            // 网页版坚持用 providerSetting 本体取目录（v1020：ID/number/账号 capacity 同源），不走 listKey。
+            value = RemoteModels(models = emptyList(), loading = true)
             webLoadError = null
             webLoading = true
             val loaded = loadGeminiWebModelsForUi {
                 providerManager.getProviderByType(providerSetting).listModels(providerSetting)
             }
-            value = loaded.models.sortedBy { it.modelId }
+            value = RemoteModels(models = loaded.models.sortedBy { it.modelId })
             webLoadError = loaded.error
             webLoading = false
         } else {
-            runCatching {
-                println("loading models...")
-                value = providerManager.getProviderByType(providerSetting)
-                    .listModels(providerSetting)
+            // v1031：以前这条路失败只往控制台打一行（println/printStackTrace），界面表现就是
+            // 「一片空清单」—— 用户既不知道拉取失败过、也不知道为什么、更没有重试入口。
+            // v1020 只给网页版做了「失败可见 + 重试」，现在所有供应商共用同一套判据。
+            // 注意：协程取消必须原样上抛（v281 的规矩），不能把它当成一次拉取失败吞掉，
+            // 否则用户点停止/退出页面时不会立刻生效。
+            var failure: Throwable? = null
+            webLoadError = null
+            webLoading = true
+            val fetched = try {
+                providerManager.getProviderByType(listKey)
+                    .listModels(listKey)
                     .sortedBy { it.modelId }
                     .toList()
-            }.onFailure {
-                it.printStackTrace()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                failure = e
+                emptyList()
             }
+            webLoadError = failure?.let {
+                "拉取模型失败：${it.message ?: it.javaClass.simpleName}"
+            }
+            webLoading = false
+            // v1034 官方 3.2.0：拉取失败时保留上一次成功拿到的清单，界面不至于整片空白
+            value = if (failure != null) value.copy(loading = false, error = failure) else RemoteModels(models = fetched)
         }
     }
     var expanded by rememberSaveable { mutableStateOf(true) }
@@ -557,8 +584,10 @@ private fun ModelList(
             AddModelButton(
                 modelLoadError = webLoadError,
                 modelsLoading = webLoading,
-                onRetryModels = { if (providerSetting is ProviderSetting.GeminiWeb) webRetryKey += 1 },
-                models = modelList,
+                // v1031：重试入口对所有供应商开放（以前只有网页版能重试，账号通道失败就只能重进页面）。
+                onRetryModels = { webRetryKey += 1 },
+                remoteModels = remoteModels,
+                onRefresh = { refreshCount++ },
                 selectedModels = providerSetting.models,
                 onAddModel = {
                     onUpdateProvider(providerSetting.addModel(it))
@@ -774,9 +803,17 @@ private fun ModelSettingsForm(
     }
 }
 
+/** 提供商远端的可用模型列表，[error] 不为空时 [models] 是上次成功拿到的结果 */
+private data class RemoteModels(
+    val models: List<Model> = emptyList(),
+    val loading: Boolean = false,
+    val error: Throwable? = null,
+)
+
 @Composable
 private fun AddModelButton(
-    models: List<Model>,
+    remoteModels: RemoteModels,
+    onRefresh: () -> Unit,
     selectedModels: List<Model>,
     expanded: Boolean,
     onAddModel: (Model) -> Unit,
@@ -802,7 +839,8 @@ private fun AddModelButton(
             modelLoadError = modelLoadError,
             modelsLoading = modelsLoading,
             onRetryModels = onRetryModels,
-            models = models,
+            remoteModels = remoteModels,
+            onRefresh = onRefresh,
             selectedModels = selectedModels,
             onModelSelected = { model ->
                 val inputModalities = ModelRegistry.MODEL_INPUT_MODALITIES.getData(model.modelId)
@@ -946,7 +984,8 @@ private fun AddModelButton(
 
 @Composable
 private fun ModelPicker(
-    models: List<Model>,
+    remoteModels: RemoteModels,
+    onRefresh: () -> Unit,
     selectedModels: List<Model>,
     onModelSelected: (Model) -> Unit,
     onModelDeselected: (Model) -> Unit,
@@ -965,17 +1004,7 @@ private fun ModelPicker(
             sheetState = rememberBottomSheetState(initialValue = SheetValue.Hidden, enabledValues = setOf(SheetValue.Hidden, SheetValue.Expanded)),
         ) {
             var filterText by remember { mutableStateOf("") }
-            val filterKeywords = filterText.split(" ").filter { it.isNotBlank() }
-            val filteredModels = models.fastFilter {
-                if (filterKeywords.isEmpty()) {
-                    true
-                } else {
-                    filterKeywords.all { keyword ->
-                        it.modelId.contains(keyword, ignoreCase = true) ||
-                            it.displayName.contains(keyword, ignoreCase = true)
-                    }
-                }
-            }
+            val filteredModels = remoteModels.models.filterByKeywords(filterText)
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -985,10 +1014,13 @@ private fun ModelPicker(
                 verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
                 // v1020：网页版拉取中/失败原因与重试入口，不再用空名单掩盖异常。
-                if (showDisplayNames && modelsLoading) {
-                    Text("正在从当前 Google 账号拉取模型…")
+                // v1031：加载中/失败原因/重试不再只给网页版看。拉不到模型的账号通道
+                // 原来只显示一片空白，用户无法区分「这个供应商没有模型」和「请求失败了」。
+                // 名称显示（displayName 当主标签）仍然只由 showDisplayNames 控制，网页版行为一字未动。
+                if (modelsLoading) {
+                    Text("正在拉取模型清单…")
                 }
-                if (showDisplayNames && modelLoadError != null) {
+                if (modelLoadError != null) {
                     Text(text = modelLoadError, color = MaterialTheme.colorScheme.error)
                     TextButton(onClick = onRetryModels) { Text("重新拉取模型") }
                 }
@@ -1002,8 +1034,16 @@ private fun ModelPicker(
                 ) {
                     Text(
                         text = stringResource(R.string.setting_provider_page_avaliable_models),
-                        style = MaterialTheme.typography.titleMedium
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.weight(1f),
                     )
+
+                    IconButton(
+                        onClick = onRefresh,
+                        enabled = !remoteModels.loading,
+                    ) {
+                        Icon(HugeIcons.Refresh01, contentDescription = "Refresh")
+                    }
 
                     val unselectedCount = filteredModels.count { model ->
                         selectedModels.none { it.modelId == model.modelId }
@@ -1023,6 +1063,33 @@ private fun ModelPicker(
                                 R.string.setting_provider_page_select_all,
                                 unselectedCount
                             ) else stringResource(R.string.setting_provider_page_deselect_models)
+                        )
+                    }
+                }
+
+                if (remoteModels.loading) {
+                    LinearWavyProgressIndicator(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp)
+                    )
+                }
+
+                remoteModels.error?.let { error ->
+                    Surface(
+                        shape = MaterialTheme.shapes.large,
+                        color = MaterialTheme.colorScheme.errorContainer,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 8.dp),
+                    ) {
+                        Text(
+                            text = error.message ?: error.javaClass.simpleName,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            maxLines = 4,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(12.dp),
                         )
                     }
                 }
@@ -1126,9 +1193,9 @@ private fun ModelPicker(
     }
     BadgedBox(
         badge = {
-            if (models.isNotEmpty()) {
+            if (remoteModels.models.isNotEmpty()) {
                 Badge {
-                    Text(models.size.toString())
+                    Text(remoteModels.models.size.toString())
                 }
             }
         }

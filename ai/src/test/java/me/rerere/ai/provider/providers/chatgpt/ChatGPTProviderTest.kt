@@ -1,5 +1,6 @@
 package me.rerere.ai.provider.providers.chatgpt
 
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -16,6 +17,9 @@ import me.rerere.ai.provider.supportsBuiltInSearch
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.util.json
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -109,6 +113,29 @@ class ChatGPTProviderTest {
         assertEquals(1, body["include"]!!.jsonArray.size)
         assertTrue("reasoning" in body)
         assertNull(body["prompt_cache_key"])
+    }
+
+    @Test
+    fun `codex model discovery requests the supported client version`() = runBlocking {
+        var requestedVersion: String? = null
+        val client = OkHttpClient.Builder().addInterceptor { chain ->
+            val request = chain.request()
+            requestedVersion = request.url.queryParameter("client_version")
+            Response.Builder()
+                .request(request)
+                .protocol(Protocol.HTTP_2)
+                .code(200)
+                .message("OK")
+                .body("""{"models":[{"slug":"gpt-6.2-astra","visibility":"list"}]}""".toResponseBody())
+                .build()
+        }.build()
+        val credential = OAuthCredential(accessToken = "local-test-only", refreshToken = "unused")
+        val provider = ChatGPTProvider(client) { _, _ -> credential }
+
+        val models = provider.listModels(ProviderSetting.ChatGPT())
+
+        assertEquals(listOf("gpt-6.2-astra"), models.map { it.modelId })
+        assertEquals("0.170.0", requestedVersion)
     }
 
     @Test

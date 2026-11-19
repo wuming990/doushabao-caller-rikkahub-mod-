@@ -56,6 +56,9 @@ data class Settings(
     val translateTargetLanguage: String = "zh-CN",
     val enableSuggestion: Boolean = true,
     val suggestionPrompt: String = DEFAULT_SUGGESTION_PROMPT,
+    // 回复结束后上下文占用达到聊天模型上下文窗口的 autoCompressThreshold 时自动压缩历史
+    val enableAutoCompress: Boolean = false,
+    val autoCompressThreshold: Float = 0.8f,
     val ocrModelId: Uuid = Uuid.random(),
     val ocrPrompt: String = DEFAULT_OCR_PROMPT,
     val assistantId: Uuid = DEFAULT_ASSISTANT_ID,
@@ -96,6 +99,8 @@ data class Settings(
     val roundTableSetting: RoundTableSetting = RoundTableSetting(),
     val enableAgentTools: Boolean = true,
     val agentModelId: Uuid? = null,
+    // v1040：null 跟随主助手，显式 AUTO 则独立使用自动档。只在子代理生成时读取。
+    val agentReasoningLevel: ReasoningLevel? = null,
     // v1024：手填非负整数；0不限，旧4不变。
     val agentMaxConcurrent: Int = 4,
     val agentThreadTimeoutMinutes: Int = 10,
@@ -172,6 +177,16 @@ data class Settings(
     val groupChatCleanContext: Boolean = false,
     /** v268：手动压缩上次选择的模式（true = 经典压缩，默认智能压缩）。 */
     val compressUseClassicMode: Boolean = false,
+    /**
+     * v1032：经典压缩的「用户发言保护」（默认关 = 与 v1031 行为一字节不差）。
+     *
+     * 打开后，经典压缩会把**本次新压进摘要的那一段里的用户发言**逐字附在摘要正文末尾，
+     * 模型下一轮仍能看到原话，不再只读到摘要的转述。关闭时摘要内容与开关引入前完全相同。
+     *
+     * 与 compressUseClassicMode 一样是「全局记住上次选择」，不做成每段对话一份：
+     * 这是压缩口径，不是对话内容。智能压缩不看这个字段（它本来就保留最近的用户发言原文）。
+     */
+    val compressClassicProtectUserMessages: Boolean = false,
     /**
      * v280：允许子代理检索历史对话。默认 false，只有用户在子代理设置里主动打开才生效。
      * 主对话与圆桌完全不看这个字段。

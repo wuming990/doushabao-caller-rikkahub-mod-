@@ -1491,3 +1491,18 @@ private fun parseTextAlign(textAlign: String): TextAlign? {
         else -> null
     }
 }
+
+
+/**
+ * 官方 3.1.2 用 bettertext 取代了旧的 MathInline（MathBlock.kt 里已删除）。
+ * 这个文件保留的是历史渲染器（当前无调用点），为了不删我方文件、又能编译，
+ * 这里放一个最简单的本地实现：公式按原文本显示。
+ */
+@Composable
+private fun MathInline(
+    latex: String,
+    modifier: Modifier = Modifier,
+    fontSize: androidx.compose.ui.unit.TextUnit,
+) {
+    Text(text = latex, modifier = modifier, fontSize = fontSize)
+}

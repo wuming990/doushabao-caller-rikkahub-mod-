@@ -478,4 +478,95 @@ class V1019ClassicCompressionTest {
         assertTrue(prompt.contains("## Open Items"))
         assertFalse(prompt.contains("{content}"))
     }
+
+    @Test
+    fun `v1034 checkpoint during active generation preserves partial code and executed tools`() = runBlocking {
+        val tool = UIMessagePart.Tool(
+            toolCallId = "already-written", toolName = "workspace_edit_file", input = "{}",
+            output = listOf(UIMessagePart.Text("code already written on disk")),
+        )
+        val partial = UIMessage(role = MessageRole.ASSISTANT, parts = listOf(
+            UIMessagePart.Text("partial answer and code"), tool,
+        ))
+        fixture(listOf(UIMessage.user("keep my request"), partial)) { session, store ->
+            val original = session.state.value.messageNodes
+            val generation = Job()
+            session.setJob(generation)
+            try {
+                session.compressClassicHistory(allowWhileGenerating = true) { snapshot, _ ->
+                    assertTrue(session.isGenerating)
+                    assertEquals(original, snapshot.messageNodes)
+                    "selected smart summary with retained user wording"
+                }
+                assertEquals(original, store.persisted.messageNodes.take(original.size))
+                assertEquals(partial, store.persisted.currentMessages[1])
+                assertEquals(tool, store.persisted.currentMessages[1].getTools().single())
+                assertTrue(store.persisted.currentMessages.last().isContextCheckpoint)
+                assertEquals(1, store.writes)
+                assertTrue("compression must not finish the reply job", generation.isActive)
+            } finally {
+                session.setJob(null)
+            }
+        }
+    }
+
+    @Test
+    fun `v1034 ordinary compression is still rejected during generation by default`() = runBlocking {
+        fixture(listOf(UIMessage.user("question"), UIMessage.assistant("partial"))) { session, store ->
+            val original = session.state.value.messageNodes
+            session.setJob(Job())
+            try {
+                expectIssue(ClassicCompressionIssue.GENERATING) {
+                    session.compressClassicHistory { _, _ -> error("must not request a summary") }
+                }
+                assertEquals(original, session.state.value.messageNodes)
+                assertEquals(0, store.writes)
+            } finally {
+                session.setJob(null)
+            }
+        }
+    }
+
+    @Test
+    fun `v1034 failed midturn summary never replaces partial answer or writes a checkpoint`() = runBlocking {
+        fixture(listOf(UIMessage.user("question"), UIMessage.assistant("partial code"))) { session, store ->
+            val original = session.state.value.messageNodes
+            session.setJob(Job())
+            val failure = IllegalStateException("summary endpoint unavailable")
+            try {
+                try {
+                    session.compressClassicHistory(allowWhileGenerating = true) { _, _ -> throw failure }
+                    fail("expected summary error")
+                } catch (actual: IllegalStateException) {
+                    assertSame(failure, actual)
+                }
+                assertEquals(original, session.state.value.messageNodes)
+                assertEquals(0, store.writes)
+                assertTrue(session.isGenerating)
+            } finally {
+                session.setJob(null)
+            }
+        }
+    }
+
+    @Test
+    fun `v1034 cancellation of midturn summary propagates without any checkpoint write`() = runBlocking {
+        fixture(listOf(UIMessage.user("question"), UIMessage.assistant("partial code"))) { session, store ->
+            val original = session.state.value.messageNodes
+            session.setJob(Job())
+            val cancelled = CancellationException("user pressed stop")
+            try {
+                try {
+                    session.compressClassicHistory(allowWhileGenerating = true) { _, _ -> throw cancelled }
+                    fail("expected cancellation")
+                } catch (actual: CancellationException) {
+                    assertSame(cancelled, actual)
+                }
+                assertEquals(original, session.state.value.messageNodes)
+                assertEquals(0, store.writes)
+            } finally {
+                session.setJob(null)
+            }
+        }
+    }
 }

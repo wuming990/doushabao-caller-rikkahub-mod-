@@ -6,18 +6,26 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DrawerState
 import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.DropdownMenuGroup
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.DropdownMenuPopup
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.MenuDefaults
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.OutlinedTextField
@@ -34,6 +42,7 @@ import androidx.compose.material3.rememberBottomSheetState
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -45,6 +54,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
@@ -54,9 +64,11 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.core.content.FileProvider
 import androidx.core.net.toFile
 import androidx.core.net.toUri
+import me.rerere.ui.components.RikkaConfirmDialog
 import me.rerere.ui.toast.ToastType
 import me.rerere.ui.toast.ToasterState
 import dev.chrisbanes.haze.hazeSource
+import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.rememberHazeState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -73,10 +85,12 @@ import me.rerere.ai.ui.UIMessagePart
 import me.rerere.common.android.appTempFolder
 import me.rerere.hugeicons.HugeIcons
 import me.rerere.hugeicons.stroke.ArrowLeft01
-import me.rerere.hugeicons.stroke.Cancel01
+import me.rerere.hugeicons.stroke.Delete01
 import me.rerere.hugeicons.stroke.LeftToRightListBullet
 import me.rerere.hugeicons.stroke.Menu03
 import me.rerere.hugeicons.stroke.MessageAdd01
+import me.rerere.hugeicons.stroke.MoreVertical
+import me.rerere.hugeicons.stroke.Share04
 import me.rerere.rikkahub.AppScope
 import me.rerere.rikkahub.R
 import me.rerere.rikkahub.Screen
@@ -94,14 +108,18 @@ import me.rerere.rikkahub.data.model.Assistant
 import me.rerere.rikkahub.data.model.Conversation
 import me.rerere.rikkahub.data.model.GroupChatConfig
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
+import me.rerere.rikkahub.service.BackgroundShellStatus
 import me.rerere.rikkahub.service.ChatError
+import me.rerere.rikkahub.service.SessionActivity
 import me.rerere.rikkahub.service.GroupPickOutcome
 import me.rerere.rikkahub.service.RoundTableTaskGuard
 import me.rerere.rikkahub.service.approxConversationTokens
 import me.rerere.rikkahub.service.buildContextUsageInfo
 import me.rerere.rikkahub.service.reportedConversationTokens
 import me.rerere.rikkahub.service.resolveAutoCompressTriggerTokens
+import me.rerere.rikkahub.ui.components.ai.BackgroundTasksSheet
 import me.rerere.rikkahub.ui.components.ai.ChatInput
+import me.rerere.rikkahub.ui.components.ai.ChatTopBarCapsule
 import me.rerere.rikkahub.ui.components.ai.ChatFileBrowserSheet
 import me.rerere.rikkahub.ui.components.ai.ChatImageTarget
 import me.rerere.rikkahub.ui.components.ai.ChatImageTargetDialog
@@ -343,7 +361,10 @@ private fun ChatPageContent(
     // v255：附件条的「添加 / 重试 / 移除」要在面板关闭后也能用，所以这一层也要拿到这两个依赖
     val filesManager: FilesManager = koinInject()
     val appScope: AppScope = koinInject()
+    val sessionActivity by vm.sessionActivity.collectAsStateWithLifecycle()
     var previewMode by rememberSaveable { mutableStateOf(false) }
+    val selectionState = rememberChatSelectionState()
+    var showDeleteConfirm by remember { mutableStateOf(false) }
     val hazeState = rememberHazeState()
     // v323：官方 3.1 的会话视角助手 —— 模型/思考档/MCP/技能以会话配置为准。
     // 旧写法 setting.getCurrentAssistant() 是「全局当前助手」，bind 过 config 的会话里
@@ -439,7 +460,20 @@ private fun ChatPageContent(
         }.orEmpty()
     }
 
+    // 列表滚到标题栏下面时才显示胶囊背景，空页面或在顶部时按钮直接浮在背景上
+    // 概览页有自己的列表，切过去后跟着它判断
+    val previewListState = rememberLazyListState()
+    val listScrolledUnderTopBar by remember(chatListState, previewListState) {
+        derivedStateOf {
+            if (previewMode) previewListState.canScrollBackward else chatListState.canScrollBackward
+        }
+    }
+
     TTSAutoPlay(vm = vm, setting = setting, conversation = conversation)
+
+    BackHandler(previewMode) {
+        previewMode = false
+    }
 
     Surface(
         color = MaterialTheme.colorScheme.background,
@@ -461,12 +495,22 @@ private fun ChatPageContent(
                     showTokenStats = setting.displaySetting.showConversationTokenStats,
                     bigScreen = bigScreen,
                     drawerState = drawerState,
-                    previewMode = previewMode,
+                    hazeState = hazeState,
+                    showCapsuleBackground = listScrolledUnderTopBar,
                     onNewChat = {
                         navigateToChatPage(navController)
                     },
-                    onClickMenu = {
-                        previewMode = !previewMode
+                    onShowOverview = {
+                        selectionState.selecting = false
+                        previewMode = true
+                    },
+                    onExport = {
+                        // 跟消息上的分享一样进入多选，默认全选，用户可以再挑
+                        previewMode = false
+                        selectionState.start(conversation.messageNodes.map { it.id })
+                    },
+                    onDelete = {
+                        showDeleteConfirm = true
                     },
                     onUpdateTitle = {
                         vm.updateTitle(it)
@@ -480,6 +524,15 @@ private fun ChatPageContent(
             },
             bottomBar = {
                 val messageQueue by vm.messageQueue.collectAsStateWithLifecycle()
+                val backgroundTasks by vm.backgroundTasks.collectAsStateWithLifecycle()
+                var showBackgroundTasks by remember { mutableStateOf(false) }
+                if (showBackgroundTasks) {
+                    BackgroundTasksSheet(
+                        tasks = backgroundTasks,
+                        onStop = vm::stopBackgroundTask,
+                        onDismiss = { showBackgroundTasks = false },
+                    )
+                }
                 Column {
                     // v218：独立子代理活动面板（与圆桌无关）
                     // v224：子代理总开关关掉后完全不显示，不再占着输入框上方的位置、
@@ -631,6 +684,8 @@ private fun ChatPageContent(
                         onBeginEditQueuedMessage = vm::beginEditQueuedMessage,
                         onFinishEditQueuedMessage = vm::finishEditQueuedMessage,
                         onResumeMessageQueue = vm::resumeMessageQueue,
+                        runningBackgroundTasks = backgroundTasks.count { it.status == BackgroundShellStatus.RUNNING },
+                        onShowBackgroundTasks = { showBackgroundTasks = true },
                         state = inputState,
                         loading = loadingJob != null,
                         settings = setting,
@@ -733,9 +788,13 @@ private fun ChatPageContent(
                 innerPadding = innerPadding,
                 conversation = conversation,
                 state = chatListState,
+                previewListState = previewListState,
+                selectionState = selectionState,
                 loading = loadingJob != null,
+                compressing = sessionActivity == SessionActivity.Compressing,
                 processingStatus = processingStatus,
                 previewMode = previewMode,
+                onPreviewModeChange = { previewMode = it },
                 settings = setting,
                 hazeState = hazeState,
                 errors = errors,
@@ -805,6 +864,22 @@ private fun ChatPageContent(
                 },
             )
         }
+
+        RikkaConfirmDialog(
+            show = showDeleteConfirm,
+            title = stringResource(R.string.confirm_delete),
+            confirmText = stringResource(R.string.delete),
+            dismissText = stringResource(R.string.cancel),
+            onConfirm = {
+                showDeleteConfirm = false
+                scope.launch {
+                    vm.deleteConversation(conversation).join()
+                    navigateToChatPage(navController)
+                }
+            },
+            onDismiss = { showDeleteConfirm = false },
+            text = { Text(stringResource(R.string.chat_page_delete_conversation_confirm)) },
+        )
 
         if (showFilesSheet) {
             ChatFilesPickerSheet(
@@ -1403,8 +1478,8 @@ private fun ChatFilesPickerSheet(
                 vm.handleCompressContext(additionalPrompt, modelSource, customPrompt)
             },
             // v268：经典压缩（官方旧版流程）
-            onCompressContextClassic = { additionalPrompt, keepRecentMessages ->
-                vm.handleCompressContextClassic(additionalPrompt, keepRecentMessages)
+            onCompressContextClassic = { additionalPrompt, keepRecentMessages, protectUserMessages ->
+                vm.handleCompressContextClassic(additionalPrompt, keepRecentMessages, protectUserMessages)
             },
             // v323：必须走 VM（ChatService.updateChatAssistant → withoutConversationFields 剥掉会话字段）。
             // 旧写法直接把「会话视角助手」整份写回 settings.assistants：以前 assistant 是全局助手
@@ -1497,9 +1572,12 @@ private fun TopBar(
     showTokenStats: Boolean = false,
     drawerState: DrawerState,
     bigScreen: Boolean,
-    previewMode: Boolean,
-    onClickMenu: () -> Unit,
+    hazeState: HazeState,
+    showCapsuleBackground: Boolean,
     onNewChat: () -> Unit,
+    onShowOverview: () -> Unit,
+    onExport: () -> Unit,
+    onDelete: () -> Unit,
     onUpdateTitle: (String) -> Unit,
     // v224：非空时顶栏左侧显示返回箭头（圆桌过程对话用）
     onBack: (() -> Unit)? = null,
@@ -1520,12 +1598,19 @@ private fun TopBar(
                     Icon(HugeIcons.ArrowLeft01, stringResource(R.string.round_table_seat_chat_back))
                 }
             } else if (!bigScreen) {
-                IconButton(
-                    onClick = {
-                        scope.launch { drawerState.open() }
-                    }
+                ChatTopBarCapsule(
+                    hazeState = hazeState,
+                    displaySetting = settings.displaySetting,
+                    showBackground = showCapsuleBackground,
+                    modifier = Modifier.padding(start = 8.dp, end = 4.dp),
                 ) {
-                    Icon(HugeIcons.Menu03, "Messages")
+                    IconButton(
+                        onClick = {
+                            scope.launch { drawerState.open() }
+                        }
+                    ) {
+                        Icon(HugeIcons.Menu03, "Messages")
+                    }
                 }
             }
         },
@@ -1574,20 +1659,25 @@ private fun TopBar(
             }
         },
         actions = {
-            IconButton(
-                onClick = {
-                    onClickMenu()
-                }
+            ChatTopBarCapsule(
+                hazeState = hazeState,
+                displaySetting = settings.displaySetting,
+                showBackground = showCapsuleBackground,
+                modifier = Modifier.padding(start = 4.dp, end = 8.dp),
             ) {
-                Icon(if (previewMode) HugeIcons.Cancel01 else HugeIcons.LeftToRightListBullet, "Chat Options")
-            }
-
-            IconButton(
-                onClick = {
-                    onNewChat()
+                IconButton(
+                    onClick = {
+                        onNewChat()
+                    }
+                ) {
+                    Icon(HugeIcons.MessageAdd01, "New Message")
                 }
-            ) {
-                Icon(HugeIcons.MessageAdd01, "New Message")
+                ChatPageMenu(
+                    enabled = conversation.messageNodes.isNotEmpty(),
+                    onShowOverview = onShowOverview,
+                    onExport = onExport,
+                    onDelete = onDelete,
+                )
             }
         },
     )
@@ -1634,5 +1724,81 @@ private fun TopBar(
                 }
             }
         )
+    }
+}
+
+// 顶栏右侧的会话菜单；空对话没有内容可概览、导出或删除，菜单项全部置灰
+@Composable
+private fun ChatPageMenu(
+    enabled: Boolean,
+    onShowOverview: () -> Unit,
+    onExport: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+
+    @Composable
+    fun MenuItem(
+        text: String,
+        icon: ImageVector,
+        index: Int,
+        count: Int,
+        destructive: Boolean = false,
+        onClick: () -> Unit,
+    ) {
+        DropdownMenuItem(
+            text = { Text(text) },
+            onClick = {
+                expanded = false
+                onClick()
+            },
+            shape = MenuDefaults.itemShape(index = index, count = count).shape,
+            leadingIcon = { Icon(icon, contentDescription = null) },
+            enabled = enabled,
+            colors = if (destructive) {
+                val errorColor = MaterialTheme.colorScheme.error
+                MenuDefaults.itemColors(textColor = errorColor, leadingIconColor = errorColor)
+            } else {
+                MenuDefaults.itemColors()
+            },
+        )
+    }
+
+    Box {
+        IconButton(onClick = { expanded = true }) {
+            Icon(HugeIcons.MoreVertical, stringResource(R.string.more_options))
+        }
+        DropdownMenuPopup(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+        ) {
+            DropdownMenuGroup(shapes = MenuDefaults.groupShape(index = 0, count = 2)) {
+                MenuItem(
+                    text = stringResource(R.string.chat_page_conversation_map),
+                    icon = HugeIcons.LeftToRightListBullet,
+                    index = 0,
+                    count = 2,
+                    onClick = onShowOverview,
+                )
+                MenuItem(
+                    text = stringResource(R.string.export_title),
+                    icon = HugeIcons.Share04,
+                    index = 1,
+                    count = 2,
+                    onClick = onExport,
+                )
+            }
+            Spacer(Modifier.height(MenuDefaults.GroupSpacing))
+            DropdownMenuGroup(shapes = MenuDefaults.groupShape(index = 1, count = 2)) {
+                MenuItem(
+                    text = stringResource(R.string.delete),
+                    icon = HugeIcons.Delete01,
+                    index = 0,
+                    count = 1,
+                    destructive = true,
+                    onClick = onDelete,
+                )
+            }
+        }
     }
 }

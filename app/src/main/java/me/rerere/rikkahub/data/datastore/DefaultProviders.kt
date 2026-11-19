@@ -112,7 +112,7 @@ val DEFAULT_PROVIDERS = listOf(
         name = "Vercel AI Gateway",
         baseUrl = "https://ai-gateway.vercel.sh/v1",
         apiKey = "",
-        enabled = false,
+        enabled = true,
         builtIn = true,
         quotaQuery = QuotaQuery(
             enabled = true,
@@ -125,7 +125,7 @@ val DEFAULT_PROVIDERS = listOf(
         name = "阿里云百炼",
         baseUrl = "https://dashscope.aliyuncs.com/compatible-mode/v1",
         apiKey = "",
-        enabled = false,
+        enabled = true,
         builtIn = true
     ),
     ProviderSetting.OpenAI(
@@ -133,7 +133,7 @@ val DEFAULT_PROVIDERS = listOf(
         name = "火山引擎",
         baseUrl = "https://ark.cn-beijing.volces.com/api/v3",
         apiKey = "",
-        enabled = false,
+        enabled = true,
         builtIn = true
     ),
     ProviderSetting.OpenAI(
@@ -141,7 +141,7 @@ val DEFAULT_PROVIDERS = listOf(
         name = "智谱AI开放平台",
         baseUrl = "https://open.bigmodel.cn/api/paas/v4",
         apiKey = "",
-        enabled = false,
+        enabled = true,
         builtIn = true
     ),
     ProviderSetting.OpenAI(
@@ -149,7 +149,7 @@ val DEFAULT_PROVIDERS = listOf(
         name = "阶跃星辰",
         baseUrl = "https://api.stepfun.com/v1",
         apiKey = "",
-        enabled = false,
+        enabled = true,
         builtIn = true
     ),
     ProviderSetting.OpenAI(
@@ -157,7 +157,7 @@ val DEFAULT_PROVIDERS = listOf(
         name = "腾讯Hunyuan",
         baseUrl = "https://tokenhub.tencentmaas.com/v1",
         apiKey = "",
-        enabled = false,
+        enabled = true,
         builtIn = true
     ),
     ProviderSetting.OpenAI(
@@ -165,7 +165,7 @@ val DEFAULT_PROVIDERS = listOf(
         name = "xAI",
         baseUrl = "https://api.x.ai/v1",
         apiKey = "",
-        enabled = false,
+        enabled = true,
         builtIn = true,
         useResponseApi = true,
     ),
@@ -174,7 +174,7 @@ val DEFAULT_PROVIDERS = listOf(
         name = "MiniMax",
         baseUrl = "https://api.minimaxi.com/anthropic/v1",
         apiKey = "",
-        enabled = false,
+        enabled = true,
         builtIn = true,
     ),
     ProviderSetting.OpenAI(
@@ -182,7 +182,7 @@ val DEFAULT_PROVIDERS = listOf(
         name = "MIMO",
         baseUrl = "https://api.xiaomimimo.com/v1",
         apiKey = "",
-        enabled = false,
+        enabled = true,
         builtIn = true,
     ),
 )

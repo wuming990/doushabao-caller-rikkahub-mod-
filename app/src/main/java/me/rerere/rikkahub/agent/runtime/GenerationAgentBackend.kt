@@ -1,18 +1,22 @@
 package me.rerere.rikkahub.agent.runtime
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.jsonObject
 import me.rerere.ai.core.MessageRole
+import me.rerere.ai.core.ReasoningLevel
 import me.rerere.ai.core.Tool
 import me.rerere.ai.ui.UIMessage
 import me.rerere.ai.ui.UIMessagePart
 import me.rerere.rikkahub.agent.model.AGENT_EVENT_TYPE_MODEL_ACTIVE
+import me.rerere.rikkahub.agent.model.AGENT_EVENT_TYPE_TOKEN_USAGE
 import me.rerere.rikkahub.agent.model.AGENT_EVENT_TYPE_RESUME_CHECKPOINT
 import me.rerere.rikkahub.agent.model.AgentEvent
 import me.rerere.rikkahub.agent.model.AgentFinishReason
@@ -20,6 +24,8 @@ import me.rerere.rikkahub.agent.model.AgentMessage
 import me.rerere.rikkahub.agent.model.AgentReport
 import me.rerere.rikkahub.agent.model.AgentRole
 import me.rerere.rikkahub.agent.model.AgentThread
+import me.rerere.rikkahub.agent.model.AgentUsageSnapshot
+import me.rerere.rikkahub.agent.model.agentUsageSnapshotOf
 import me.rerere.rikkahub.agent.tools.withSmallAgentOutputLimit
 import me.rerere.rikkahub.agent.tools.createAgentReadOnlyTools
 import me.rerere.rikkahub.agent.tools.createAgentWritableTools
@@ -1053,6 +1059,8 @@ class GenerationAgentBackend(
                     ) {
                         runWithModel(
                             thread = thread,
+                            // v1032：token 事件 id 用「候选模型序号-尝试序号」区分，互不覆盖
+                            usageOrdinal = "${index + 1}-$attempt",
                             resume = resume,
                             settings = settings,
                             model = model,
@@ -1230,6 +1238,12 @@ class GenerationAgentBackend(
         checkpoint: String? = null,
         /** v251：本次续跑采用的模式（suffix / repair），由线程状态推导 */
         resumeMode: AgentResumeMode? = null,
+        /**
+         * v1032：本次尝试的编号（`候选模型序号-第几次尝试`），只用来拼 token 用量事件的稳定 id。
+         *
+         * 同一次尝试反复上报覆盖自己（不重复计），不同尝试各留一条（失败重试花掉的钱也算进去）。
+         */
+        usageOrdinal: String = "1-1",
     ): AgentRunOutcome {
         // 独立助手副本：清空一切可能污染子代理上下文的字段
         //
@@ -1243,6 +1257,7 @@ class GenerationAgentBackend(
             webSearchToolNames = webSearchToolNames,
             // v1027 复审后整条链只传一个对象，串参数/漏传这两类错误结构上不可能再发生
             mcp = mcp,
+            reasoningLevelOverride = settings.agentReasoningLevel,
         )
 
         var latestMessages: List<UIMessage> = emptyList()
@@ -1256,6 +1271,60 @@ class GenerationAgentBackend(
             .filter { it.role == MessageRole.ASSISTANT }
             .map { it.id }
             .toSet()
+
+        // v1032：子代理 token 记账 —— 把本次尝试的用量写成一条**界面看不见**的内部事件。
+        //
+        // 为什么不是「已经有数据了我只是没显示」：子代理走 GenerationLoop，而 UsageRecorder 的
+        // 全包 8 处 wrap 都在 ChatRequestFactory / 元信息 / 记忆 / 翻译 / OCR 那条路上，
+        // 子代理这一路从来没被包过 —— 它花掉的 token 以前一个字节都没记下来。
+        // 为什么不加数据库列：AgentDatabase 版本 3 是用户红线；现有 agent_events 的
+        // 「稳定 id + REPLACE」正好能表达「同一次尝试只留最后一份累计值」，够用且不动 schema。
+        // 取数口径照「本对话token明细」的 SQL（cumulativeUsage 优先、老数据退回 usage、
+        // 请求次数优先 cumulativeRequestCount），两处不会长出两套数。唯一一处刻意不同：
+        // 只报 totalTokens、报不出输入/输出分项的服务商这里不计（计了界面只会显示成 Σ 0，像免费）。
+        // 所以这份数只可能因为「拿不到分项」而偏小，不会因为口径差异而偏大。
+        var lastUsageEventJson: String? = null
+        var lastUsageWriteAt = 0L
+        // v1032 二轮审查修正：第一轮里 message.usage 是按分片刷新的水位值（第 2 轮起才有
+        // cumulativeUsage 每轮一次），所以「值变了才写」这一个判据在第一轮根本挡不住，
+        // 会变成每个分片一次写库 + 一次 Room 失效（面板展开时反复重查重算）。补一道 1 秒节流；
+        // 收尾 / 取消 / 异常这三处一律 force 落定，不受节流影响，否则最后一笔花费可能不记。
+        //
+        // @param force 收尾/取消/异常用 true，强制写下去
+        suspend fun publishUsage(force: Boolean = false) {
+            val snapshot = agentUsageSnapshotOf(
+                model.id.toString(),
+                latestMessages.filter {
+                    it.role == MessageRole.ASSISTANT && it.id !in inputAssistantIds
+                },
+            ) ?: return
+            val detail = AgentUsageSnapshot.encode(snapshot)
+            // 一次尝试可能上报几十次，值没变就不写库（与续跑检查点同一取舍）
+            if (detail == lastUsageEventJson) return
+            val now = System.currentTimeMillis()
+            if (!force && now - lastUsageWriteAt < USAGE_WRITE_THROTTLE_MILLIS) return
+            // 记账失败绝不能打断生成：旧写法让一次 AgentDatabase 写失败穿出 collect，被下面的
+            // catch 包成 AgentAttemptFailure，结果是整轮重试、换模型 —— 为了记一笔账多花一遍钱。
+            val result = runCatching {
+                onEvent(
+                    AgentEvent(
+                        id = agentTokenUsageEventId(thread.id, thread.resumeCount, usageOrdinal),
+                        threadId = thread.id,
+                        type = AGENT_EVENT_TYPE_TOKEN_USAGE,
+                        detail = detail,
+                        createdAt = Instant.now(),
+                    )
+                )
+            }
+            // 只有真写成功才置标记与时间戳：写失败时保留「下一片再补一次」的机会，
+            // 否则同一个值再也不会重发，那笔花费永久丢失（这是第一轮审查抓到的同类毛病）。
+            if (result.isSuccess) {
+                lastUsageEventJson = detail
+                lastUsageWriteAt = now
+            } else {
+                println("[agent-usage] 记录 token 用量失败，留待下一次上报: ${result.exceptionOrNull()}")
+            }
+        }
 
         try {
             generationLoop.generateText(
@@ -1282,6 +1351,7 @@ class GenerationAgentBackend(
                 when (chunk) {
                     is GenerationChunk.Messages -> {
                         latestMessages = chunk.messages
+                        publishUsage()
                         // v251：每次 assistant 流式更新后，保存「已累计的完整原文」检查点。
                         // 内容 = 旧检查点（本轮开始前的累计）+ 本轮所有 assistant 文本（toText，未裁剪）。
                         // 刻意不调用 clipAgentMessageContent —— 检查点必须是无损的续跑依据。
@@ -1359,13 +1429,18 @@ class GenerationAgentBackend(
                 }
             }
         } catch (e: kotlinx.coroutines.CancellationException) {
-            throw e
+            throw e // v1032：取消必须立刻原样上抛，这里刻意不记账（见上面那两条纪律）
         } catch (e: Throwable) {
+            withContext(NonCancellable) { runCatching { publishUsage(force = true) } }
             throw AgentAttemptFailure(
                 failure = e,
                 producedOutput = messageFirstSeen.isNotEmpty() || emittedToolEvents.isNotEmpty(),
             )
         }
+
+        // v1032：正常写完必须落定一次（服务商的 usage 常在最后一个分片才给全，
+        // 这一处不该被 1 秒节流挡掉，否则最后一笔花费就丢了）。
+        publishUsage(force = true)
 
         val lastAssistant = latestMessages.lastOrNull { it.role == MessageRole.ASSISTANT }
         val finishReason = lastAssistant?.finishReason
@@ -1962,6 +2037,12 @@ internal fun agentMessageId(threadId: String, message: UIMessage): String =
     "$threadId:${message.id}"
 
 /** v222：工具事件的稳定 id（同一工具同一阶段只落一条） */
+/**
+ * v1032：子代理 token 用量事件的写库节流窗口（毫秒）。
+ * 只挡流式过程中的自更新；收尾 / 取消 / 异常三处 force 落定，不受它影响。
+ */
+private const val USAGE_WRITE_THROTTLE_MILLIS = 1_000L
+
 internal fun agentEventId(threadId: String, key: String): String = "$threadId:$key"
 
 /** v222：工具事件的可读描述 */
@@ -2563,7 +2644,10 @@ internal fun buildIsolatedAssistant(
     memoryEnabled: Boolean = false,
     webSearchToolNames: List<String> = emptyList(),
     mcp: AgentMcpCapability = AgentMcpCapability(),
+    reasoningLevelOverride: ReasoningLevel? = null,
 ): me.rerere.rikkahub.data.model.Assistant = base.copy(
+    // v1040：只改子代理专用副本；同一次 run 的首跑、重试和备用模型共享设置。
+    reasoningLevel = reasoningLevelOverride ?: base.reasoningLevel,
     systemPrompt = buildAgentSystemPrompt(thread, memoryEnabled, webSearchToolNames, mcp),
     enableMemory = false,
     useGlobalMemory = false,

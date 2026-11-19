@@ -75,6 +75,18 @@ private fun reasoningLevel(
     decode = { name -> ReasoningLevel.entries.find { it.name == name } ?: ReasoningLevel.AUTO },
 )
 
+// v1040：兼顾旧备份和未知值；只有显式写入 AUTO 才是独立自动档。
+internal fun decodeAgentReasoningLevel(raw: String?): ReasoningLevel? =
+    ReasoningLevel.entries.firstOrNull { it.name == raw }
+
+internal val AGENT_REASONING_LEVEL_FIELD = SettingsField(
+    SettingsStore.AGENT_REASONING_LEVEL,
+    Settings::agentReasoningLevel,
+    { copy(agentReasoningLevel = it) },
+    encode = { it?.name },
+    decode = ::decodeAgentReasoningLevel,
+)
+
 internal val SETTINGS_FIELDS: List<SettingsField<*, *>> = with(SettingsStore) {
     listOf(
         // UI设置
@@ -114,6 +126,10 @@ internal val SETTINGS_FIELDS: List<SettingsField<*, *>> = with(SettingsStore) {
         plain(SUGGESTION_PROMPT, Settings::suggestionPrompt) { copy(suggestionPrompt = it) },
         uuid(OCR_MODEL, Settings::ocrModelId) { copy(ocrModelId = it) },
         plain(OCR_PROMPT, Settings::ocrPrompt) { copy(ocrPrompt = it) },
+
+        // 自动压缩
+        plain(ENABLE_AUTO_COMPRESS, Settings::enableAutoCompress) { copy(enableAutoCompress = it) },
+        plain(AUTO_COMPRESS_THRESHOLD, Settings::autoCompressThreshold) { copy(autoCompressThreshold = it) },
 
         // 提供商
         json(PROVIDERS, Settings::providers) { copy(providers = it) },
@@ -224,6 +240,7 @@ internal val SETTINGS_FIELDS: List<SettingsField<*, *>> = with(SettingsStore) {
             },
         ),
         plain(COMPRESS_USE_CLASSIC_MODE, Settings::compressUseClassicMode) { copy(compressUseClassicMode = it) },
+        plain(COMPRESS_CLASSIC_PROTECT_USER_MESSAGES, Settings::compressClassicProtectUserMessages) { copy(compressClassicProtectUserMessages = it) },
         SettingsField(
             GROUP_CHAT_PRESETS, Settings::groupChatPresets, { copy(groupChatPresets = it) },
             encode = { JsonInstant.encodeToString(it) },
@@ -236,6 +253,7 @@ internal val SETTINGS_FIELDS: List<SettingsField<*, *>> = with(SettingsStore) {
         plain(AGENT_MCP, Settings::allowAgentMcp) { copy(allowAgentMcp = it) },
         plain(AGENT_MAX_STEPS, Settings::agentMaxSteps) { copy(agentMaxSteps = it) },
         plain(AGENT_ENABLED, Settings::enableAgentTools) { copy(enableAgentTools = it) },
+        AGENT_REASONING_LEVEL_FIELD,
         SettingsField(
             AGENT_MODEL, Settings::agentModelId, { copy(agentModelId = it) },
             encode = { it?.toString() },

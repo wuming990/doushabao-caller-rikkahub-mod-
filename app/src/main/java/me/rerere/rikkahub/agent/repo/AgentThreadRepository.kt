@@ -9,6 +9,8 @@ import me.rerere.rikkahub.agent.db.AgentMessageEntity
 import me.rerere.rikkahub.agent.db.AgentEventEntity
 import me.rerere.rikkahub.agent.db.AgentThreadEntity
 import me.rerere.rikkahub.agent.model.AGENT_EVENT_TYPE_RESUME_CHECKPOINT
+import me.rerere.rikkahub.agent.model.AGENT_EVENT_TYPE_TOKEN_USAGE
+import kotlinx.coroutines.flow.combine
 import me.rerere.rikkahub.agent.model.AgentMessage
 import me.rerere.rikkahub.agent.model.AgentEvent
 import me.rerere.rikkahub.agent.model.AgentRole
@@ -34,6 +36,13 @@ interface AgentThreadRepository {
 
     suspend fun insertEvent(event: AgentEvent)
     fun eventsFlow(threadId: String): Flow<List<AgentEvent>>
+
+    /**
+     * v1032：该对话下所有子代理的 token 用量事件（TOKEN_USAGE，界面不可见的那一类）。
+     *
+     * 交给 `agentThreadUsageOf` 汇总；界面只订阅这一条 Flow，不再自己攒状态。
+     */
+    fun tokenUsageEventsFlow(conversationId: String): Flow<List<AgentEvent>>
 
     /**
      * v251：读取该线程最近一次续跑检查点（未裁剪的完整原文）。
@@ -127,6 +136,19 @@ class RoomAgentThreadRepository(
 
     override suspend fun resumeCheckpoint(threadId: String): String? =
         dao.resumeCheckpoint(threadId)
+
+    override fun tokenUsageEventsFlow(conversationId: String): Flow<List<AgentEvent>> =
+        dao.tokenUsageEventsFlow(conversationId).map { list ->
+            list.map {
+                AgentEvent(
+                    id = it.id,
+                    threadId = it.threadId,
+                    type = it.type,
+                    detail = it.detail,
+                    createdAt = Instant.ofEpochMilli(it.createdAt),
+                )
+            }
+        }
 }
 
 /** 内存实现：单元测试与无数据库演示用 */
@@ -182,7 +204,24 @@ class InMemoryAgentThreadRepository : AgentThreadRepository {
 
     override fun eventsFlow(threadId: String): Flow<List<AgentEvent>> =
         events.map { list ->
-            list.filter { it.threadId == threadId && it.type != AGENT_EVENT_TYPE_RESUME_CHECKPOINT }
+            // v1032：TOKEN_USAGE 与续跑检查点同为内部事件，内存实现也必须一样排除，
+            // 否则单测里能看到的脏事件在生产里看不到，测试就白跑。
+            list.filter {
+                it.threadId == threadId &&
+                    it.type != AGENT_EVENT_TYPE_RESUME_CHECKPOINT &&
+                    it.type != AGENT_EVENT_TYPE_TOKEN_USAGE
+            }
+        }
+
+    override fun tokenUsageEventsFlow(conversationId: String): Flow<List<AgentEvent>> =
+        // 顺序与 lambda 形参必须一一对应：combine(threads, events) 的第一个参数才会进 storedThreads。
+        // 写反过的版本会把事件列表当线程列表用，编译期就炸 —— 这里留一行说明防止再翻。
+        combine(threads, events) { storedThreads, storedEvents ->
+            val owned = storedThreads
+                .filter { it.conversationId == conversationId }
+                .map { it.id }
+                .toSet()
+            storedEvents.filter { it.type == AGENT_EVENT_TYPE_TOKEN_USAGE && it.threadId in owned }
         }
 
     override suspend fun resumeCheckpoint(threadId: String): String? =

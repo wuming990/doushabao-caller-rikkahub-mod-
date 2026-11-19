@@ -19,14 +19,18 @@ import androidx.core.net.toUri
 import me.rerere.rikkahub.data.files.FileFolders
 import me.rerere.rikkahub.data.files.FilesManager
 import me.rerere.rikkahub.data.repository.WorkspaceRepository
+import me.rerere.rikkahub.service.BackgroundShellManager
+import me.rerere.rikkahub.service.BackgroundShellTask
 import me.rerere.rikkahub.utils.generateUnifiedDiff
 import me.rerere.workspace.WorkspaceCommandResult
 import me.rerere.workspace.WorkspaceFileEntry
 import me.rerere.workspace.WorkspaceManager
 import org.koin.java.KoinJavaComponent.getKoin
 import java.io.ByteArrayOutputStream
+import kotlin.uuid.Uuid
 
 private const val MAX_READ_FILE_BYTES = 8L * 1024 * 1024
+private const val SHELL_TIMEOUT_MAX_SECONDS = 600L
 
 /**
  * 发布到聊天的文件上限; 只做流式拷贝, 内容不进入对话, 因此可以远大于读取上限。
@@ -52,6 +56,8 @@ suspend fun createWorkspaceTools(
     workspaceRepository: WorkspaceRepository,
     cwd: String? = null,
     defaultTimeoutSeconds: Int = 0,
+    conversationId: Uuid? = null,
+    backgroundShellManager: BackgroundShellManager? = null,
 ): List<Tool> {
     if (workspaceId.isNullOrBlank()) return emptyList()
     val workspaceEntity = workspaceRepository.getById(workspaceId)
@@ -64,13 +70,22 @@ suspend fun createWorkspaceTools(
     // SFTP 覆盖写入时服务器打开文件就清空原内容，写到一半断线会留下残缺文件；
     // 那种工作区里改文件应当走 shell，不该拿到「直接写 / 直接改」两颗工具。
     val canUseFileWriteTools = workspaceEntity?.capabilities()?.fileWriteTools ?: true
-    return listOf(
+    // 官方 3.1.2：后台命令按会话归属，没有会话或环境不支持时不提供
+    val background = backgroundShellManager
+        ?.takeIf { workspaceEntity?.capabilities()?.backgroundShell == true }
+        ?.let { manager -> conversationId?.let { BackgroundShell(manager, it) } }
+    val tools = listOf(
         createReadFileTool(workspaceId, ::needsApproval, workspaceRepository),
         createWriteFileTool(workspaceId, ::needsApproval, workspaceRepository),
         createEditFileTool(workspaceId, ::needsApproval, workspaceRepository),
-        createShellTool(workspaceId, ::needsApproval, workspaceRepository, shellCwd, defaultTimeoutSeconds),
+        createShellTool(workspaceId, ::needsApproval, workspaceRepository, shellCwd, defaultTimeoutSeconds, background),
         createPublishFileTool(workspaceId, ::needsApproval, workspaceRepository),
-    ).filterNot { !canUseFileWriteTools && it.name in WorkspaceFileWriteToolNames }
+    ).filterNot { !canUseFileWriteTools && it.name in WorkspaceFileWriteToolNames }.toMutableList()
+    if (background != null) {
+        tools += createShellOutputTool(background)
+        tools += createShellKillTool(background)
+    }
+    return tools
 }
 
 private val IMAGE_EXTENSIONS = setOf(
@@ -352,6 +367,7 @@ private fun createShellTool(
     workspaceRepository: WorkspaceRepository,
     defaultCwd: String? = null,
     defaultTimeoutSeconds: Int = 0,
+    background: BackgroundShell? = null,
 ) = Tool(
     name = "workspace_shell",
     description = buildString {
@@ -359,6 +375,12 @@ private fun createShellTool(
         append("Use cwd for a path relative to the workspace files root. ")
         if (!defaultCwd.isNullOrBlank()) {
             append("Defaults to '$defaultCwd'. ")
+        }
+        if (background != null) {
+            append(
+                "Set run_in_background for long-running commands such as dev servers, watchers or long builds; " +
+                    "processes left running with `&` are killed when the command returns. "
+            )
         }
         append("Requires Rootfs to be installed and ready.")
     },
@@ -384,13 +406,27 @@ private fun createShellTool(
                     put("type", "integer")
                     put(
                         "description",
-                        if (defaultTimeoutSeconds <= 0) {
-                            "Command timeout in seconds. Defaults to no timeout (unlimited). Set a positive number to cap it."
-                        } else {
-                            "Command timeout in seconds. Defaults to $defaultTimeoutSeconds. Set to 0 for no timeout."
+                        buildString {
+                            if (defaultTimeoutSeconds <= 0) {
+                                append("Command timeout in seconds. Defaults to no timeout (unlimited). Set a positive number to cap it.")
+                            } else {
+                                append("Command timeout in seconds. Defaults to $defaultTimeoutSeconds. Set to 0 for no timeout.")
+                            }
+                            if (background != null) append(" Ignored when running in the background.")
                         }
                     )
                 })
+                if (background != null) {
+                    put("run_in_background", buildJsonObject {
+                        put("type", "boolean")
+                        put(
+                            "description",
+                            "Start the command in the background and return a task id immediately instead of waiting for it. " +
+                                "You will be notified with its exit code and the last lines of its output when it finishes, so do not poll it. " +
+                                "Use workspace_shell_output to check on it earlier and workspace_shell_kill to stop it. Defaults to false."
+                        )
+                    })
+                }
             },
             required = listOf("command"),
         )
@@ -401,30 +437,109 @@ private fun createShellTool(
         val command = params.string("command") ?: error("command is required")
         val cwd = (params.string("cwd") ?: defaultCwd.orEmpty())
             .removePrefix("/workspace/").removePrefix("/workspace")
-        val timeoutSeconds = params.string("timeout")?.toLongOrNull()?.also {
-            require(it >= 0L) { "timeout must be non-negative" }
+        val runInBackground = params.string("run_in_background")?.toBooleanStrictOrNull() ?: false
+        val output = if (runInBackground && background != null) {
+            background.manager.start(background.conversationId, workspaceId, command, cwd).toJson()
+        } else {
+            val timeoutSeconds = params.string("timeout")?.toLongOrNull()?.also {
+                require(it >= 0L) { "timeout must be non-negative" }
+            }
+            val timeoutMillis = when (timeoutSeconds) {
+                // AI 未指定: 用用户在设置里选的值; <=0 表示不限时
+                null -> if (defaultTimeoutSeconds <= 0) 0L
+                else defaultTimeoutSeconds.toLong().coerceAtMost(Long.MAX_VALUE / 1_000L) * 1_000L
+                0L -> 0L
+                else -> timeoutSeconds.coerceAtMost(Long.MAX_VALUE / 1_000L) * 1_000L
+            }
+            val result = workspaceRepository.executeCommand(workspaceId, command, cwd, timeoutMillis)
+            buildJsonObject {
+                put("exitCode", result.exitCode)
+                put("stdout", result.stdout)
+                put("stderr", result.stderr)
+                put("timedOut", result.timedOut)
+                if (result.truncated) put("truncated", true)
+            }
         }
-        val timeoutMillis = when (timeoutSeconds) {
-            // AI 未指定: 用用户在设置里选的默认值; <=0 表示不限时
-            null -> if (defaultTimeoutSeconds <= 0) 0L
-            else defaultTimeoutSeconds.toLong().coerceAtMost(Long.MAX_VALUE / 1_000L) * 1_000L
-            0L -> 0L
-            else -> timeoutSeconds.coerceAtMost(Long.MAX_VALUE / 1_000L) * 1_000L
-        }
-        val result = workspaceRepository.executeCommand(workspaceId, command, cwd, timeoutMillis)
+        listOf(UIMessagePart.Text(output.toString()))
+    },
+)
+
+private class BackgroundShell(val manager: BackgroundShellManager, val conversationId: Uuid)
+
+private fun createShellOutputTool(background: BackgroundShell) = Tool(
+    name = "workspace_shell_output",
+    description = """
+        Read the output of a background command started by workspace_shell with run_in_background.
+        Returns the combined stdout and stderr produced since the previous read, the command status,
+        and the exit code once it has finished. You are notified automatically when a background command
+        finishes, so only use this when you need its output before then, such as checking that a server started.
+    """.trimIndent().replace("\n", " "),
+    parameters = {
+        InputSchema.Obj(
+            properties = buildJsonObject {
+                put("task_id", buildJsonObject {
+                    put("type", "string")
+                    put("description", "Task id returned by workspace_shell")
+                })
+                put("wait", buildJsonObject {
+                    put("type", "integer")
+                    put(
+                        "description",
+                        "Seconds to wait for the command to finish before returning. Defaults to 0 (return immediately), max $SHELL_TIMEOUT_MAX_SECONDS."
+                    )
+                })
+            },
+            required = listOf("task_id"),
+        )
+    },
+    execute = {
+        val params = it.jsonObject
+        val taskId = params.string("task_id") ?: error("task_id is required")
+        val waitMillis = (params.string("wait")?.toLongOrNull() ?: 0L)
+            .coerceIn(0L, SHELL_TIMEOUT_MAX_SECONDS) * 1_000L
+        val result = background.manager.readOutput(background.conversationId, taskId, waitMillis)
         listOf(
             UIMessagePart.Text(
-                buildJsonObject {
-                    put("exitCode", result.exitCode)
-                    put("stdout", result.stdout)
-                    put("stderr", result.stderr)
-                    put("timedOut", result.timedOut)
-                    if (result.truncated) put("truncated", true)
+                result.task.toJson {
+                    put("output", result.output)
+                    if (result.skippedBytes > 0) {
+                        put("skippedBytes", result.skippedBytes)
+                        put("note", "Earlier output was omitted. The full log is at ${result.task.logPath}.")
+                    }
                 }.toString()
             )
         )
     },
 )
+
+private fun createShellKillTool(background: BackgroundShell) = Tool(
+    name = "workspace_shell_kill",
+    description = "Stop a background command started by workspace_shell with run_in_background, together with every process it started.",
+    parameters = {
+        InputSchema.Obj(
+            properties = buildJsonObject {
+                put("task_id", buildJsonObject {
+                    put("type", "string")
+                    put("description", "Task id returned by workspace_shell")
+                })
+            },
+            required = listOf("task_id"),
+        )
+    },
+    execute = {
+        val taskId = it.jsonObject.string("task_id") ?: error("task_id is required")
+        val task = background.manager.kill(background.conversationId, taskId)
+        listOf(UIMessagePart.Text(task.toJson().toString()))
+    },
+)
+
+private fun BackgroundShellTask.toJson(extra: JsonObjectBuilder.() -> Unit = {}) = buildJsonObject {
+    put("taskId", id)
+    put("status", status.name.lowercase())
+    exitCode?.let { put("exitCode", it) }
+    put("logPath", logPath)
+    extra()
+}
 
 private fun kotlinx.serialization.json.JsonObject.string(name: String): String? =
     this[name]?.jsonPrimitive?.contentOrNull

@@ -270,10 +270,16 @@ class TruncationAutoResumeGuardTest {
         // 对话框：双模式状态 + 模式切换 + 经典参数 + 确认分支
         val dialog = source("app/src/main/java/me/rerere/rikkahub/ui/components/ai/CompressContextDialog.kt")
         assertTrue("对话框缺双模式状态 classicMode", dialog.contains("var classicMode by remember { mutableStateOf(initialClassicMode) }"))
-        assertTrue("对话框缺经典模式确认分支 onConfirmClassic", dialog.contains("onConfirmClassic(additionalPrompt, keepRecentMessages)"))
+        assertTrue("对话框缺经典模式确认分支 onConfirmClassic", dialog.contains("onConfirmClassic(additionalPrompt, keepRecentMessages, protectUserMessages)"))
         assertTrue("对话框缺模式切换 UI chat_page_compress_mode_smart", dialog.contains("chat_page_compress_mode_smart"))
         assertFalse("v1019经典不应再把历史裁成目标token短摘要", dialog.contains("selectedTokens"))
-        assertTrue("v1019经典必须允许保留最近消息且默认全压", dialog.contains("mutableIntStateOf(0)") && dialog.contains("chat_page_compress_keep_recent_desc"))
+        // 官方 3.1.2 把步进器改成可手填数字：默认值仍是 0（文字框初值 "0"，缺省解析为 0）
+        assertTrue(
+            "v1019经典必须允许保留最近消息且默认全压",
+            dialog.contains("var keepRecentText by remember { mutableStateOf(\"0\") }") &&
+                dialog.contains("val keepRecentMessages = keepRecentText.toIntOrNull() ?: 0") &&
+                dialog.contains("chat_page_compress_keep_recent_desc"),
+        )
         // 服务层：经典压缩函数 + 官方旧版提示词（不读设置里的 Codex 提示词）
         val service = source("app/src/main/java/me/rerere/rikkahub/service/ChatService.kt")
         assertTrue("ChatService 缺经典压缩函数 compressConversationClassic", service.contains("suspend fun compressConversationClassic("))
@@ -316,10 +322,10 @@ class TruncationAutoResumeGuardTest {
         assertTrue("服务经典模式缺模式记忆", classicTask.contains("settingsStore.update") && classicTask.contains("compressUseClassicMode = true"))
         // 接线：FilesPicker 参数 + ChatPage 传递
         val picker = source("app/src/main/java/me/rerere/rikkahub/ui/components/ai/FilesPicker.kt")
-        assertTrue("FilesPicker 缺经典压缩参数 onCompressContextClassic", picker.contains("onCompressContextClassic: (additionalPrompt: String, keepRecentMessages: Int) -> Job"))
+        assertTrue("FilesPicker 缺经典压缩参数 onCompressContextClassic", picker.contains("onCompressContextClassic: (additionalPrompt: String, keepRecentMessages: Int, protectUserMessages: Boolean) -> Job"))
         assertTrue("FilesPicker 缺初始模式传递 initialClassicMode = settings.compressUseClassicMode", picker.contains("initialClassicMode = settings.compressUseClassicMode"))
         val page = source("app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatPage.kt")
-        assertTrue("ChatPage 缺经典压缩接线 onCompressContextClassic", page.contains("onCompressContextClassic = { additionalPrompt, keepRecentMessages ->"))
+        assertTrue("ChatPage 缺经典压缩接线 onCompressContextClassic", page.contains("onCompressContextClassic = { additionalPrompt, keepRecentMessages, protectUserMessages ->"))
         // 设置四件套 + 双语文案
         val prefs = source(prefsPath) + "\n" + source(settingsPath) // v323：官方 3.1 把 Settings 字段拆到 Settings.kt，判据改读两个文件（断言内容未改）
         assertTrue("Settings 缺字段 compressUseClassicMode", prefs.contains("val compressUseClassicMode: Boolean = false"))

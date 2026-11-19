@@ -172,10 +172,64 @@ class RoundTableSpeechBodyTest {
         assertTrue("找不到主对话 generateText 调用", callStart >= 0 && callEnd > callStart)
         val call = chatService.substring(callStart, callEnd)
 
+        // v1034：为了支持「一轮回复中途压缩后接着写」，messages 实参被提到循环变量
+        // generationMessages（初值就是下面这行原始表达式，之后每轮从当前会话重新取）。
+        // 判据跟着改成钉新写法，强度不降：① 必须仍从 conversation.currentMessages 起步；
+        // ② 实参必须是那个变量本身；③ 依旧绝不允许在这里裁剪 messages（下面那条负向判据不动）。
         assertTrue(
-            "messages 必须传原始 currentMessages（生成回写基线）",
-            call.contains("messages = conversation.currentMessages.let {"),
+            "messages 起步必须是原始 currentMessages（生成回写基线），不许换成裁剪过的列表",
+            chatService.contains("var generationMessages: List<UIMessage> = conversation.currentMessages.let {"),
         )
+        assertTrue(
+            "generateText 的 messages 实参必须是那个未裁剪的循环变量",
+            call.contains("messages = generationMessages,"),
+        )
+        // v1034 审查位 P1-2：只看"初始化 + 实参"是能被绕过的 —— 中间加一句
+        // `generationMessages = generationMessages.take(3)` 就同时满足两条判据。
+        // 因此再加两把锁：① 可数判据：全文对 generationMessages 的重新赋值只允许出现在
+        // 循环续写那一处；② 负向判据：这些赋值里不许出现任何裁剪/过滤算子。
+        val reassignments = chatService.lines()
+            .map { it.trim() }
+            .filter { it.startsWith("generationMessages =") }
+        assertEquals(
+            "generationMessages 只允许在「中途压缩后继续这一轮」那一处被重新赋值，实际多出来：$reassignments",
+            1,
+            reassignments.size,
+        )
+        assertTrue(
+            "续写时必须从会话当前消息整体重新取，不许换成裁剪过的列表",
+            reassignments.single().contains("getConversationFlow(conversationId).value.currentMessages"),
+        )
+        listOf(".take(", ".drop(", ".filter(", ".filterIndexed(", ".subList(", "withoutRoundTableToolParts", "limitContext")
+            .forEach { op ->
+                assertFalse("messages 入参链路上出现了裁剪算子 $op（会被永久写回对话记录）", reassignments.single().contains(op))
+                assertFalse("messages 初始化或实参附近出现了裁剪算子 $op", call.contains(op))
+            }
+        // v1034 第三轮审查位 P1：上面那些还被 `.let` **分支内部**绕过（把 else { it } 改成
+        // else { it.drop(1) }，四道锁一条都不碰）。所以把整个初始化表达式切出来单独判形状：
+        // 只允许「messageRange != null 时取那段子列表」这一处裁剪（重新生成语义，本来就有），
+        // 普通分支必须原样返回 it。
+        val initStart = chatService.indexOf("var generationMessages: List<UIMessage> = conversation.currentMessages.let {")
+        assertTrue("找不到 generationMessages 的初始化表达式", initStart >= 0)
+        val initializer = chatService.substring(initStart).lineSequence().take(8).joinToString("\n")
+        assertTrue(
+            "初始化里那唯一的裁剪必须仍然只在 messageRange 分支里（普通分支被裁 = 主对话上文被削）",
+            Regex("""if\s*\(\s*messageRange\s*!=\s*null\s*\)\s*\{\s*it\.subList\(""", RegexOption.DOT_MATCHES_ALL)
+                .containsMatchIn(initializer),
+        )
+        assertTrue(
+            "普通分支必须原样返回 it（不许换成 take/drop/filter/subList/limitContext 等任何裁剪）",
+            Regex("""\}\s*else\s*\{\s*it\s*\}""", RegexOption.DOT_MATCHES_ALL).containsMatchIn(initializer),
+        )
+        // 另一半口子：有人去改 Conversation.currentMessages 这个 getter 本身，本文件永远看不见。
+        val conv = source("data/model/Conversation.kt")
+        val cmStart = conv.indexOf("val currentMessages")
+        assertTrue("找不到 Conversation.currentMessages", cmStart >= 0)
+        val cm = conv.substring(cmStart).lineSequence().take(6).joinToString("\n")
+        assertTrue("currentMessages 必须是「每个节点取当前选中消息」的 1:1 映射", cm.contains("messageNodes.map { node -> node.messages[node.selectIndex] }"))
+        listOf(".take(", ".drop(", ".filter(", ".subList(", ".distinct(", ".sortedByDescending(").forEach { op ->
+            assertFalse("currentMessages 的 getter 里出现了裁剪/筛掉节点的算子 $op（会把主对话上文永久削短）", cm.contains(op))
+        }
         assertFalse(
             "绝不能在 messages 入参上裁剪：那份会被按 id 写回对话，等于永久删记录",
             call.contains("withoutRoundTableToolParts"),

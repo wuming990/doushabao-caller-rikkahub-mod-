@@ -39,8 +39,16 @@ class HistoryVM(
             // v1024：与聊天页一致，先等原压缩停止/提交收尾，再删记录。
             chatService.cancelManualCompression(conversation.id)
             conversationRepo.deleteConversation(conversation)
+            chatService.killBackgroundTasks(conversation.id)
             // v318：删对话要一并释放它的讨论群运行态与状态转发订阅（ChatVM 同一口径）
             chatService.releaseGroupStateOnDelete(conversation.id)
+        }
+    }
+
+    /** 官方 3.1.2：多选删除批量入口。保留上面的单条 deleteConversation（带 v1024/v318 收尾）。 */
+    fun deleteConversations(conversationIds: Collection<Uuid>) {
+        viewModelScope.launch {
+            conversationIds.forEach { chatService.deleteConversation(it) }
         }
     }
 
@@ -59,14 +67,4 @@ class HistoryVM(
 
     fun getPinnedConversations(): Flow<List<Conversation>> =
         conversationRepo.getPinnedConversations()
-
-    fun restoreConversation(conversation: Conversation) {
-        viewModelScope.launch {
-            chatService.restoreConversation(conversation)
-        }
-    }
-
-    suspend fun getFullConversation(conversationId: Uuid): Conversation? {
-        return chatService.getConversation(conversationId)
-    }
 }

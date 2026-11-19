@@ -32,7 +32,9 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -88,9 +90,10 @@ internal fun EditedFilesList(
     ) { uri ->
         val path = selectedPath.also { selectedPath = null } ?: return@rememberLauncherForActivityResult
         if (uri == null) return@rememberLauncherForActivityResult
-        val outputStream = context.contentResolver.openOutputStream(uri) ?: return@rememberLauncherForActivityResult
         scope.launch {
             runCatching {
+                val outputStream = withContext(Dispatchers.IO) { context.contentResolver.openOutputStream(uri) }
+                    ?: return@runCatching
                 val (area, relativePath) = resolveWorkspacePath(path)
                 outputStream.use { output ->
                     workspaceRepository.exportFile(workspaceId, area, relativePath, output)

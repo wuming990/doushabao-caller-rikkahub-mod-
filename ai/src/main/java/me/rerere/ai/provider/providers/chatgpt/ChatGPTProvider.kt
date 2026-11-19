@@ -45,7 +45,8 @@ private const val CODEX_ORIGINATOR = "codex_cli_rs"
 private const val CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 
 // 模型列表按客户端版本过滤，太旧会拿不到新模型
-private const val CODEX_CLIENT_VERSION = "0.163.0"
+// v1039：对齐 Codex CLI 0.170.0；仅影响模型目录，GPT-6.2 的目录最低版本为 0.166.0。
+private const val CODEX_CLIENT_VERSION = "0.170.0"
 
 /**
  * Codex 后端对请求体的要求，Codex CLI 也是这样发的：

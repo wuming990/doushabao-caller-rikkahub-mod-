@@ -38,10 +38,8 @@ internal class GeminiCredentialStore(
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey())
         val encrypted = cipher.doFinal(json.encodeToString(state).encodeToByteArray())
-        val temporary = File(file.parentFile, "$FILE_NAME.tmp")
-        temporary.writeBytes(cipher.iv + encrypted)
-        temporary.copyTo(file, overwrite = true)
-        temporary.delete()
+        // v1038：保留原加密格式，但不再用可能截断旧文件的copyTo覆盖。
+        writeGeminiCredentialBytesAtomically(file, cipher.iv + encrypted)
     }
 
     private fun getOrCreateKey(): SecretKey {

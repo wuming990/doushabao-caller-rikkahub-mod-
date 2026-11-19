@@ -63,6 +63,19 @@ fun GeminiProviderConfigure(
     val toaster = LocalToaster.current
     val context = LocalContext.current
     val canEnable = accounts.any { it.enabled && it.tokenStatus != GeminiTokenStatus.INVALID }
+    var showRtImport by remember { mutableStateOf(false) }
+
+    // v1038：新增入口而非替换网页登录；导入成功后复用已有的模型合并流程。
+    if (showRtImport) {
+        GeminiRtImportDialog(
+            repository = repository,
+            onDismiss = { showRtImport = false },
+            onImported = {
+                val models = providerManager.getProviderByType(provider).listModels(provider)
+                onEdit(provider.copy(models = mergeCodexModels(provider.models, models)))
+            },
+        )
+    }
 
     LaunchedEffect(oauthStatus) {
         when (val status = oauthStatus) {
@@ -140,6 +153,13 @@ fun GeminiProviderConfigure(
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text(stringResource(R.string.gemini_sign_in))
+        }
+
+        OutlinedButton(
+            onClick = { showRtImport = true },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(stringResource(R.string.gemini_rt_import_title))
         }
 
         Row(
